@@ -8,12 +8,17 @@ from pydantic import ValidationError as PydanticValidationError
 from video_to_skill.errors import ProcessingError
 from video_to_skill.generation import (
     COURSE_SKILL_MARKER,
+    CapabilityProfile,
     CorePrinciple,
     CourseArtifact,
     CourseAsset,
+    CourseInteraction,
     CourseSkillBlueprint,
     CourseSkillClaim,
     CourseSkillSource,
+    CurriculumDesign,
+    CurriculumPath,
+    SemanticUnit,
     blueprint_from_json,
     render_course_skill_package,
 )
@@ -25,7 +30,10 @@ def test_generator_skill_owns_the_complete_user_workflow() -> None:
     assert "One invocation owns the complete workflow" in generator
     assert "process every accessible item by default" in generator
     assert "Do not create a second generic video tutor Skill" in generator
-    assert "Learn, Practice, Apply, and Reference itself" in generator
+    assert "four behaviors into artifact quotas" in generator
+    assert "Build the canonical semantic map" in generator
+    assert "Use a thematic course as the default primary design" in generator
+    assert "empty-invocation contract" in generator
     assert "blueprint-schema --workspace WORKSPACE --output AUTHORING_JSON" in generator
     assert "`blueprint_schema`" in generator
     assert "Preserve the seed's `sources` and `coverage_ledger` exactly" in generator
@@ -43,10 +51,13 @@ def _blueprint() -> CourseSkillBlueprint:
     }
     artifacts = [
         CourseArtifact(
+            id="artifact-foundations",
             path="chapters/foundations.md",
             title="Foundations",
-            mode="learn",
+            modes=["learn", "reference"],
             use_when="learning the core model",
+            independent_loading_reason="Load the foundational concept independently.",
+            semantic_unit_ids=["unit-transition"],
             topics=["state transitions"],
             content=(
                 "# Foundations\n\n## Core idea\n\nObserve both the action and its result.\n\n"
@@ -55,10 +66,13 @@ def _blueprint() -> CourseSkillBlueprint:
             ),
         ),
         CourseArtifact(
+            id="artifact-exercise",
             path="exercises/observe-transition.md",
             title="Observe a transition",
-            mode="practice",
+            modes=["practice"],
             use_when="checking whether the learner can distinguish intent from result",
+            independent_loading_reason="Present practice without loading its solution.",
+            semantic_unit_ids=["unit-transition"],
             topics=["evidence"],
             content=(
                 "# Observe a transition\n\n## Task\n\nIdentify the before and after states.\n\n"
@@ -66,17 +80,23 @@ def _blueprint() -> CourseSkillBlueprint:
             ),
         ),
         CourseArtifact(
+            id="artifact-solution",
             path="solutions/observe-transition.md",
             title="Observe a transition rubric",
-            mode="practice",
+            modes=["practice"],
             use_when="grading an attempt",
+            independent_loading_reason="Withhold the rubric until after an attempt.",
+            semantic_unit_ids=["unit-transition"],
             content="# Rubric\n\nAward credit only when both states are cited.\n",
         ),
         CourseArtifact(
+            id="artifact-application",
             path="playbooks/verify-transition.md",
             title="Verify a transition",
-            mode="apply",
+            modes=["apply"],
             use_when="applying the demonstrated verification method",
+            independent_loading_reason="Load the procedure only for real application.",
+            semantic_unit_ids=["unit-transition"],
             topics=["verification"],
             content=(
                 "# Verify a transition\n\n## Procedure\n\n1. Capture the before and after "
@@ -84,10 +104,13 @@ def _blueprint() -> CourseSkillBlueprint:
             ),
         ),
         CourseArtifact(
+            id="artifact-reference",
             path="reference/evidence-types.md",
             title="Evidence types",
-            mode="reference",
+            modes=["reference"],
             use_when="looking up which modality supports a claim",
+            independent_loading_reason="Answer precise evidence questions without a chapter.",
+            semantic_unit_ids=["unit-transition"],
             topics=["speech", "visual", "temporal"],
             content="# Evidence types\n\nUse temporal evidence for transitions.\n",
         ),
@@ -100,6 +123,7 @@ def _blueprint() -> CourseSkillBlueprint:
             summary="A transition requires before and after evidence.",
             inferred=False,
             confidence="high",
+            semantic_unit_ids=["unit-transition"],
             evidence=[evidence],
         ),
         CourseSkillClaim(
@@ -109,6 +133,7 @@ def _blueprint() -> CourseSkillBlueprint:
             summary="Actions and results need different evidence.",
             inferred=False,
             confidence="high",
+            semantic_unit_ids=["unit-transition"],
             evidence=[evidence],
         ),
         CourseSkillClaim(
@@ -118,6 +143,7 @@ def _blueprint() -> CourseSkillBlueprint:
             summary="The demonstrated transition can be used for retrieval practice.",
             inferred=True,
             confidence="medium",
+            semantic_unit_ids=["unit-transition"],
             evidence=[evidence],
         ),
         CourseSkillClaim(
@@ -127,6 +153,7 @@ def _blueprint() -> CourseSkillBlueprint:
             summary="A valid answer identifies both observable states.",
             inferred=True,
             confidence="medium",
+            semantic_unit_ids=["unit-transition"],
             evidence=[evidence],
         ),
         CourseSkillClaim(
@@ -136,6 +163,7 @@ def _blueprint() -> CourseSkillBlueprint:
             summary="Capture observable states before and after the action.",
             inferred=False,
             confidence="high",
+            semantic_unit_ids=["unit-transition"],
             evidence=[evidence],
         ),
         CourseSkillClaim(
@@ -145,6 +173,7 @@ def _blueprint() -> CourseSkillBlueprint:
             summary="Temporal evidence supports transition claims.",
             inferred=False,
             confidence="high",
+            semantic_unit_ids=["unit-transition"],
             evidence=[evidence],
         ),
     ]
@@ -156,11 +185,64 @@ def _blueprint() -> CourseSkillBlueprint:
             "Use for lessons, practice, project application, or precise reference."
         ),
         scope="Learn how to establish and verify observable state transitions.",
+        artifact_language="English",
+        interaction=CourseInteraction(
+            welcome=(
+                "Let's explore how observable transitions work. "
+                'Tell me what you are examining—or say "start".'
+            ),
+            starter_questions=[
+                "What state transition do you want to understand?",
+                "What evidence can you currently observe?",
+            ],
+        ),
+        capability_profile=CapabilityProfile(
+            learn="strong",
+            practice="strong",
+            apply="strong",
+            reference="strong",
+            rationale="The source demonstrates and explains an observable transition.",
+        ),
+        curriculum=CurriculumDesign(
+            selected_path_id="thematic",
+            rationale="A thematic path connects the concept to practice and application.",
+            paths=[
+                CurriculumPath(
+                    id="thematic",
+                    title="Thematic transition course",
+                    kind="thematic",
+                    use_when="learning and applying the complete transition method",
+                    artifact_ids=[
+                        "artifact-foundations",
+                        "artifact-exercise",
+                        "artifact-application",
+                        "artifact-reference",
+                    ],
+                )
+            ],
+        ),
         prerequisites=["Can inspect a before and after state."],
         core_principles=[
             CorePrinciple(
                 text="Require before and after evidence for a transition.",
                 claim_id="claim-core",
+            )
+        ],
+        semantic_units=[
+            SemanticUnit(
+                id="unit-transition",
+                source_id="course-01",
+                start=62,
+                end=75,
+                speaker="Instructor",
+                kind="claim",
+                summary="A transition requires observable before and after states.",
+                materiality="core",
+                disposition="included",
+                inferred=False,
+                confidence="high",
+                modalities=["speech", "visual", "temporal"],
+                evidence_ids=["transcript-1", "frame-before", "frame-after"],
             )
         ],
         artifacts=artifacts,
@@ -206,13 +288,18 @@ def test_rendered_course_skill_is_teaching_first_and_valid(tmp_path: Path) -> No
 
     resident = (target / "SKILL.md").read_text(encoding="utf-8")
     assert COURSE_SKILL_MARKER in resident
-    for mode in ("Learn", "Practice", "Apply", "Reference"):
-        assert f"### {mode}" in resident
-    assert "one short diagnostic question" in resident
-    assert "without loading or revealing the solution" in resident
+    assert "## Empty invocation" in resident
+    assert "at most three in one turn" in resident
+    assert "**Learn:**" in resident
+    assert "**Practice:**" in resident
+    assert "**Apply:**" in resident
+    assert "**Reference:**" in resident
+    assert "without loading its solution" in resident
     assert "user's actual context" in resident
-    assert "missing evidence" in resident
+    assert "outside or current knowledge" in resident
     assert "solutions/observe-transition.md" not in resident
+    assert (target / "source-map.md").is_file()
+    assert (target / "build-manifest.json").is_file()
 
     sources = (target / "sources.md").read_text(encoding="utf-8")
     assert "https://youtu.be/example?t=62" in sources
@@ -247,19 +334,15 @@ def test_renderer_copies_only_sanitized_minimal_course_assets(tmp_path: Path) ->
     assert validate_skill(target, run_official=False).valid
 
 
-def test_blueprint_accepts_legacy_singular_modality_but_emits_modalities(
+def test_blueprint_rejects_singular_modality(
     tmp_path: Path,
 ) -> None:
     payload = _blueprint().model_dump(mode="json")
     evidence = payload["claims"][0]["evidence"][0]
     evidence["modality"] = "speech+visual"
     del evidence["modalities"]
-    blueprint = CourseSkillBlueprint.model_validate(payload)
-
-    target = render_course_skill_package(blueprint, tmp_path / "transition-course")
-    provenance = (target / "provenance.json").read_text(encoding="utf-8")
-    assert '"modalities": [' in provenance
-    assert '"modality"' not in provenance
+    with pytest.raises(PydanticValidationError):
+        CourseSkillBlueprint.model_validate(payload)
 
 
 @pytest.mark.parametrize(
@@ -420,15 +503,22 @@ def test_renderer_refuses_existing_destination(tmp_path: Path) -> None:
     assert (target / "user-notes.md").read_text(encoding="utf-8") == "preserve me"
 
 
-def test_blueprint_requires_grounded_artifacts_for_all_four_modes() -> None:
+def test_blueprint_does_not_require_artifacts_for_all_four_behaviors() -> None:
     payload = _blueprint().model_dump(mode="json")
-    payload["artifacts"] = [item for item in payload["artifacts"] if item["mode"] != "reference"]
+    payload["artifacts"] = [
+        item for item in payload["artifacts"] if item["id"] != "artifact-reference"
+    ]
     payload["claims"] = [
         item for item in payload["claims"] if item["file"] != "reference/evidence-types.md"
     ]
+    payload["curriculum"]["paths"][0]["artifact_ids"] = [
+        artifact_id
+        for artifact_id in payload["curriculum"]["paths"][0]["artifact_ids"]
+        if artifact_id != "artifact-reference"
+    ]
 
-    with pytest.raises(ValueError, match="every mode; missing: reference"):
-        CourseSkillBlueprint.model_validate(payload)
+    blueprint = CourseSkillBlueprint.model_validate(payload)
+    assert blueprint.capability_profile.reference == "strong"
 
 
 def test_blueprint_requires_asset_link_and_visual_provenance(tmp_path: Path) -> None:
@@ -455,14 +545,69 @@ def test_blueprint_requires_asset_link_and_visual_provenance(tmp_path: Path) -> 
         CourseSkillBlueprint.model_validate(ungrounded)
 
 
-def test_course_contract_validator_rejects_missing_mode(tmp_path: Path) -> None:
+def test_course_contract_validator_rejects_missing_empty_invocation(
+    tmp_path: Path,
+) -> None:
     target = render_course_skill_package(_blueprint(), tmp_path / "transition-course")
     skill = target / "SKILL.md"
     skill.write_text(
-        skill.read_text(encoding="utf-8").replace("### Practice", "### Exercises"),
+        skill.read_text(encoding="utf-8").replace(
+            "## Empty invocation",
+            "## Invocation",
+        ),
         encoding="utf-8",
     )
 
     report = validate_skill(target, run_official=False)
     assert not report.valid
-    assert "missing-course-mode" in {item.code for item in report.issues}
+    assert "missing-empty-invocation" in {item.code for item in report.issues}
+
+
+def test_v2_requires_material_semantic_coverage_and_disposition_reasons() -> None:
+    uncovered = _blueprint().model_dump(mode="json")
+    for artifact in uncovered["artifacts"]:
+        artifact["semantic_unit_ids"] = ["unit-context"]
+    uncovered["semantic_units"].append(
+        {
+            **uncovered["semantic_units"][0],
+            "id": "unit-context",
+            "materiality": "contextual",
+            "disposition": "context-only",
+            "disposition_reason": "Retained only in the source map.",
+        }
+    )
+    with pytest.raises(ValueError, match="need a course artifact"):
+        CourseSkillBlueprint.model_validate(uncovered)
+
+    unexplained = _blueprint().model_dump(mode="json")
+    unexplained["semantic_units"][0]["disposition"] = "omitted"
+    with pytest.raises(ValueError, match="require a reason"):
+        CourseSkillBlueprint.model_validate(unexplained)
+
+
+def test_v2_allows_evidence_driven_artifact_collections() -> None:
+    payload = _blueprint().model_dump(mode="json")
+    for artifact in payload["artifacts"]:
+        if artifact["id"] == "artifact-foundations":
+            artifact["path"] = "founder-decisions/foundations.md"
+    for claim in payload["claims"]:
+        if claim["file"] == "chapters/foundations.md":
+            claim["file"] = "founder-decisions/foundations.md"
+
+    blueprint = CourseSkillBlueprint.model_validate(payload)
+
+    assert blueprint.artifacts[0].path == "founder-decisions/foundations.md"
+
+
+def test_build_manifest_detects_human_modified_generated_file(tmp_path: Path) -> None:
+    target = render_course_skill_package(_blueprint(), tmp_path / "transition-course")
+    chapter = target / "chapters" / "foundations.md"
+    chapter.write_text(
+        chapter.read_text(encoding="utf-8") + "\nHuman edit.\n",
+        encoding="utf-8",
+    )
+
+    report = validate_skill(target, run_official=False)
+
+    assert not report.valid
+    assert "managed-file-modified" in {item.code for item in report.issues}

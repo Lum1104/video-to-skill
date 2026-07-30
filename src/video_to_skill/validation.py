@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import shutil
@@ -475,11 +476,11 @@ def _validate_provenance(
     if not isinstance(payload, dict):
         report.add("error", "invalid-provenance", "Root must be an object.", path)
         return None
-    if payload.get("schema_version") != 1:
+    if payload.get("schema_version") != 2:
         report.add(
             "error",
             "provenance-schema",
-            "provenance.json must use schema_version 1.",
+            "provenance.json must use schema_version 2.",
             path,
         )
     source_ids = {
@@ -489,6 +490,55 @@ def _validate_provenance(
     }
     if not source_ids:
         report.add("error", "provenance-sources", "No attributed sources found.", path)
+    raw_units = payload.get("semantic_units")
+    semantic_ids: set[str] = set()
+    if not isinstance(raw_units, list) or not raw_units:
+        report.add(
+            "error",
+            "missing-semantic-map",
+            "V2 provenance requires semantic_units.",
+            path,
+        )
+    else:
+        for unit in raw_units:
+            if not isinstance(unit, dict):
+                report.add("error", "invalid-semantic-unit", "Unit must be an object.", path)
+                continue
+            unit_id = str(unit.get("id") or "")
+            if not unit_id or unit_id in semantic_ids:
+                report.add(
+                    "error",
+                    "duplicate-semantic-unit",
+                    f"Semantic unit ID is missing or duplicated: {unit_id or '<missing>'}.",
+                    path,
+                )
+            semantic_ids.add(unit_id)
+            if unit.get("source_id") not in source_ids:
+                report.add(
+                    "error",
+                    "unknown-semantic-source",
+                    f"Semantic unit {unit_id or '<unknown>'} references an unknown source.",
+                    path,
+                )
+            if unit.get("disposition") not in {
+                "included",
+                "merged",
+                "context-only",
+                "omitted",
+            }:
+                report.add(
+                    "error",
+                    "invalid-semantic-disposition",
+                    f"Semantic unit {unit_id or '<unknown>'} has no valid disposition.",
+                    path,
+                )
+            if unit.get("disposition") != "included" and not unit.get("disposition_reason"):
+                report.add(
+                    "error",
+                    "missing-disposition-reason",
+                    f"Semantic unit {unit_id or '<unknown>'} needs a disposition reason.",
+                    path,
+                )
     raw_claims = payload.get("claims", [])
     if not isinstance(raw_claims, list):
         report.add("error", "invalid-claims", "Claims must be an array.", path)
@@ -540,6 +590,18 @@ def _validate_provenance(
                 "error",
                 "invalid-claim-confidence",
                 f"Claim {claim_id or '<unknown>'} must declare high/medium/low confidence.",
+                path,
+            )
+        semantic_unit_ids = claim.get("semantic_unit_ids")
+        if (
+            not isinstance(semantic_unit_ids, list)
+            or not semantic_unit_ids
+            or any(unit_id not in semantic_ids for unit_id in semantic_unit_ids)
+        ):
+            report.add(
+                "error",
+                "invalid-claim-semantic-units",
+                f"Claim {claim_id or '<unknown>'} must reference known semantic units.",
                 path,
             )
         claim_file = claim.get("file")
@@ -653,25 +715,47 @@ def _validate_course_skill_contract(
     if COURSE_SKILL_MARKER not in skill_text:
         return
     required_headings = {
-        "Learn": r"(?m)^### Learn\s*$",
-        "Practice": r"(?m)^### Practice\s*$",
-        "Apply": r"(?m)^### Apply\s*$",
-        "Reference": r"(?m)^### Reference\s*$",
-        "Evidence and uncertainty": r"(?m)^## Evidence and uncertainty\s*$",
+        "missing-empty-invocation": (
+            r"(?m)^## Empty invocation\s*$",
+            "Course skill is missing the empty-invocation contract.",
+        ),
+        "missing-initial-context": (
+            r"(?m)^## Initial context\s*$",
+            "Course skill is missing its bounded initial-context contract.",
+        ),
+        "missing-interaction-behavior": (
+            r"(?m)^## Interaction behavior\s*$",
+            "Course skill is missing adaptive interaction behavior.",
+        ),
+        "missing-capability-profile": (
+            r"(?m)^## Capability profile\s*$",
+            "Course skill is missing its evidence-derived capability profile.",
+        ),
+        "missing-evidence-contract": (
+            r"(?m)^## Evidence and uncertainty\s*$",
+            "Course skill is missing its evidence and uncertainty contract.",
+        ),
     }
-    for label, pattern in required_headings.items():
+    for code, (pattern, message) in required_headings.items():
         if not re.search(pattern, skill_text):
-            report.add(
-                "error",
-                "missing-course-mode",
-                f"Course skill is missing the `{label}` behavior contract.",
-                root / "SKILL.md",
-            )
+            report.add("error", code, message, root / "SKILL.md")
 
     behavioral_checks = {
-        "missing-adaptive-diagnostic": (
-            r"(?is)\bdiagnos\w*.*\b(prerequisite|goal|mastery)",
-            "Learn mode must diagnose goals or prerequisite mastery before sequencing lessons.",
+        "missing-empty-no-side-effects": (
+            r"(?is)load no supporting file.*inspect no project.*run no command.*create no file",
+            "Empty invocation must have no supporting-file, project, command, or file side effects.",
+        ),
+        "missing-start-option": (
+            r"(?ims)^## Empty invocation.*\bstart\b",
+            "Empty invocation must offer a zero-friction `start` path.",
+        ),
+        "missing-three-question-bound": (
+            r"(?is)\bat most three\b",
+            "Initial context must ask at most three questions.",
+        ),
+        "missing-adaptive-teaching": (
+            r"(?is)\bone useful cognitive move\b.*\b(adapt|answer)\b",
+            "Learning behavior must teach one bounded move and adapt to the learner.",
         ),
         "missing-practice-feedback": (
             r"(?is)\b(attempt|retry)\b.*\b(rubric|feedback|misconception|hint)",
@@ -682,7 +766,7 @@ def _validate_course_skill_contract(
             "Practice mode must withhold solutions until an attempt or explicit request.",
         ),
         "missing-application-context": (
-            r"(?is)\b(actual|user(?:'s)?)\s+(context|situation|constraints?)",
+            r"(?is)\buser(?:'s)? actual context\b",
             "Apply mode must inspect the user's real context before adapting the course method.",
         ),
         "missing-timestamp-grounding": (
@@ -690,15 +774,28 @@ def _validate_course_skill_contract(
             "Consequential answers must be grounded with source timestamps.",
         ),
         "missing-honest-uncertainty": (
-            r"(?is)\b(uncertain|uncertainty|missing evidence|cannot answer)\b",
+            r"(?is)\b(uncertain|uncertainty|low-confidence|inferred)\b",
             "The skill must state how to handle unsupported or uncertain material.",
+        ),
+        "missing-language-following": (
+            r"(?is)respond in the user's language",
+            "The skill must follow the user's interaction language by default.",
+        ),
+        "missing-knowledge-boundary": (
+            r"(?is)outside or current knowledge",
+            "The skill must distinguish source evidence from outside or current knowledge.",
         ),
     }
     for code, (pattern, message) in behavioral_checks.items():
         if not re.search(pattern, skill_text):
             report.add("error", code, message, root / "SKILL.md")
 
-    for required in ("sources.md", "provenance.json"):
+    for required in (
+        "source-map.md",
+        "sources.md",
+        "provenance.json",
+        "build-manifest.json",
+    ):
         if not (root / required).is_file():
             report.add(
                 "error",
@@ -756,6 +853,92 @@ def _validate_playbook_coverage(
                     f"{claim_counts.get(relative, 0)} procedure-step provenance claims."
                 ),
                 path,
+            )
+
+
+def _validate_build_manifest(
+    root: Path,
+    report: ValidationReport,
+    *,
+    text: str | None,
+) -> None:
+    path = root / "build-manifest.json"
+    if not path.is_file():
+        return
+    if text is None:
+        report.add(
+            "error",
+            "invalid-build-manifest",
+            "build-manifest.json could not be scanned as bounded UTF text.",
+            path,
+        )
+        return
+    try:
+        payload = json.loads(text)
+    except (json.JSONDecodeError, RecursionError) as exc:
+        report.add("error", "invalid-build-manifest", str(exc), path)
+        return
+    if not isinstance(payload, dict) or payload.get("schema_version") != 2:
+        report.add(
+            "error",
+            "build-manifest-schema",
+            "build-manifest.json must use schema_version 2.",
+            path,
+        )
+        return
+    build_id = payload.get("build_id")
+    if not isinstance(build_id, str) or not re.fullmatch(r"v2s-[a-f0-9]{20}", build_id):
+        report.add(
+            "error",
+            "invalid-build-id",
+            "Build manifest requires a stable V2 build ID.",
+            path,
+        )
+    managed = payload.get("managed_files")
+    if not isinstance(managed, dict) or not managed:
+        report.add(
+            "error",
+            "missing-managed-files",
+            "Build manifest requires generated-file ownership hashes.",
+            path,
+        )
+        return
+    for relative, entry in managed.items():
+        if not isinstance(relative, str) or not isinstance(entry, dict):
+            report.add(
+                "error",
+                "invalid-managed-file",
+                "Managed-file entries must map relative paths to objects.",
+                path,
+            )
+            continue
+        managed_path = (root / relative).resolve()
+        try:
+            managed_path.relative_to(root)
+        except ValueError:
+            report.add(
+                "error",
+                "escaping-managed-file",
+                "Build manifest contains a path outside the Skill.",
+                path,
+            )
+            continue
+        if not managed_path.is_file():
+            report.add(
+                "error",
+                "missing-managed-file",
+                f"Build manifest points to missing generated file {relative}.",
+                path,
+            )
+            continue
+        expected = entry.get("sha256")
+        digest = hashlib.sha256(managed_path.read_bytes()).hexdigest()
+        if expected != digest:
+            report.add(
+                "error",
+                "managed-file-modified",
+                f"Generated file differs from its build receipt: {relative}.",
+                managed_path,
             )
 
 
@@ -878,6 +1061,11 @@ def validate_skill(
         root,
         report,
         text=text_files.get(root / "provenance.json"),
+    )
+    _validate_build_manifest(
+        root,
+        report,
+        text=text_files.get(root / "build-manifest.json"),
     )
     _validate_playbook_coverage(
         root,

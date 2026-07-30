@@ -8,11 +8,16 @@ from video_to_skill.cli import app
 from video_to_skill.config import Settings
 from video_to_skill.generation import (
     MAX_BLUEPRINT_AUTHORING_JSON_BYTES,
+    CapabilityProfile,
     CorePrinciple,
     CourseArtifact,
+    CourseInteraction,
     CourseSkillBlueprint,
     CourseSkillClaim,
     CourseSkillSource,
+    CurriculumDesign,
+    CurriculumPath,
+    SemanticUnit,
     coverage_ledger_from_workspace,
 )
 from video_to_skill.models import (
@@ -111,25 +116,28 @@ def _contract_blueprint(
         "evidence_ids": ["transcript-1"],
     }
     artifact_specs = [
-        ("chapters/foundations.md", "Foundations", "learn"),
-        ("exercises/check.md", "Check", "practice"),
-        ("solutions/check.md", "Check rubric", "practice"),
-        ("playbooks/apply.md", "Apply", "apply"),
-        ("reference/terms.md", "Terms", "reference"),
+        ("foundations", "chapters/foundations.md", "Foundations", "learn"),
+        ("check", "exercises/check.md", "Check", "practice"),
+        ("check-solution", "solutions/check.md", "Check rubric", "practice"),
+        ("apply", "playbooks/apply.md", "Apply", "apply"),
+        ("terms", "reference/terms.md", "Terms", "reference"),
     ]
     artifacts = [
         CourseArtifact(
+            id=artifact_id,
             path=path,
             title=title,
-            mode=mode,
+            modes=[mode],
             use_when=f"using {title.lower()}",
+            independent_loading_reason=f"Load {title.lower()} only when needed.",
+            semantic_unit_ids=["unit-core"],
             content=(
                 "# Material\n\n## Procedure\n\n1. Verify the result.\n"
                 if mode == "apply"
                 else "# Material\n\nGrounded course material.\n"
             ),
         )
-        for path, title, mode in artifact_specs
+        for artifact_id, path, title, mode in artifact_specs
     ]
     claims = [
         CourseSkillClaim(
@@ -139,16 +147,18 @@ def _contract_blueprint(
             summary="Verify observable results.",
             inferred=False,
             confidence="high",
+            semantic_unit_ids=["unit-core"],
             evidence=[evidence],
         ),
         *[
             CourseSkillClaim(
                 id=f"claim-{index}",
                 file=artifact.path,
-                kind=("procedure-step" if artifact.mode == "apply" else "teaching-material"),
+                kind=("procedure-step" if "apply" in artifact.modes else "teaching-material"),
                 summary=f"Ground {artifact.title}.",
-                inferred=artifact.mode == "practice",
-                confidence="medium" if artifact.mode == "practice" else "high",
+                inferred="practice" in artifact.modes,
+                confidence="medium" if "practice" in artifact.modes else "high",
+                semantic_unit_ids=["unit-core"],
                 evidence=[evidence],
             )
             for index, artifact in enumerate(artifacts, start=1)
@@ -159,7 +169,48 @@ def _contract_blueprint(
         title="Contract Course",
         description="Teach, practice, apply, and reference the fully accounted course.",
         scope="Use the demonstrated method with explicit evidence.",
+        artifact_language="English",
+        interaction=CourseInteraction(
+            welcome='Let us explore grounded verification. Say "start" and I will guide you.',
+            starter_questions=["What result do you need to verify?"],
+        ),
+        capability_profile=CapabilityProfile(
+            learn="strong",
+            practice="strong",
+            apply="strong",
+            reference="strong",
+            rationale="The course explains and demonstrates the complete method.",
+        ),
+        curriculum=CurriculumDesign(
+            selected_path_id="thematic",
+            rationale="The thematic path connects the complete method.",
+            paths=[
+                CurriculumPath(
+                    id="thematic",
+                    title="Thematic course",
+                    kind="thematic",
+                    use_when="learning or applying the method",
+                    artifact_ids=["foundations", "check", "apply", "terms"],
+                )
+            ],
+        ),
         core_principles=[CorePrinciple(text="Verify observable results.", claim_id="claim-core")],
+        semantic_units=[
+            SemanticUnit(
+                id="unit-core",
+                source_id=active[0].id,
+                start=1,
+                end=2,
+                kind="claim",
+                summary="Verify observable results.",
+                materiality="core",
+                disposition="included",
+                inferred=False,
+                confidence="high",
+                modalities=["speech"],
+                evidence_ids=["transcript-1"],
+            )
+        ],
         artifacts=artifacts,
         sources=[
             CourseSkillSource(
@@ -318,7 +369,7 @@ description: Teach and apply the grounded course.
     (generated / "provenance.json").write_text(
         json.dumps(
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "sources": [
                     {
                         "id": "youtube-course",
@@ -326,6 +377,23 @@ description: Teach and apply the grounded course.
                         "url": "https://youtu.be/course",
                     }
                 ],
+                "semantic_units": [
+                    {
+                        "id": "unit-1",
+                        "source_id": "youtube-course",
+                        "start": 1,
+                        "end": 2,
+                        "kind": "claim",
+                        "summary": "Teach the grounded course.",
+                        "materiality": "core",
+                        "disposition": "included",
+                        "inferred": False,
+                        "confidence": "high",
+                        "modalities": ["speech"],
+                        "evidence_ids": ["transcript-1"],
+                    }
+                ],
+                "semantic_relations": [],
                 "claims": [
                     {
                         "id": "claim-1",
@@ -334,6 +402,7 @@ description: Teach and apply the grounded course.
                         "summary": "Teach the grounded course.",
                         "inferred": False,
                         "confidence": "high",
+                        "semantic_unit_ids": ["unit-1"],
                         "evidence": [
                             {
                                 "source_id": "youtube-course",
@@ -573,38 +642,53 @@ def test_build_skill_renders_validates_and_registers_for_second_invocation(
     }
     artifacts = [
         CourseArtifact(
+            id="foundations",
             path="chapters/foundations.md",
             title="Foundations",
-            mode="learn",
+            modes=["learn"],
             use_when="learning the demonstrated method",
+            independent_loading_reason="Load the foundational lesson independently.",
+            semantic_unit_ids=["unit-result"],
             content="# Foundations\n\nLearn the grounded method.\n",
         ),
         CourseArtifact(
+            id="exercise",
             path="exercises/check-result.md",
             title="Check the result",
-            mode="practice",
+            modes=["practice"],
             use_when="practicing result verification",
+            independent_loading_reason="Present practice without its rubric.",
+            semantic_unit_ids=["unit-result"],
             content="# Exercise\n\nVerify an observable result.\n",
         ),
         CourseArtifact(
+            id="solution",
             path="solutions/check-result.md",
             title="Check the result rubric",
-            mode="practice",
+            modes=["practice"],
             use_when="reviewing an attempted verification",
+            independent_loading_reason="Withhold the rubric until after an attempt.",
+            semantic_unit_ids=["unit-result"],
             content="# Rubric\n\nRequire observable evidence.\n",
         ),
         CourseArtifact(
+            id="application",
             path="playbooks/verify.md",
             title="Verify a result",
-            mode="apply",
+            modes=["apply"],
             use_when="applying the method",
+            independent_loading_reason="Load the procedure for actual application.",
+            semantic_unit_ids=["unit-result"],
             content="# Verify\n\n## Procedure\n\n1. Inspect the visible result.\n",
         ),
         CourseArtifact(
+            id="reference",
             path="reference/evidence.md",
             title="Evidence reference",
-            mode="reference",
+            modes=["reference"],
             use_when="checking which evidence supports the result",
+            independent_loading_reason="Load precise evidence rules without a lesson.",
+            semantic_unit_ids=["unit-result"],
             content="# Evidence\n\nUse visual evidence for visible state.\n",
         ),
     ]
@@ -612,10 +696,11 @@ def test_build_skill_renders_validates_and_registers_for_second_invocation(
         CourseSkillClaim(
             id=f"claim-artifact-{index}",
             file=artifact.path,
-            kind=("procedure-step" if artifact.mode == "apply" else "teaching-material"),
+            kind=("procedure-step" if "apply" in artifact.modes else "teaching-material"),
             summary=f"Ground {artifact.title.lower()} in the demonstrated result.",
-            inferred=artifact.mode == "practice",
-            confidence="medium" if artifact.mode == "practice" else "high",
+            inferred="practice" in artifact.modes,
+            confidence="medium" if "practice" in artifact.modes else "high",
+            semantic_unit_ids=["unit-result"],
             evidence=[evidence],
         )
         for index, artifact in enumerate(artifacts, start=1)
@@ -625,11 +710,52 @@ def test_build_skill_renders_validates_and_registers_for_second_invocation(
         title="Grounded Course",
         description=("Teach, practice, apply, and reference the demonstrated grounded workflow."),
         scope="Use the demonstrated workflow with explicit evidence checks.",
+        artifact_language="English",
+        interaction=CourseInteraction(
+            welcome='Let us explore grounded verification. Say "start" and I will guide you.',
+            starter_questions=["What visible result do you need to verify?"],
+        ),
+        capability_profile=CapabilityProfile(
+            learn="strong",
+            practice="strong",
+            apply="strong",
+            reference="strong",
+            rationale="The source explains and demonstrates visible result verification.",
+        ),
+        curriculum=CurriculumDesign(
+            selected_path_id="thematic",
+            rationale="The thematic path links explanation, practice, and application.",
+            paths=[
+                CurriculumPath(
+                    id="thematic",
+                    title="Thematic course",
+                    kind="thematic",
+                    use_when="learning or applying grounded verification",
+                    artifact_ids=["foundations", "exercise", "application", "reference"],
+                )
+            ],
+        ),
         artifacts=artifacts,
         core_principles=[
             CorePrinciple(
                 text="Verify the visible result.",
                 claim_id="claim-core",
+            )
+        ],
+        semantic_units=[
+            SemanticUnit(
+                id="unit-result",
+                source_id="source-1",
+                start=12,
+                end=18,
+                kind="claim",
+                summary="Verify the visible result after the action.",
+                materiality="core",
+                disposition="included",
+                inferred=False,
+                confidence="high",
+                modalities=["speech", "visual"],
+                evidence_ids=["transcript-1", "frame-1"],
             )
         ],
         sources=[
@@ -649,6 +775,7 @@ def test_build_skill_renders_validates_and_registers_for_second_invocation(
                 summary="Verify the visible result after the action.",
                 inferred=False,
                 confidence="high",
+                semantic_unit_ids=["unit-result"],
                 evidence=[evidence],
             ),
             *artifact_claims,
@@ -724,7 +851,11 @@ def test_build_skill_renders_validates_and_registers_for_second_invocation(
     assert portable.is_dir()
     assert installed.is_dir()
     resident = (installed / "SKILL.md").read_text(encoding="utf-8")
-    assert "### Learn" in resident
-    assert "### Practice" in resident
-    assert "### Apply" in resident
-    assert "### Reference" in resident
+    assert "## Empty invocation" in resident
+    assert "## Capability profile" in resident
+    assert "**Learn:**" in resident
+    assert "**Practice:**" in resident
+    assert "**Apply:**" in resident
+    assert "**Reference:**" in resident
+    assert (installed / "source-map.md").is_file()
+    assert (installed / "build-manifest.json").is_file()

@@ -76,6 +76,6 @@ The deterministic Python layer handles acquisition, timestamps, caching, retriev
 
 The multimodal evidence workflow is also informed by the caption-plus-screenshot approach in [Youtube2Webpage](https://github.com/obra/Youtube2Webpage).
 
-See the [developer guide](docs/development.md), [architecture](docs/architecture.md), [provider configuration](docs/providers.md), and [security model](docs/security.md).
+See the [generated Skill V2 design](docs/generated-skill-v2.md), [developer guide](docs/development.md), [architecture](docs/architecture.md), [provider configuration](docs/providers.md), and [security model](docs/security.md).
 
 Thanks to [book-to-skill](https://github.com/virgiliojr94/book-to-skill) for the inspiration.

@@ -26,7 +26,7 @@ Read [Chapter 1](chapters/ch01.md).
     (root / "provenance.json").write_text(
         json.dumps(
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "sources": [
                     {
                         "id": "youtube-demo",
@@ -34,6 +34,23 @@ Read [Chapter 1](chapters/ch01.md).
                         "url": "https://youtu.be/demo",
                     }
                 ],
+                "semantic_units": [
+                    {
+                        "id": "unit-1",
+                        "source_id": "youtube-demo",
+                        "start": 12,
+                        "end": 20,
+                        "kind": "claim",
+                        "summary": "Apply the demonstrated workflow.",
+                        "materiality": "core",
+                        "disposition": "included",
+                        "inferred": False,
+                        "confidence": "high",
+                        "modalities": ["speech"],
+                        "evidence_ids": ["transcript-1"],
+                    }
+                ],
+                "semantic_relations": [],
                 "claims": [
                     {
                         "id": "claim-1",
@@ -42,6 +59,7 @@ Read [Chapter 1](chapters/ch01.md).
                         "summary": "Apply the demonstrated workflow.",
                         "inferred": False,
                         "confidence": "high",
+                        "semantic_unit_ids": ["unit-1"],
                         "evidence": [
                             {
                                 "source_id": "youtube-demo",

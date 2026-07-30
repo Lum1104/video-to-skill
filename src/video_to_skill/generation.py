@@ -16,13 +16,14 @@ import shutil
 import tempfile
 from collections import defaultdict
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Literal
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic import ValidationError as PydanticValidationError
 
+from video_to_skill import __version__
 from video_to_skill.errors import ProcessingError
 from video_to_skill.models import JobState, SourceDescriptor
 from video_to_skill.url_security import UrlParameterLimitError, has_sensitive_url_parameters
@@ -31,7 +32,7 @@ from video_to_skill.utils import atomic_write_json, atomic_write_text, format_ti
 if TYPE_CHECKING:
     from video_to_skill.workspace import Workspace
 
-COURSE_SKILL_MARKER = "<!-- video-to-skill:course-skill:v1 -->"
+COURSE_SKILL_MARKER = "<!-- video-to-skill:course-skill:v2 -->"
 _SKILL_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _MARKDOWN_TARGET_RE = re.compile(r"!?\[[^\]]*]\(([^)]+)\)")
 _ROOT_ARTIFACTS = {
@@ -39,13 +40,6 @@ _ROOT_ARTIFACTS = {
     "glossary.md",
     "patterns.md",
     "cheatsheet.md",
-}
-_ARTIFACT_DIRECTORIES = {
-    "chapters",
-    "playbooks",
-    "exercises",
-    "solutions",
-    "reference",
 }
 _SOURCE_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 MAX_COURSE_ASSETS = 24
@@ -60,6 +54,44 @@ SkillMode = Literal["learn", "practice", "apply", "reference"]
 Confidence = Literal["high", "medium", "low"]
 CoverageStatus = Literal["complete", "partial", "failed", "skipped"]
 EvidenceModality = Literal["speech", "visual", "ocr", "metadata", "temporal"]
+CapabilityLevel = Literal["strong", "medium", "light", "unsupported"]
+SemanticMateriality = Literal["core", "supporting", "contextual", "incidental"]
+SemanticDisposition = Literal["included", "merged", "context-only", "omitted"]
+SemanticUnitKind = Literal[
+    "question",
+    "claim",
+    "reason",
+    "example",
+    "analogy",
+    "definition",
+    "distinction",
+    "qualification",
+    "counterpoint",
+    "prediction",
+    "recommendation",
+    "warning",
+    "value-judgment",
+    "open-question",
+]
+SemanticRelationKind = Literal[
+    "answers",
+    "supports",
+    "explains",
+    "exemplifies",
+    "qualifies",
+    "contrasts-with",
+    "depends-on",
+    "updates",
+    "contradicts",
+    "raises",
+    "leaves-unresolved",
+]
+CurriculumKind = Literal[
+    "source-faithful",
+    "thematic",
+    "application-first",
+    "custom",
+]
 CourseCoverageState = Literal["complete", "partial", "unproven"]
 CourseLedgerEntryKind = Literal["active-source", "retired-source", "inspection-entry"]
 CourseLedgerEntryStatus = Literal["accessible", "retired", "inaccessible", "failed"]
@@ -90,9 +122,13 @@ def _safe_artifact_path(value: str) -> str:
         if path.as_posix() not in _ROOT_ARTIFACTS:
             allowed = ", ".join(sorted(_ROOT_ARTIFACTS))
             raise ValueError(f"root artifact must be one of: {allowed}")
-    elif path.parts[0] not in _ARTIFACT_DIRECTORIES:
-        allowed = ", ".join(sorted(_ARTIFACT_DIRECTORIES))
-        raise ValueError(f"artifact must be inside one of: {allowed}")
+    else:
+        if len(path.parts) > 4 or path.parts[0] in {"assets", "."}:
+            raise ValueError("artifact collection path is unsafe or too deeply nested")
+        if any(not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", part) for part in path.parts):
+            raise ValueError(
+                "artifact paths must use lowercase letters, digits, dots, hyphens, or underscores"
+            )
     return path.as_posix()
 
 
@@ -229,19 +265,6 @@ class ClaimEvidence(GenerationModel):
     modalities: list[EvidenceModality] = Field(min_length=1)
     evidence_ids: list[str] = Field(min_length=1)
 
-    @model_validator(mode="before")
-    @classmethod
-    def accept_legacy_modality(cls, value: Any) -> Any:
-        if not isinstance(value, dict):
-            return value
-        data = dict(value)
-        legacy = data.pop("modality", None)
-        if "modalities" not in data and legacy is not None:
-            if not isinstance(legacy, str):
-                return data
-            data["modalities"] = legacy.split("+")
-        return data
-
     @field_validator("source_id")
     @classmethod
     def compact_source_id(cls, value: str) -> str:
@@ -277,6 +300,7 @@ class CourseSkillClaim(GenerationModel):
     summary: str = Field(min_length=1, max_length=1200)
     inferred: bool
     confidence: Confidence
+    semantic_unit_ids: list[str] = Field(min_length=1)
     evidence: list[ClaimEvidence] = Field(min_length=1)
 
     @field_validator("id", "kind", "summary", "anchor")
@@ -287,16 +311,27 @@ class CourseSkillClaim(GenerationModel):
     @field_validator("file")
     @classmethod
     def safe_claim_file(cls, value: str) -> str:
-        if value in {"SKILL.md", "sources.md"}:
+        if value in {"SKILL.md", "source-map.md", "sources.md"}:
             return value
         return _safe_artifact_path(value)
 
+    @field_validator("semantic_unit_ids")
+    @classmethod
+    def compact_semantic_unit_ids(cls, value: list[str]) -> list[str]:
+        compact = [_compact_required(item) for item in value]
+        if len(compact) != len(set(compact)):
+            raise ValueError("claim semantic_unit_ids cannot contain duplicates")
+        return compact
+
 
 class CourseArtifact(GenerationModel):
+    id: str = Field(min_length=1, max_length=160)
     path: str
     title: str = Field(min_length=1, max_length=300)
-    mode: SkillMode
+    modes: list[SkillMode] = Field(min_length=1, max_length=4)
     use_when: str = Field(min_length=1, max_length=500)
+    independent_loading_reason: str = Field(min_length=1, max_length=500)
+    semantic_unit_ids: list[str] = Field(min_length=1)
     topics: list[str] = Field(default_factory=list, max_length=30)
     content: str = Field(min_length=1, max_length=500_000)
 
@@ -305,17 +340,24 @@ class CourseArtifact(GenerationModel):
     def safe_path(cls, value: str) -> str:
         return _safe_artifact_path(value)
 
-    @field_validator("title", "use_when")
+    @field_validator("id", "title", "use_when", "independent_loading_reason")
     @classmethod
     def compact_text(cls, value: str) -> str:
         return _compact_required(value)
 
-    @field_validator("topics")
+    @field_validator("modes")
     @classmethod
-    def compact_topics(cls, value: list[str]) -> list[str]:
+    def unique_modes(cls, value: list[SkillMode]) -> list[SkillMode]:
+        if len(value) != len(set(value)):
+            raise ValueError("artifact modes cannot contain duplicates")
+        return value
+
+    @field_validator("topics", "semantic_unit_ids")
+    @classmethod
+    def compact_unique_lists(cls, value: list[str]) -> list[str]:
         compact = [_compact_required(item) for item in value]
         if len(compact) != len(set(compact)):
-            raise ValueError("artifact topics cannot contain duplicates")
+            raise ValueError("artifact list values cannot contain duplicates")
         return compact
 
 
@@ -389,22 +431,190 @@ class CorePrinciple(GenerationModel):
         return _compact_required(value)
 
 
+class SemanticUnit(GenerationModel):
+    """One high-recall, source-ordered unit retained before curriculum design."""
+
+    id: str = Field(min_length=1, max_length=160)
+    source_id: str = Field(min_length=1, max_length=256)
+    start: float = Field(ge=0, allow_inf_nan=False)
+    end: float = Field(ge=0, allow_inf_nan=False)
+    speaker: str | None = Field(default=None, max_length=300)
+    kind: SemanticUnitKind
+    summary: str = Field(min_length=1, max_length=1200)
+    detail: str | None = Field(default=None, max_length=5000)
+    materiality: SemanticMateriality
+    disposition: SemanticDisposition
+    disposition_reason: str | None = Field(default=None, max_length=1000)
+    merged_into: str | None = Field(default=None, max_length=160)
+    inferred: bool
+    confidence: Confidence
+    modalities: list[EvidenceModality] = Field(min_length=1)
+    evidence_ids: list[str] = Field(min_length=1)
+
+    @field_validator(
+        "id",
+        "source_id",
+        "speaker",
+        "summary",
+        "detail",
+        "disposition_reason",
+        "merged_into",
+    )
+    @classmethod
+    def compact_text(cls, value: str | None) -> str | None:
+        return _compact_required(value) if value is not None else None
+
+    @field_validator("modalities")
+    @classmethod
+    def unique_modalities(cls, value: list[EvidenceModality]) -> list[EvidenceModality]:
+        if len(value) != len(set(value)):
+            raise ValueError("semantic unit modalities cannot contain duplicates")
+        return value
+
+    @field_validator("evidence_ids")
+    @classmethod
+    def unique_evidence_ids(cls, value: list[str]) -> list[str]:
+        compact = [_compact_required(item) for item in value]
+        if len(compact) != len(set(compact)):
+            raise ValueError("semantic unit evidence_ids cannot contain duplicates")
+        return compact
+
+    @model_validator(mode="after")
+    def coherent_unit(self) -> SemanticUnit:
+        if self.end < self.start:
+            raise ValueError("semantic unit end must be after start")
+        if self.disposition == "merged":
+            if self.merged_into is None:
+                raise ValueError("merged semantic units require merged_into")
+        elif self.merged_into is not None:
+            raise ValueError("only merged semantic units can declare merged_into")
+        if self.disposition != "included" and self.disposition_reason is None:
+            raise ValueError("merged, context-only, and omitted semantic units require a reason")
+        return self
+
+
+class SemanticRelation(GenerationModel):
+    from_unit_id: str = Field(min_length=1, max_length=160)
+    to_unit_id: str = Field(min_length=1, max_length=160)
+    kind: SemanticRelationKind
+    explanation: str | None = Field(default=None, max_length=1000)
+
+    @field_validator("from_unit_id", "to_unit_id", "explanation")
+    @classmethod
+    def compact_text(cls, value: str | None) -> str | None:
+        return _compact_required(value) if value is not None else None
+
+    @model_validator(mode="after")
+    def distinct_units(self) -> SemanticRelation:
+        if self.from_unit_id == self.to_unit_id:
+            raise ValueError("semantic relations must connect two different units")
+        return self
+
+
+class CapabilityProfile(GenerationModel):
+    learn: CapabilityLevel
+    practice: CapabilityLevel
+    apply: CapabilityLevel
+    reference: CapabilityLevel
+    rationale: str = Field(min_length=1, max_length=1200)
+
+    @field_validator("rationale")
+    @classmethod
+    def compact_rationale(cls, value: str) -> str:
+        return _compact_required(value)
+
+
+class CurriculumPath(GenerationModel):
+    id: str = Field(min_length=1, max_length=160)
+    title: str = Field(min_length=1, max_length=300)
+    kind: CurriculumKind
+    use_when: str = Field(min_length=1, max_length=500)
+    artifact_ids: list[str] = Field(min_length=1)
+
+    @field_validator("id", "title", "use_when")
+    @classmethod
+    def compact_text(cls, value: str) -> str:
+        return _compact_required(value)
+
+    @field_validator("artifact_ids")
+    @classmethod
+    def unique_artifact_ids(cls, value: list[str]) -> list[str]:
+        compact = [_compact_required(item) for item in value]
+        if len(compact) != len(set(compact)):
+            raise ValueError("curriculum path artifact_ids cannot contain duplicates")
+        return compact
+
+
+class CurriculumDesign(GenerationModel):
+    selected_path_id: str = Field(min_length=1, max_length=160)
+    rationale: str = Field(min_length=1, max_length=1200)
+    paths: list[CurriculumPath] = Field(min_length=1)
+
+    @field_validator("selected_path_id", "rationale")
+    @classmethod
+    def compact_text(cls, value: str) -> str:
+        return _compact_required(value)
+
+    @model_validator(mode="after")
+    def coherent_paths(self) -> CurriculumDesign:
+        path_ids = [path.id for path in self.paths]
+        if len(path_ids) != len(set(path_ids)):
+            raise ValueError("curriculum path ids must be unique")
+        if self.selected_path_id not in set(path_ids):
+            raise ValueError("selected_path_id must identify a curriculum path")
+        return self
+
+
+class CourseInteraction(GenerationModel):
+    welcome: str = Field(min_length=1, max_length=360)
+    starter_questions: list[str] = Field(min_length=1, max_length=3)
+
+    @field_validator("welcome")
+    @classmethod
+    def compact_welcome(cls, value: str) -> str:
+        compact = _compact_required(value)
+        sentence_count = len(re.findall(r"[.!?\u3002\uff01\uff1f](?:\s|$)", compact))
+        if sentence_count > 2:
+            raise ValueError("empty-invocation welcome must use at most two sentences")
+        if "start" not in compact.casefold():
+            raise ValueError("empty-invocation welcome must offer `start`")
+        return compact
+
+    @field_validator("starter_questions")
+    @classmethod
+    def compact_questions(cls, value: list[str]) -> list[str]:
+        compact = [_compact_required(item) for item in value]
+        if len(compact) != len(set(compact)):
+            raise ValueError("starter questions cannot contain duplicates")
+        return compact
+
+
 class CourseSkillBlueprint(GenerationModel):
     """The semantic handoff between the generator agent and package renderer."""
 
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     name: str = Field(min_length=1, max_length=64)
     title: str = Field(min_length=1, max_length=300)
     description: str = Field(min_length=1, max_length=1024)
     scope: str = Field(min_length=1, max_length=1000)
+    artifact_language: str = Field(min_length=2, max_length=80)
+    interaction: CourseInteraction
+    capability_profile: CapabilityProfile
+    curriculum: CurriculumDesign
     prerequisites: list[str] = Field(default_factory=list, max_length=30)
     core_principles: list[CorePrinciple] = Field(default_factory=list, max_length=24)
+    semantic_units: list[SemanticUnit] = Field(min_length=1)
+    semantic_relations: list[SemanticRelation] = Field(default_factory=list)
     artifacts: list[CourseArtifact] = Field(default_factory=list)
     assets: list[CourseAsset] = Field(default_factory=list, max_length=MAX_COURSE_ASSETS)
     sources: list[CourseSkillSource] = Field(min_length=1)
     coverage_ledger: CourseCoverageLedger | None = None
     claims: list[CourseSkillClaim] = Field(min_length=1)
     limitations: list[str] = Field(default_factory=list, max_length=30)
+    parent_build_id: str | None = Field(
+        default=None,
+        pattern=r"^v2s-[a-f0-9]{20}$",
+    )
 
     @field_validator("name")
     @classmethod
@@ -413,7 +623,7 @@ class CourseSkillBlueprint(GenerationModel):
             raise ValueError("skill name must use lowercase letters, digits, and hyphens")
         return value
 
-    @field_validator("title", "description", "scope")
+    @field_validator("title", "description", "scope", "artifact_language")
     @classmethod
     def compact_text(cls, value: str) -> str:
         return _compact_required(value)
@@ -435,18 +645,81 @@ class CourseSkillBlueprint(GenerationModel):
         artifact_paths = [item.path for item in self.artifacts]
         if len(artifact_paths) != len(set(artifact_paths)):
             raise ValueError("artifact paths must be unique")
-        required_modes: set[SkillMode] = {"learn", "practice", "apply", "reference"}
-        available_modes = {item.mode for item in self.artifacts}
-        if missing_modes := required_modes - available_modes:
+        artifact_ids = [item.id for item in self.artifacts]
+        if len(artifact_ids) != len(set(artifact_ids)):
+            raise ValueError("artifact ids must be unique")
+        known_artifacts = set(artifact_ids)
+        solutions_by_id = {
+            artifact.id for artifact in self.artifacts if artifact.path.startswith("solutions/")
+        }
+        for path in self.curriculum.paths:
+            unknown_artifacts = set(path.artifact_ids) - known_artifacts
+            if unknown_artifacts:
+                raise ValueError(
+                    f"curriculum path '{path.id}' references unknown artifacts: "
+                    + ", ".join(sorted(unknown_artifacts))
+                )
+            if leaked_solutions := set(path.artifact_ids) & solutions_by_id:
+                raise ValueError(
+                    f"curriculum path '{path.id}' cannot index solutions: "
+                    + ", ".join(sorted(leaked_solutions))
+                )
+        solution_artifacts = [
+            artifact for artifact in self.artifacts if artifact.path.startswith("solutions/")
+        ]
+        if solution_artifacts and not any(
+            artifact.path.startswith("exercises/") for artifact in self.artifacts
+        ):
+            raise ValueError("solutions require at least one separate exercise")
+
+        semantic_ids = [unit.id for unit in self.semantic_units]
+        if len(semantic_ids) != len(set(semantic_ids)):
+            raise ValueError("semantic unit ids must be unique")
+        known_semantic_units = set(semantic_ids)
+        for unit in self.semantic_units:
+            if unit.source_id not in set(source_ids):
+                raise ValueError(
+                    f"semantic unit '{unit.id}' references unknown source '{unit.source_id}'"
+                )
+            if unit.merged_into is not None and unit.merged_into not in known_semantic_units:
+                raise ValueError(
+                    f"semantic unit '{unit.id}' merges into unknown unit '{unit.merged_into}'"
+                )
+        relation_keys: set[tuple[str, str, str]] = set()
+        for relation in self.semantic_relations:
+            if (
+                relation.from_unit_id not in known_semantic_units
+                or relation.to_unit_id not in known_semantic_units
+            ):
+                raise ValueError("semantic relations must reference known semantic units")
+            key = (relation.from_unit_id, relation.to_unit_id, relation.kind)
+            if key in relation_keys:
+                raise ValueError("semantic relations cannot contain duplicates")
+            relation_keys.add(key)
+
+        represented_units: set[str] = set()
+        for artifact in self.artifacts:
+            unknown_units = set(artifact.semantic_unit_ids) - known_semantic_units
+            if unknown_units:
+                raise ValueError(
+                    f"artifact '{artifact.id}' references unknown semantic units: "
+                    + ", ".join(sorted(unknown_units))
+                )
+            represented_units.update(artifact.semantic_unit_ids)
+        missing_material = {
+            unit.id
+            for unit in self.semantic_units
+            if unit.materiality in {"core", "supporting"}
+            and unit.disposition == "included"
+            and unit.id not in represented_units
+        }
+        if missing_material:
             raise ValueError(
-                "course skill needs at least one artifact for every mode; missing: "
-                + ", ".join(sorted(missing_modes))
+                "included core or supporting semantic units need a course artifact: "
+                + ", ".join(sorted(missing_material))
             )
-        if not any(item.path.startswith("exercises/") for item in self.artifacts):
-            raise ValueError("practice mode requires at least one exercise")
-        if not any(item.path.startswith("solutions/") for item in self.artifacts):
-            raise ValueError("practice mode requires a separate rubric or solution")
-        rendered_files = {"SKILL.md", "sources.md", *artifact_paths}
+
+        rendered_files = {"SKILL.md", "source-map.md", "sources.md", *artifact_paths}
 
         claim_ids = [item.id for item in self.claims]
         if len(claim_ids) != len(set(claim_ids)):
@@ -456,6 +729,12 @@ class CourseSkillBlueprint(GenerationModel):
         for claim in self.claims:
             if claim.file not in rendered_files:
                 raise ValueError(f"claim '{claim.id}' points to an unknown rendered file")
+            unknown_units = set(claim.semantic_unit_ids) - known_semantic_units
+            if unknown_units:
+                raise ValueError(
+                    f"claim '{claim.id}' references unknown semantic units: "
+                    + ", ".join(sorted(unknown_units))
+                )
             for evidence in claim.evidence:
                 if evidence.source_id not in known_sources:
                     raise ValueError(
@@ -474,12 +753,12 @@ class CourseSkillBlueprint(GenerationModel):
         claims_by_id = {claim.id: claim for claim in self.claims}
         for asset in self.assets:
             for used_by in asset.used_by:
-                artifact = artifacts_by_path.get(used_by)
-                if artifact is None:
+                linked_artifact = artifacts_by_path.get(used_by)
+                if linked_artifact is None:
                     raise ValueError(
                         f"asset '{asset.path}' is used by unknown artifact '{used_by}'"
                     )
-                if not _artifact_uses_asset(artifact, asset.path):
+                if not _artifact_uses_asset(linked_artifact, asset.path):
                     raise ValueError(f"artifact '{used_by}' does not link to asset '{asset.path}'")
             grounded = False
             for claim_id in asset.claim_ids:
@@ -747,22 +1026,45 @@ def blueprint_seed_from_workspace(workspace: Workspace) -> dict[str, object]:
         ]
     )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "name": "replace-with-course-skill-name",
         "title": "Replace with the course title",
         "description": (
-            "Replace with when and why an Agent should teach, practice, apply, or "
-            "reference this course."
+            "Replace with the source-specific requests that should trigger this course. "
+            "Do not claim a broad generic domain."
         ),
         "scope": "Replace with the evidence-bounded learning scope.",
+        "artifact_language": "replace-with-canonical-artifact-language",
+        "interaction": {
+            "welcome": (
+                "Replace with an inviting, course-specific outcome and offer `start` "
+                "in no more than two sentences."
+            ),
+            "starter_questions": ["Replace with one to three short, high-information questions."],
+        },
+        "capability_profile": {
+            "learn": "strong",
+            "practice": "medium",
+            "apply": "medium",
+            "reference": "strong",
+            "rationale": "Replace with evidence-based relative capability depth.",
+        },
+        "curriculum": {
+            "selected_path_id": "thematic",
+            "rationale": "Replace with why the selected design fits the semantic map.",
+            "paths": [],
+        },
         "prerequisites": [],
         "core_principles": [],
+        "semantic_units": [],
+        "semantic_relations": [],
         "artifacts": [],
         "assets": [],
         "sources": sources,
         "coverage_ledger": ledger.model_dump(mode="json"),
         "claims": [],
         "limitations": limitations,
+        "parent_build_id": None,
     }
 
 
@@ -770,17 +1072,29 @@ def blueprint_authoring_payload(workspace: Workspace | None = None) -> dict[str,
     """Emit the strict schema and optional workspace-derived full-inventory seed."""
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "blueprint_schema": CourseSkillBlueprint.model_json_schema(mode="validation"),
         "blueprint_seed": (
             blueprint_seed_from_workspace(workspace) if workspace is not None else None
         ),
         "authoring_contract": {
             "seed_is_complete": False,
-            "required_modes": ["learn", "practice", "apply", "reference"],
+            "default_curriculum": "thematic",
             "notes": [
                 "Keep the preseeded sources and coverage_ledger unchanged.",
-                "Add grounded artifacts and claims; do not copy transcripts or raw media.",
+                (
+                    "Build a high-recall semantic map before curriculum artifacts; account "
+                    "for every material unit."
+                ),
+                (
+                    "Treat learn, practice, apply, and reference as capabilities, not "
+                    "artifact quotas."
+                ),
+                (
+                    "Give every artifact an independent loading reason and link it to "
+                    "semantic units and grounded claims."
+                ),
+                "Do not copy transcripts or raw media into the shareable Skill.",
                 "build-skill --workspace revalidates the ledger before rendering or installing.",
             ],
         },
@@ -951,29 +1265,13 @@ def _evidence_pointer(
     return f"{pointer}; {qualifier}{claim.confidence} confidence; `{claim.id}`"
 
 
-def _artifact_index(artifacts: list[CourseArtifact], mode: SkillMode) -> list[str]:
-    selected = [
-        item for item in artifacts if item.mode == mode and not item.path.startswith("solutions/")
-    ]
-    if not selected:
-        return ["- No dedicated file. Use the evidence map and the closest indexed material."]
-    lines: list[str] = []
-    for item in selected:
-        topics = f" Topics: {', '.join(item.topics)}." if item.topics else ""
-        lines.append(f"- [{item.title}]({item.path}) — {item.use_when}.{topics}")
-    if mode == "practice" and any(item.path.startswith("solutions/") for item in artifacts):
-        lines.append(
-            "- Matching rubrics and solutions are under `solutions/`; load one only after "
-            "an attempt or explicit request."
-        )
-    return lines
-
-
 def render_course_skill_markdown(blueprint: CourseSkillBlueprint) -> str:
-    """Render the resident, teaching-first ``SKILL.md``."""
+    """Render the V2 host-neutral, teaching-first ``SKILL.md``."""
 
     claims = {item.id: item for item in blueprint.claims}
     sources = _source_map(blueprint)
+    artifacts = {item.id: item for item in blueprint.artifacts}
+    capability = blueprint.capability_profile
     lines = [
         "---",
         f"name: {blueprint.name}",
@@ -986,43 +1284,62 @@ def render_course_skill_markdown(blueprint: CourseSkillBlueprint) -> str:
         "",
         "## Operating contract",
         "",
-        "Act as an evidence-grounded teacher and practitioner for this course. Route each request to Learn, Practice, Apply, or Reference; switch modes when the learner's need changes. Load only the smallest relevant file and never treat the package as knowledge beyond its stated scope.",
+        (
+            "Act as an evidence-grounded teacher and practitioner for this course. Infer "
+            "whether the user wants to learn, practice, apply, or look something up; do "
+            "not make them choose an internal mode. Move between behaviors when useful, "
+            "load only the smallest relevant artifact, and never treat this package as "
+            "knowledge beyond its stated scope."
+        ),
         "",
-        "When the request is ambiguous, begin in Learn mode with one short diagnostic question. Do not ask for a long intake form.",
+        (
+            f"Use {blueprint.artifact_language} as the canonical artifact language and "
+            "respond in the user's language unless they request otherwise."
+        ),
         "",
-        "## Modes",
+        "## Empty invocation",
         "",
-        "### Learn",
+        "When invoked without a specific request, load no supporting file, inspect no project, run no command, and create no file. Reply with only this welcome and wait:",
         "",
-        "1. Diagnose the learner's goal and prerequisite mastery with one question or micro-task at a time.",
-        "2. Choose the next lesson from the learning index; skip material the learner demonstrates they already understand.",
-        "3. Teach one bounded concept using an explanation, one grounded demonstration, and its timestamped evidence.",
-        "4. Ask for retrieval or application before revealing the answer. If mastery is weak, explain the misconception differently and assign a smaller follow-up.",
-        "5. End with what was mastered, what remains uncertain, and the recommended next lesson. Keep learner progress in the conversation or host memory, never in this shareable package.",
+        f"> {blueprint.interaction.welcome}",
         "",
-        "### Practice",
+        "Do not add a syllabus, mode menu, prerequisite list, evidence explanation, or feature list to that welcome.",
         "",
-        "1. Select an exercise that matches the learner's goal and observed level.",
-        "2. Present one task and its success criteria without loading or revealing the solution.",
-        "3. Evaluate the attempt against the rubric, distinguish conceptual errors from execution slips, and cite the relevant course evidence.",
-        "4. Give the smallest useful hint, allow a retry, then load the solution only after an attempt or an explicit request.",
+        "## Initial context",
         "",
-        "### Apply",
+        "After the user chooses to begin, ask only the missing questions from this course-specific set, at most three in one turn. Say that short answers are enough:",
         "",
-        "1. Inspect the user's actual context, constraints, and desired outcome before choosing a playbook.",
-        "2. Map course assumptions to the current situation and label any unsupported adaptation as an inference.",
-        "3. Execute or guide the demonstrated method through observable checkpoints; do not blindly run source-derived commands.",
-        "4. Verify the result, recover from failures with grounded alternatives, and report deviations from the demonstrated workflow.",
+        *[f"- {question}" for question in blueprint.interaction.starter_questions],
         "",
-        "### Reference",
+        "If the user already supplied enough context or asks a precise source question, proceed without an intake.",
         "",
-        "1. Answer the precise question first, then load only the indexed chapter or reference needed to support it.",
-        "2. Preserve exact terminology, labels, commands, and thresholds only when the evidence supports them.",
-        "3. Cite the source and timestamp for consequential claims. Distinguish what the course demonstrates from pedagogical interpretation or outside knowledge.",
+        "## Interaction behavior",
+        "",
+        "- **Learn:** introduce one useful cognitive move, ground it in a source example when useful, ask one retrieval or transfer question, and adapt to the answer. Do not dump a chapter or announce a formal lesson unless requested.",
+        "- **Practice:** present a task and success criteria without loading its solution. Evaluate the attempt naturally, give the smallest useful hint, allow a retry, and reveal a rubric or solution only after an attempt or explicit request.",
+        "- **Apply:** inspect only the missing parts of the user's actual context, map source assumptions to it, label adaptations as inference, and use observable checkpoints. Do not pretend a conceptual source demonstrated an operational procedure.",
+        "- **Reference:** answer the precise question first, load the smallest relevant artifact or [source map](source-map.md), preserve exact details only when supported, and cite source timestamps for consequential claims.",
+        "",
+        "Keep learner progress in the active conversation or host memory, never in this shareable package.",
         "",
         "## Evidence and uncertainty",
         "",
-        "Treat `provenance.json` as the claim-to-evidence ledger and [sources.md](sources.md) as the human-readable timestamp map. A visible-state claim requires visual evidence; an action or transition requires ordered temporal evidence. Never upgrade low-confidence or inferred material into an authoritative instruction. If the package cannot answer, state the missing evidence and ask whether to continue with clearly labeled outside knowledge.",
+        (
+            "Treat `provenance.json` as the machine-readable claim and semantic evidence "
+            "ledger, [source-map.md](source-map.md) as the high-recall meaning map, and "
+            "[sources.md](sources.md) as the source-acquisition record. A visible-state "
+            "claim requires visual evidence; an action or transition requires ordered "
+            "temporal evidence. Never upgrade low-confidence or inferred material into "
+            "an authoritative instruction."
+        ),
+        "",
+        (
+            "Use source-grounded material first. Mark teaching or application inference "
+            "naturally. When the request calls for outside or current knowledge, keep it "
+            "distinct from what the source establishes; ask permission only when a "
+            "material external action, private data, paid access, or a user-requested "
+            "source-only boundary requires it."
+        ),
         "",
     ]
 
@@ -1038,14 +1355,66 @@ def render_course_skill_markdown(blueprint: CourseSkillBlueprint) -> str:
             lines.append(f"- {principle.text} _Evidence: {_evidence_pointer(claim, sources)}._")
         lines.append("")
 
-    indexes: tuple[tuple[str, SkillMode], ...] = (
-        ("Learning index", "learn"),
-        ("Practice index", "practice"),
-        ("Application index", "apply"),
-        ("Reference index", "reference"),
+    lines.extend(
+        [
+            "## Capability profile",
+            "",
+            f"- Learn: **{capability.learn}**",
+            f"- Practice: **{capability.practice}**",
+            f"- Apply: **{capability.apply}**",
+            f"- Reference: **{capability.reference}**",
+            f"- Rationale: {capability.rationale}",
+            "",
+            "These levels describe relative depth, not user-visible modes or artifact quotas.",
+            "",
+            "## Learning paths",
+            "",
+        ]
     )
-    for heading, mode in indexes:
-        lines.extend([f"## {heading}", "", *_artifact_index(blueprint.artifacts, mode), ""])
+    ordered_paths = sorted(
+        blueprint.curriculum.paths,
+        key=lambda item: item.id != blueprint.curriculum.selected_path_id,
+    )
+    for path in ordered_paths:
+        marker = " **Recommended.**" if path.id == blueprint.curriculum.selected_path_id else ""
+        lines.append(f"### {path.title}{marker}")
+        lines.extend(["", path.use_when, ""])
+        for artifact_id in path.artifact_ids:
+            artifact = artifacts[artifact_id]
+            topics = f" Topics: {', '.join(artifact.topics)}." if artifact.topics else ""
+            lines.append(f"- [{artifact.title}]({artifact.path}) — {artifact.use_when}.{topics}")
+        lines.append("")
+    lines.extend(
+        [
+            f"Curriculum rationale: {blueprint.curriculum.rationale}",
+            "",
+            "## Additional material",
+            "",
+        ]
+    )
+    indexed_ids = {
+        artifact_id for path in blueprint.curriculum.paths for artifact_id in path.artifact_ids
+    }
+    additional = [
+        artifact
+        for artifact in blueprint.artifacts
+        if artifact.id not in indexed_ids and not artifact.path.startswith("solutions/")
+    ]
+    if additional:
+        for artifact in additional:
+            behaviors = ", ".join(artifact.modes)
+            lines.append(
+                f"- [{artifact.title}]({artifact.path}) — {artifact.use_when}. "
+                f"Behaviors: {behaviors}."
+            )
+    else:
+        lines.append("- No additional indexed artifact.")
+    if any(artifact.path.startswith("solutions/") for artifact in blueprint.artifacts):
+        lines.append(
+            "- Matching rubrics and solutions are under `solutions/`; load one only after "
+            "an attempt or explicit request."
+        )
+    lines.append("")
 
     lines.extend(
         [
@@ -1063,14 +1432,82 @@ def render_course_skill_markdown(blueprint: CourseSkillBlueprint) -> str:
                 ]
                 if blueprint.coverage_ledger is None
                 else [
-                    f"- Persisted full-course accounting is **{blueprint.coverage_ledger.state}**."
+                    (
+                        "- Persisted source-acquisition accounting is "
+                        f"**{blueprint.coverage_ledger.state}**."
+                    )
                 ]
             ),
             "- This skill contains derivative teaching material, not raw video, complete subtitles, or the extraction workspace.",
-            "- Consult [sources.md](sources.md) for coverage and `provenance.json` for exact claim mappings.",
+            "- Consult [source-map.md](source-map.md) for semantic coverage, [sources.md](sources.md) for acquisition coverage, `provenance.json` for exact mappings, and `build-manifest.json` for the portable build receipt.",
             "",
         ]
     )
+    return "\n".join(lines)
+
+
+def render_source_map_markdown(blueprint: CourseSkillBlueprint) -> str:
+    """Render the chronological, high-recall semantic map."""
+
+    lines = [
+        "# Canonical source map",
+        "",
+        (
+            "Load this file for source-faithful context, long-tail examples, qualifications, "
+            "tensions, predictions, or open questions. Curriculum artifacts may merge "
+            "presentation, but this map retains the original semantic units."
+        ),
+        "",
+    ]
+    units_by_source: dict[str, list[SemanticUnit]] = defaultdict(list)
+    for unit in blueprint.semantic_units:
+        units_by_source[unit.source_id].append(unit)
+    for source in blueprint.sources:
+        lines.extend([f"## {source.title}", ""])
+        for unit in sorted(
+            units_by_source.get(source.id, []),
+            key=lambda item: (item.start, item.end, item.id),
+        ):
+            link = _timestamp_url(source.url, unit.start)
+            timestamp = (
+                f"[{format_timestamp(unit.start)}-{format_timestamp(unit.end)}]({link})"
+                if link
+                else f"{format_timestamp(unit.start)}-{format_timestamp(unit.end)}"
+            )
+            lines.extend(
+                [
+                    f"### {timestamp} · {unit.kind} · `{unit.id}`",
+                    "",
+                    unit.summary,
+                    "",
+                ]
+            )
+            if unit.detail:
+                lines.extend([unit.detail, ""])
+            metadata = [
+                f"Materiality: {unit.materiality}",
+                f"Disposition: {unit.disposition}",
+                f"Confidence: {unit.confidence}",
+                f"Status: {'inferred' if unit.inferred else 'observed'}",
+                f"Modalities: {'+'.join(unit.modalities)}",
+            ]
+            if unit.speaker:
+                metadata.insert(0, f"Speaker: {unit.speaker}")
+            lines.extend([f"- {item}" for item in metadata])
+            if unit.disposition_reason:
+                lines.append(f"- Disposition reason: {unit.disposition_reason}")
+            if unit.merged_into:
+                lines.append(f"- Merged into: `{unit.merged_into}`")
+            lines.append("")
+    if blueprint.semantic_relations:
+        lines.extend(["## Semantic relations", ""])
+        for relation in blueprint.semantic_relations:
+            explanation = f" — {relation.explanation}" if relation.explanation else ""
+            lines.append(
+                f"- `{relation.from_unit_id}` **{relation.kind}** "
+                f"`{relation.to_unit_id}`{explanation}"
+            )
+        lines.append("")
     return "\n".join(lines)
 
 
@@ -1262,7 +1699,7 @@ def provenance_payload(blueprint: CourseSkillBlueprint) -> dict[str, object]:
     """Return validator-compatible provenance without transcript text."""
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "sources": [
             {
                 "id": source.id,
@@ -1277,7 +1714,93 @@ def provenance_payload(blueprint: CourseSkillBlueprint) -> dict[str, object]:
             if blueprint.coverage_ledger is not None
             else {"schema_version": 1, "state": "unverified"}
         ),
+        "semantic_units": [
+            unit.model_dump(mode="json", exclude_none=True) for unit in blueprint.semantic_units
+        ],
+        "semantic_relations": [
+            relation.model_dump(mode="json", exclude_none=True)
+            for relation in blueprint.semantic_relations
+        ],
         "claims": [claim.model_dump(mode="json", exclude_none=True) for claim in blueprint.claims],
+    }
+
+
+def _public_blueprint_payload(blueprint: CourseSkillBlueprint) -> dict[str, object]:
+    payload = blueprint.model_dump(mode="json", exclude_none=True)
+    assets = payload.get("assets")
+    if isinstance(assets, list):
+        for asset in assets:
+            if isinstance(asset, dict):
+                asset.pop("source_path", None)
+    return payload
+
+
+def _build_id(blueprint: CourseSkillBlueprint) -> str:
+    payload = _public_blueprint_payload(blueprint)
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"v2s-{hashlib.sha256(encoded).hexdigest()[:20]}"
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def build_manifest_payload(
+    blueprint: CourseSkillBlueprint,
+    package_root: Path,
+) -> dict[str, object]:
+    """Return the portable build receipt and generated-file ownership hashes."""
+
+    artifact_ids = {artifact.path: artifact.id for artifact in blueprint.artifacts}
+    managed_files: dict[str, object] = {}
+    for path in sorted(item for item in package_root.rglob("*") if item.is_file()):
+        relative = path.relative_to(package_root).as_posix()
+        if relative == "build-manifest.json":
+            continue
+        entry: dict[str, object] = {"sha256": _file_sha256(path)}
+        if artifact_id := artifact_ids.get(relative):
+            entry["artifact_id"] = artifact_id
+        managed_files[relative] = entry
+    source_snapshot = [
+        source.model_dump(mode="json", exclude_none=True) for source in blueprint.sources
+    ]
+    semantic_snapshot = [
+        unit.model_dump(mode="json", exclude_none=True) for unit in blueprint.semantic_units
+    ]
+    return {
+        "schema_version": 2,
+        "build_id": _build_id(blueprint),
+        "parent_build_id": blueprint.parent_build_id,
+        "generator": {
+            "name": "video-to-skill",
+            "version": __version__,
+        },
+        "artifact_language": blueprint.artifact_language,
+        "curriculum": {
+            "selected_path_id": blueprint.curriculum.selected_path_id,
+            "selected_kind": next(
+                path.kind
+                for path in blueprint.curriculum.paths
+                if path.id == blueprint.curriculum.selected_path_id
+            ),
+        },
+        "source_snapshot_digest": _ledger_digest(source_snapshot),
+        "workspace_snapshot_digest": (
+            _ledger_digest(blueprint.coverage_ledger.model_dump(mode="json"))
+            if blueprint.coverage_ledger is not None
+            else None
+        ),
+        "semantic_map_digest": _ledger_digest(semantic_snapshot),
+        "managed_files": managed_files,
     }
 
 
@@ -1320,6 +1843,10 @@ def render_course_skill_package(
     ).resolve()
     try:
         atomic_write_text(staging / "SKILL.md", render_course_skill_markdown(blueprint))
+        atomic_write_text(
+            staging / "source-map.md",
+            render_source_map_markdown(blueprint),
+        )
         atomic_write_text(staging / "sources.md", render_sources_markdown(blueprint))
         atomic_write_json(staging / "provenance.json", provenance_payload(blueprint))
         for artifact in blueprint.artifacts:
@@ -1336,6 +1863,10 @@ def render_course_skill_package(
                     raise ProcessingError(
                         "Combined sanitized course assets exceed the package byte bound"
                     )
+        atomic_write_json(
+            staging / "build-manifest.json",
+            build_manifest_payload(blueprint, staging),
+        )
         if target.exists():
             raise ProcessingError(f"Skill destination appeared during rendering: {target}")
         os.replace(staging, target)
