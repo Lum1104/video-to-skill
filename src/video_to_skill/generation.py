@@ -676,6 +676,7 @@ class CourseSkillBlueprint(GenerationModel):
         if len(semantic_ids) != len(set(semantic_ids)):
             raise ValueError("semantic unit ids must be unique")
         known_semantic_units = set(semantic_ids)
+        semantic_units_by_id = {unit.id: unit for unit in self.semantic_units}
         for unit in self.semantic_units:
             if unit.source_id not in set(source_ids):
                 raise ValueError(
@@ -685,6 +686,25 @@ class CourseSkillBlueprint(GenerationModel):
                 raise ValueError(
                     f"semantic unit '{unit.id}' merges into unknown unit '{unit.merged_into}'"
                 )
+        merge_terminals: dict[str, str] = {}
+        for unit in self.semantic_units:
+            if unit.disposition != "merged":
+                continue
+            current = unit
+            visited: set[str] = set()
+            while current.disposition == "merged":
+                if current.id in visited:
+                    raise ValueError(
+                        f"semantic unit merge chain contains a cycle at '{current.id}'"
+                    )
+                visited.add(current.id)
+                assert current.merged_into is not None
+                current = semantic_units_by_id[current.merged_into]
+            if current.disposition != "included":
+                raise ValueError(
+                    f"semantic unit '{unit.id}' merge chain must terminate at an included unit"
+                )
+            merge_terminals[unit.id] = current.id
         relation_keys: set[tuple[str, str, str]] = set()
         for relation in self.semantic_relations:
             if (
@@ -717,6 +737,12 @@ class CourseSkillBlueprint(GenerationModel):
             raise ValueError(
                 "included core or supporting semantic units need a course artifact: "
                 + ", ".join(sorted(missing_material))
+            )
+        unrepresented_merge_targets = set(merge_terminals.values()) - represented_units
+        if unrepresented_merge_targets:
+            raise ValueError(
+                "semantic unit merge chains must terminate at artifact-linked units: "
+                + ", ".join(sorted(unrepresented_merge_targets))
             )
 
         rendered_files = {"SKILL.md", "source-map.md", "sources.md", *artifact_paths}

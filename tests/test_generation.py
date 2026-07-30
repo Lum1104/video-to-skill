@@ -585,6 +585,101 @@ def test_v2_requires_material_semantic_coverage_and_disposition_reasons() -> Non
         CourseSkillBlueprint.model_validate(unexplained)
 
 
+def test_v2_requires_merge_chains_to_reach_artifact_linked_included_units() -> None:
+    self_referential = _blueprint().model_dump(mode="json")
+    self_referential["semantic_units"][0].update(
+        {
+            "disposition": "merged",
+            "disposition_reason": "Duplicate wording.",
+            "merged_into": "unit-transition",
+        }
+    )
+    with pytest.raises(ValueError, match="merge chain contains a cycle"):
+        CourseSkillBlueprint.model_validate(self_referential)
+
+    cyclic = _blueprint().model_dump(mode="json")
+    cyclic["semantic_units"][0].update(
+        {
+            "disposition": "merged",
+            "disposition_reason": "Duplicate wording.",
+            "merged_into": "unit-cycle",
+        }
+    )
+    cyclic["semantic_units"].append(
+        {
+            **cyclic["semantic_units"][0],
+            "id": "unit-cycle",
+            "merged_into": "unit-transition",
+        }
+    )
+    with pytest.raises(ValueError, match="merge chain contains a cycle"):
+        CourseSkillBlueprint.model_validate(cyclic)
+
+    omitted_terminal = _blueprint().model_dump(mode="json")
+    omitted_terminal["semantic_units"][0].update(
+        {
+            "disposition": "merged",
+            "disposition_reason": "Consolidated into the retained unit.",
+            "merged_into": "unit-omitted",
+        }
+    )
+    omitted_terminal["semantic_units"].append(
+        {
+            **omitted_terminal["semantic_units"][0],
+            "id": "unit-omitted",
+            "disposition": "omitted",
+            "disposition_reason": "Not useful to the curriculum.",
+            "merged_into": None,
+        }
+    )
+    with pytest.raises(ValueError, match="must terminate at an included unit"):
+        CourseSkillBlueprint.model_validate(omitted_terminal)
+
+    unrepresented_terminal = _blueprint().model_dump(mode="json")
+    unrepresented_terminal["semantic_units"][0].update(
+        {
+            "disposition": "merged",
+            "disposition_reason": "Consolidated into the retained unit.",
+            "merged_into": "unit-context",
+        }
+    )
+    unrepresented_terminal["semantic_units"].append(
+        {
+            **unrepresented_terminal["semantic_units"][0],
+            "id": "unit-context",
+            "materiality": "contextual",
+            "disposition": "included",
+            "disposition_reason": None,
+            "merged_into": None,
+        }
+    )
+    with pytest.raises(ValueError, match="artifact-linked units"):
+        CourseSkillBlueprint.model_validate(unrepresented_terminal)
+
+    valid = _blueprint().model_dump(mode="json")
+    valid["semantic_units"][0].update(
+        {
+            "disposition": "merged",
+            "disposition_reason": "Consolidated into the retained unit.",
+            "merged_into": "unit-retained",
+        }
+    )
+    valid["semantic_units"].append(
+        {
+            **valid["semantic_units"][0],
+            "id": "unit-retained",
+            "disposition": "included",
+            "disposition_reason": None,
+            "merged_into": None,
+        }
+    )
+    for artifact in valid["artifacts"]:
+        artifact["semantic_unit_ids"] = ["unit-retained"]
+
+    blueprint = CourseSkillBlueprint.model_validate(valid)
+    assert blueprint.semantic_units[0].merged_into == "unit-retained"
+
+
 def test_v2_allows_evidence_driven_artifact_collections() -> None:
     payload = _blueprint().model_dump(mode="json")
     for artifact in payload["artifacts"]:
