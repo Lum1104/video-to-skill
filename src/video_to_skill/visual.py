@@ -102,6 +102,10 @@ def difference_hash(path: Path, hash_size: int = 8) -> str:
             rgb = image.convert("RGB")
             try:
                 average_color = rgb.resize((1, 1)).getpixel((0, 0))
+                if not isinstance(average_color, tuple) or len(average_color) != 3:
+                    raise ProcessingError(
+                        f"Cannot compute an RGB average color for extracted frame {path}"
+                    )
                 grayscale = rgb.convert("L").resize((hash_size + 1, hash_size))
                 try:
                     pixels = list(grayscale.getdata())
