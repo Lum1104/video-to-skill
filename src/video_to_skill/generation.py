@@ -51,6 +51,7 @@ MAX_WORKSPACE_LEDGER_ENTRIES = 10_000
 MAX_BLUEPRINT_AUTHORING_JSON_BYTES = 8 * 1024 * 1024
 
 SkillMode = Literal["learn", "practice", "apply", "reference"]
+ArtifactDisclosure = Literal["normal", "after-attempt"]
 Confidence = Literal["high", "medium", "low"]
 CoverageStatus = Literal["complete", "partial", "failed", "skipped"]
 EvidenceModality = Literal["speech", "visual", "ocr", "metadata", "temporal"]
@@ -329,6 +330,7 @@ class CourseArtifact(GenerationModel):
     path: str
     title: str = Field(min_length=1, max_length=300)
     modes: list[SkillMode] = Field(min_length=1, max_length=4)
+    disclosure: ArtifactDisclosure
     use_when: str = Field(min_length=1, max_length=500)
     independent_loading_reason: str = Field(min_length=1, max_length=500)
     semantic_unit_ids: list[str] = Field(min_length=1)
@@ -649,8 +651,8 @@ class CourseSkillBlueprint(GenerationModel):
         if len(artifact_ids) != len(set(artifact_ids)):
             raise ValueError("artifact ids must be unique")
         known_artifacts = set(artifact_ids)
-        solutions_by_id = {
-            artifact.id for artifact in self.artifacts if artifact.path.startswith("solutions/")
+        withheld_artifact_ids = {
+            artifact.id for artifact in self.artifacts if artifact.disclosure == "after-attempt"
         }
         for path in self.curriculum.paths:
             unknown_artifacts = set(path.artifact_ids) - known_artifacts
@@ -659,18 +661,22 @@ class CourseSkillBlueprint(GenerationModel):
                     f"curriculum path '{path.id}' references unknown artifacts: "
                     + ", ".join(sorted(unknown_artifacts))
                 )
-            if leaked_solutions := set(path.artifact_ids) & solutions_by_id:
+            if leaked_artifacts := set(path.artifact_ids) & withheld_artifact_ids:
                 raise ValueError(
-                    f"curriculum path '{path.id}' cannot index solutions: "
-                    + ", ".join(sorted(leaked_solutions))
+                    f"curriculum path '{path.id}' cannot index after-attempt artifacts: "
+                    + ", ".join(sorted(leaked_artifacts))
                 )
-        solution_artifacts = [
-            artifact for artifact in self.artifacts if artifact.path.startswith("solutions/")
+        withheld_artifacts = [
+            artifact for artifact in self.artifacts if artifact.disclosure == "after-attempt"
         ]
-        if solution_artifacts and not any(
-            artifact.path.startswith("exercises/") for artifact in self.artifacts
+        if withheld_artifacts and not any(
+            artifact.disclosure == "normal" and "practice" in artifact.modes
+            for artifact in self.artifacts
         ):
-            raise ValueError("solutions require at least one separate exercise")
+            raise ValueError(
+                "after-attempt artifacts require at least one separate, normally disclosed "
+                "practice artifact"
+            )
 
         semantic_ids = [unit.id for unit in self.semantic_units]
         if len(semantic_ids) != len(set(semantic_ids)):
@@ -1424,7 +1430,7 @@ def render_course_skill_markdown(blueprint: CourseSkillBlueprint) -> str:
     additional = [
         artifact
         for artifact in blueprint.artifacts
-        if artifact.id not in indexed_ids and not artifact.path.startswith("solutions/")
+        if artifact.id not in indexed_ids and artifact.disclosure == "normal"
     ]
     if additional:
         for artifact in additional:
@@ -1435,10 +1441,10 @@ def render_course_skill_markdown(blueprint: CourseSkillBlueprint) -> str:
             )
     else:
         lines.append("- No additional indexed artifact.")
-    if any(artifact.path.startswith("solutions/") for artifact in blueprint.artifacts):
+    if any(artifact.disclosure == "after-attempt" for artifact in blueprint.artifacts):
         lines.append(
-            "- Matching rubrics and solutions are under `solutions/`; load one only after "
-            "an attempt or explicit request."
+            "- Matching rubrics, answer keys, or solutions are intentionally unindexed; "
+            "load one only after an attempt or explicit request."
         )
     lines.append("")
 

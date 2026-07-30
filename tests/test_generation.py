@@ -55,6 +55,7 @@ def _blueprint() -> CourseSkillBlueprint:
             path="chapters/foundations.md",
             title="Foundations",
             modes=["learn", "reference"],
+            disclosure="normal",
             use_when="learning the core model",
             independent_loading_reason="Load the foundational concept independently.",
             semantic_unit_ids=["unit-transition"],
@@ -70,6 +71,7 @@ def _blueprint() -> CourseSkillBlueprint:
             path="exercises/observe-transition.md",
             title="Observe a transition",
             modes=["practice"],
+            disclosure="normal",
             use_when="checking whether the learner can distinguish intent from result",
             independent_loading_reason="Present practice without loading its solution.",
             semantic_unit_ids=["unit-transition"],
@@ -84,6 +86,7 @@ def _blueprint() -> CourseSkillBlueprint:
             path="solutions/observe-transition.md",
             title="Observe a transition rubric",
             modes=["practice"],
+            disclosure="after-attempt",
             use_when="grading an attempt",
             independent_loading_reason="Withhold the rubric until after an attempt.",
             semantic_unit_ids=["unit-transition"],
@@ -94,6 +97,7 @@ def _blueprint() -> CourseSkillBlueprint:
             path="playbooks/verify-transition.md",
             title="Verify a transition",
             modes=["apply"],
+            disclosure="normal",
             use_when="applying the demonstrated verification method",
             independent_loading_reason="Load the procedure only for real application.",
             semantic_unit_ids=["unit-transition"],
@@ -108,6 +112,7 @@ def _blueprint() -> CourseSkillBlueprint:
             path="reference/evidence-types.md",
             title="Evidence types",
             modes=["reference"],
+            disclosure="normal",
             use_when="looking up which modality supports a claim",
             independent_loading_reason="Answer precise evidence questions without a chapter.",
             semantic_unit_ids=["unit-transition"],
@@ -692,6 +697,30 @@ def test_v2_allows_evidence_driven_artifact_collections() -> None:
     blueprint = CourseSkillBlueprint.model_validate(payload)
 
     assert blueprint.artifacts[0].path == "founder-decisions/foundations.md"
+
+
+def test_v2_withholds_after_attempt_artifacts_independently_of_path(
+    tmp_path: Path,
+) -> None:
+    payload = _blueprint().model_dump(mode="json")
+    for artifact in payload["artifacts"]:
+        if artifact["id"] == "artifact-solution":
+            artifact["path"] = "answer-keys/observe-transition.md"
+    for claim in payload["claims"]:
+        if claim["file"] == "solutions/observe-transition.md":
+            claim["file"] = "answer-keys/observe-transition.md"
+
+    blueprint = CourseSkillBlueprint.model_validate(payload)
+    target = render_course_skill_package(blueprint, tmp_path / "transition-course")
+    resident = (target / "SKILL.md").read_text(encoding="utf-8")
+
+    assert "answer-keys/observe-transition.md" not in resident
+    assert "intentionally unindexed" in resident
+    assert (target / "answer-keys" / "observe-transition.md").is_file()
+
+    payload["curriculum"]["paths"][0]["artifact_ids"].append("artifact-solution")
+    with pytest.raises(ValueError, match="cannot index after-attempt artifacts"):
+        CourseSkillBlueprint.model_validate(payload)
 
 
 def test_build_manifest_detects_human_modified_generated_file(tmp_path: Path) -> None:

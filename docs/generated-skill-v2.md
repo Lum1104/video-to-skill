@@ -560,6 +560,7 @@ Every artifact records:
 
 - stable artifact ID;
 - supported behaviors;
+- disclosure policy (`normal` or `after-attempt`);
 - when to load it;
 - independent loading reason;
 - semantic unit IDs;
@@ -597,7 +598,9 @@ Large course
 ```
 
 Do not require fixed directories. Exercises with answers always keep solutions
-separate and unindexed until an attempt or explicit request.
+separate with an explicit `after-attempt` disclosure policy. The renderer uses
+that policy, not a directory name, to keep them unindexed until an attempt or
+explicit request.
 
 ## Capability profile
 

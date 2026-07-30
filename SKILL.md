@@ -226,7 +226,7 @@ After the semantic map is complete and before artifact authoring, propose two or
 
 Ask the user to choose the learning experience, not a chapter count. Preserve the semantic map regardless of the choice. Alternate paths may reference the same canonical content without duplicating it.
 
-Create an artifact only when users may request it independently, it is rarely needed, it must be withheld, it is large enough to benefit from progressive disclosure, it represents a distinct workflow, or it uses a machine-readable format. Give every artifact a stable ID, supported behaviors, use condition, independent loading reason, semantic-unit links, and grounded claims. If no independent loading reason exists, merge it with the nearest artifact.
+Create an artifact only when users may request it independently, it is rarely needed, it must be withheld, it is large enough to benefit from progressive disclosure, it represents a distinct workflow, or it uses a machine-readable format. Give every artifact a stable ID, supported behaviors, an explicit `normal` or `after-attempt` disclosure policy, use condition, independent loading reason, semantic-unit links, and grounded claims. If no independent loading reason exists, merge it with the nearest artifact.
 
 ## 8. Generate the course-specific Skill
 
@@ -287,7 +287,7 @@ Keep learner progress in the active conversation or host memory, not in the shar
 
 Artifacts follow semantic and loading boundaries rather than video or behavior quotas. They may contain a core idea, source reasoning, examples, qualifications, misconceptions, diagnostic prompts, transfer prompts, and deepening prompts, but the runtime selects what is useful instead of emitting the template.
 
-Exercises and solutions are separate. Label exercises, hints, rubrics, and conceptual application workflows as generator-created when the source did not demonstrate them. Do not index solution files where the consuming agent might load them before an attempt.
+Exercises and solutions are separate. Label exercises, hints, rubrics, and conceptual application workflows as generator-created when the source did not demonstrate them. Mark solutions and answer-bearing rubrics `after-attempt`; do not rely on their directory name or index them where the consuming agent might load them before an attempt.
 
 ### Provenance
 
