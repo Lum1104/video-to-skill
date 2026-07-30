@@ -13,7 +13,7 @@ license-files = ["LICENSE"]
 authors = [{ name = "video-to-skill contributors" }]
 dependencies = [
   "httpx>=0.27,<1",
-  "pillow>=10.3,<12",
+  "pillow>=10.3,<13",
   "platformdirs>=4.2,<5",
   "pydantic>=2.7,<3",
   "typer>=0.12,<1",
