@@ -1,0 +1,468 @@
+import json
+from pathlib import Path
+
+import pytest
+from PIL import Image
+from pydantic import ValidationError as PydanticValidationError
+
+from video_to_skill.errors import ProcessingError
+from video_to_skill.generation import (
+    COURSE_SKILL_MARKER,
+    CorePrinciple,
+    CourseArtifact,
+    CourseAsset,
+    CourseSkillBlueprint,
+    CourseSkillClaim,
+    CourseSkillSource,
+    blueprint_from_json,
+    render_course_skill_package,
+)
+from video_to_skill.validation import validate_skill
+
+
+def test_generator_skill_owns_the_complete_user_workflow() -> None:
+    generator = (Path(__file__).parents[1] / "SKILL.md").read_text(encoding="utf-8")
+    assert "One invocation owns the complete workflow" in generator
+    assert "process every accessible item by default" in generator
+    assert "Do not create a second generic video tutor Skill" in generator
+    assert "Learn, Practice, Apply, and Reference itself" in generator
+    assert "blueprint-schema --workspace WORKSPACE --output AUTHORING_JSON" in generator
+    assert "`blueprint_schema`" in generator
+    assert "Preserve the seed's `sources` and `coverage_ledger` exactly" in generator
+    assert "build-skill BLUEPRINT_JSON --host claude" in generator
+    assert "build-skill BLUEPRINT_JSON --host codex" in generator
+
+
+def _blueprint() -> CourseSkillBlueprint:
+    evidence = {
+        "source_id": "course-01",
+        "start": 62,
+        "end": 75,
+        "modalities": ["speech", "visual", "temporal"],
+        "evidence_ids": ["transcript-1", "frame-before", "frame-after"],
+    }
+    artifacts = [
+        CourseArtifact(
+            path="chapters/foundations.md",
+            title="Foundations",
+            mode="learn",
+            use_when="learning the core model",
+            topics=["state transitions"],
+            content=(
+                "# Foundations\n\n## Core idea\n\nObserve both the action and its result.\n\n"
+                "## Knowledge check\n\nWhat evidence establishes a transition?\n\n"
+                "## Evidence\n\n`claim-foundation`\n"
+            ),
+        ),
+        CourseArtifact(
+            path="exercises/observe-transition.md",
+            title="Observe a transition",
+            mode="practice",
+            use_when="checking whether the learner can distinguish intent from result",
+            topics=["evidence"],
+            content=(
+                "# Observe a transition\n\n## Task\n\nIdentify the before and after states.\n\n"
+                "## Success criteria\n\nBoth states are grounded in frames.\n"
+            ),
+        ),
+        CourseArtifact(
+            path="solutions/observe-transition.md",
+            title="Observe a transition rubric",
+            mode="practice",
+            use_when="grading an attempt",
+            content="# Rubric\n\nAward credit only when both states are cited.\n",
+        ),
+        CourseArtifact(
+            path="playbooks/verify-transition.md",
+            title="Verify a transition",
+            mode="apply",
+            use_when="applying the demonstrated verification method",
+            topics=["verification"],
+            content=(
+                "# Verify a transition\n\n## Procedure\n\n1. Capture the before and after "
+                "states.\n\n## Verification\n\nConfirm both states are visible.\n"
+            ),
+        ),
+        CourseArtifact(
+            path="reference/evidence-types.md",
+            title="Evidence types",
+            mode="reference",
+            use_when="looking up which modality supports a claim",
+            topics=["speech", "visual", "temporal"],
+            content="# Evidence types\n\nUse temporal evidence for transitions.\n",
+        ),
+    ]
+    claims = [
+        CourseSkillClaim(
+            id="claim-core",
+            file="SKILL.md",
+            kind="principle",
+            summary="A transition requires before and after evidence.",
+            inferred=False,
+            confidence="high",
+            evidence=[evidence],
+        ),
+        CourseSkillClaim(
+            id="claim-foundation",
+            file="chapters/foundations.md",
+            kind="concept",
+            summary="Actions and results need different evidence.",
+            inferred=False,
+            confidence="high",
+            evidence=[evidence],
+        ),
+        CourseSkillClaim(
+            id="claim-practice",
+            file="exercises/observe-transition.md",
+            kind="exercise-basis",
+            summary="The demonstrated transition can be used for retrieval practice.",
+            inferred=True,
+            confidence="medium",
+            evidence=[evidence],
+        ),
+        CourseSkillClaim(
+            id="claim-solution",
+            file="solutions/observe-transition.md",
+            kind="rubric-basis",
+            summary="A valid answer identifies both observable states.",
+            inferred=True,
+            confidence="medium",
+            evidence=[evidence],
+        ),
+        CourseSkillClaim(
+            id="claim-step",
+            file="playbooks/verify-transition.md",
+            kind="procedure-step",
+            summary="Capture observable states before and after the action.",
+            inferred=False,
+            confidence="high",
+            evidence=[evidence],
+        ),
+        CourseSkillClaim(
+            id="claim-reference",
+            file="reference/evidence-types.md",
+            kind="reference",
+            summary="Temporal evidence supports transition claims.",
+            inferred=False,
+            confidence="high",
+            evidence=[evidence],
+        ),
+    ]
+    return CourseSkillBlueprint(
+        name="transition-course",
+        title="Transition Course",
+        description=(
+            "Teach and apply the course's evidence-grounded transition method. "
+            "Use for lessons, practice, project application, or precise reference."
+        ),
+        scope="Learn how to establish and verify observable state transitions.",
+        prerequisites=["Can inspect a before and after state."],
+        core_principles=[
+            CorePrinciple(
+                text="Require before and after evidence for a transition.",
+                claim_id="claim-core",
+            )
+        ],
+        artifacts=artifacts,
+        sources=[
+            CourseSkillSource(
+                id="course-01",
+                title="Transition Demo",
+                creator="Instructor",
+                platform="youtube",
+                url="https://youtu.be/example",
+                coverage="complete",
+            )
+        ],
+        claims=claims,
+        limitations=["The course demonstrates one interface variant."],
+    )
+
+
+def _blueprint_with_asset(workspace: Path, source_path: Path) -> CourseSkillBlueprint:
+    payload = _blueprint().model_dump(mode="json")
+    for artifact in payload["artifacts"]:
+        if artifact["path"] == "chapters/foundations.md":
+            artifact["content"] += "\n![Observed state](../assets/observed-state.png)\n"
+            break
+    payload["assets"] = [
+        CourseAsset(
+            path="assets/observed-state.png",
+            source_path=source_path,
+            description="Observed before and after state",
+            used_by=["chapters/foundations.md"],
+            claim_ids=["claim-foundation"],
+        ).model_dump(mode="json")
+    ]
+    return CourseSkillBlueprint.model_validate(payload)
+
+
+def test_rendered_course_skill_is_teaching_first_and_valid(tmp_path: Path) -> None:
+    target = render_course_skill_package(
+        _blueprint(),
+        tmp_path / "skills" / "transition-course",
+        workspace_root=tmp_path / "workspace",
+    )
+
+    resident = (target / "SKILL.md").read_text(encoding="utf-8")
+    assert COURSE_SKILL_MARKER in resident
+    for mode in ("Learn", "Practice", "Apply", "Reference"):
+        assert f"### {mode}" in resident
+    assert "one short diagnostic question" in resident
+    assert "without loading or revealing the solution" in resident
+    assert "user's actual context" in resident
+    assert "missing evidence" in resident
+    assert "solutions/observe-transition.md" not in resident
+
+    sources = (target / "sources.md").read_text(encoding="utf-8")
+    assert "https://youtu.be/example?t=62" in sources
+    assert "speech+visual+temporal" in sources
+
+    report = validate_skill(target, run_official=True)
+    assert report.valid, report.model_dump()
+
+
+def test_renderer_copies_only_sanitized_minimal_course_assets(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    source = workspace / "frames" / "state.jpg"
+    source.parent.mkdir(parents=True)
+    exif = Image.Exif()
+    exif[0x010E] = "private workspace description"
+    Image.new("RGB", (320, 180), "#2d5aa6").save(source, exif=exif)
+
+    target = render_course_skill_package(
+        _blueprint_with_asset(workspace, Path("frames/state.jpg")),
+        tmp_path / "transition-course",
+        workspace_root=workspace,
+    )
+
+    copied = target / "assets" / "observed-state.png"
+    assert copied.is_file()
+    with Image.open(copied) as image:
+        assert image.format == "PNG"
+        assert image.size == (320, 180)
+        assert not image.getexif()
+    assert source.is_file()
+    assert "assets/observed-state.png" in (target / "sources.md").read_text(encoding="utf-8")
+    assert validate_skill(target, run_official=False).valid
+
+
+def test_blueprint_accepts_legacy_singular_modality_but_emits_modalities(
+    tmp_path: Path,
+) -> None:
+    payload = _blueprint().model_dump(mode="json")
+    evidence = payload["claims"][0]["evidence"][0]
+    evidence["modality"] = "speech+visual"
+    del evidence["modalities"]
+    blueprint = CourseSkillBlueprint.model_validate(payload)
+
+    target = render_course_skill_package(blueprint, tmp_path / "transition-course")
+    provenance = (target / "provenance.json").read_text(encoding="utf-8")
+    assert '"modalities": [' in provenance
+    assert '"modality"' not in provenance
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://user:password@example.com/course",
+        "https://example.com/course?access_token=secret",
+        "https://example.com/course#access_token=secret",
+        "https://example.com/course#AUTH_TOKEN=secret",
+        "https://example.com/course#oauth_token=secret",
+        "https://example.com/course#bearer_token=secret",
+        "https://example.com/course#access%5Ftoken=secret",
+        "https://example.com/course#oauth%255Ftoken=secret",
+        "https://example.com/course#state=ok;access_token=secret",
+        "https://example.com/course#state=ok%3Baccess_token=secret",
+        "https://example.com/course#/callback?oauth_token=secret",
+        "https://example.com/course?X-Amz-Signature=deadbeef",
+        "https://example.com/course?expires=1999999999&sig=deadbeef",
+        "https://example.com/course?api-key=secret",
+    ],
+)
+def test_course_source_rejects_credentialed_or_temporary_urls(url: str) -> None:
+    payload = _blueprint().model_dump(mode="json")
+    payload["sources"][0]["url"] = url
+
+    with pytest.raises(ValueError, match=r"userinfo|sensitive or temporary"):
+        CourseSkillBlueprint.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://www.youtube.com/watch?v=abc123&list=course&index=2&t=15",
+        "https://www.bilibili.com/video/BV123?spm_id_from=333.1007&vd_source=public",
+        "https://example.com/course#lesson-2",
+    ],
+)
+def test_course_source_preserves_normal_public_video_parameters(url: str) -> None:
+    payload = _blueprint().model_dump(mode="json")
+    payload["sources"][0]["url"] = url
+
+    blueprint = CourseSkillBlueprint.model_validate(payload)
+
+    assert blueprint.sources[0].url == url
+
+
+@pytest.mark.parametrize("payload", ['{"name":', "{}"])
+def test_blueprint_loader_wraps_invalid_json_as_processing_error(
+    tmp_path: Path,
+    payload: str,
+) -> None:
+    path = tmp_path / "blueprint.json"
+    path.write_text(payload, encoding="utf-8")
+
+    with pytest.raises(ProcessingError, match="Invalid course skill blueprint"):
+        blueprint_from_json(path)
+
+
+def test_blueprint_validation_errors_never_echo_sensitive_url_input(
+    tmp_path: Path,
+) -> None:
+    marker = "DO_NOT_ECHO_SECRET_7b4a"
+    ordinary_fields = "&".join(f"k{index}=v" for index in range(257))
+    sensitive_url = f"https://example.com/course?{ordinary_fields}&access_token={marker}"
+    assert len(sensitive_url) < 4_000
+    payload = _blueprint().model_dump(mode="json")
+    payload["sources"][0]["url"] = sensitive_url
+
+    with pytest.raises(PydanticValidationError) as direct_error:
+        CourseSkillBlueprint.model_validate(payload)
+    assert marker not in str(direct_error.value)
+    assert "bounded query/fragment parameter limit" in str(direct_error.value)
+
+    path = tmp_path / "sensitive-blueprint.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ProcessingError) as wrapped_error:
+        blueprint_from_json(path)
+    assert marker not in str(wrapped_error.value)
+    assert "Invalid course skill blueprint" in str(wrapped_error.value)
+
+
+def test_renderer_keeps_workspace_and_shareable_skill_separate(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    with pytest.raises(ProcessingError, match="must be separate"):
+        render_course_skill_package(
+            _blueprint(),
+            workspace / "generated-skill",
+            workspace_root=workspace,
+        )
+    assert not (workspace / "generated-skill").exists()
+
+
+@pytest.mark.parametrize("extension", [".bmp", ".txt"])
+def test_renderer_rejects_unsupported_asset_sources(
+    tmp_path: Path,
+    extension: str,
+) -> None:
+    workspace = tmp_path / "workspace"
+    source = workspace / "frames" / f"state{extension}"
+    source.parent.mkdir(parents=True)
+    if extension == ".bmp":
+        Image.new("RGB", (16, 16), "white").save(source)
+    else:
+        source.write_text("not an image", encoding="utf-8")
+
+    with pytest.raises(ProcessingError, match="format is unsupported"):
+        render_course_skill_package(
+            _blueprint_with_asset(workspace, source),
+            tmp_path / "transition-course",
+            workspace_root=workspace,
+        )
+
+
+def test_renderer_rejects_asset_path_escape_and_symlink(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside.png"
+    Image.new("RGB", (16, 16), "white").save(outside)
+
+    with pytest.raises(ProcessingError, match="escapes the evidence workspace"):
+        render_course_skill_package(
+            _blueprint_with_asset(workspace, outside),
+            tmp_path / "escaped-course",
+            workspace_root=workspace,
+        )
+
+    linked = workspace / "linked.png"
+    linked.symlink_to(outside)
+    with pytest.raises(ProcessingError, match="cannot use symlinks"):
+        render_course_skill_package(
+            _blueprint_with_asset(workspace, linked),
+            tmp_path / "linked-course",
+            workspace_root=workspace,
+        )
+
+
+def test_renderer_rejects_asset_dimension_over_bound(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    source = workspace / "wide.png"
+    workspace.mkdir()
+    Image.new("RGB", (4097, 1), "white").save(source)
+
+    with pytest.raises(ProcessingError, match="dimensions exceed"):
+        render_course_skill_package(
+            _blueprint_with_asset(workspace, source),
+            tmp_path / "transition-course",
+            workspace_root=workspace,
+        )
+
+
+def test_renderer_refuses_existing_destination(tmp_path: Path) -> None:
+    target = tmp_path / "transition-course"
+    target.mkdir()
+    (target / "user-notes.md").write_text("preserve me", encoding="utf-8")
+
+    with pytest.raises(ProcessingError, match="already exists"):
+        render_course_skill_package(_blueprint(), target)
+    assert (target / "user-notes.md").read_text(encoding="utf-8") == "preserve me"
+
+
+def test_blueprint_requires_grounded_artifacts_for_all_four_modes() -> None:
+    payload = _blueprint().model_dump(mode="json")
+    payload["artifacts"] = [item for item in payload["artifacts"] if item["mode"] != "reference"]
+    payload["claims"] = [
+        item for item in payload["claims"] if item["file"] != "reference/evidence-types.md"
+    ]
+
+    with pytest.raises(ValueError, match="every mode; missing: reference"):
+        CourseSkillBlueprint.model_validate(payload)
+
+
+def test_blueprint_requires_asset_link_and_visual_provenance(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    source = workspace / "state.png"
+    workspace.mkdir()
+    Image.new("RGB", (16, 16), "white").save(source)
+    linked = _blueprint_with_asset(workspace, source).model_dump(mode="json")
+
+    for artifact in linked["artifacts"]:
+        if artifact["path"] == "chapters/foundations.md":
+            artifact["content"] = artifact["content"].replace(
+                "\n![Observed state](../assets/observed-state.png)\n",
+                "",
+            )
+    with pytest.raises(ValueError, match="does not link to asset"):
+        CourseSkillBlueprint.model_validate(linked)
+
+    ungrounded = _blueprint_with_asset(workspace, source).model_dump(mode="json")
+    for claim in ungrounded["claims"]:
+        if claim["id"] == "claim-foundation":
+            claim["evidence"][0]["modalities"] = ["speech"]
+    with pytest.raises(ValueError, match="needs a visual or temporal claim"):
+        CourseSkillBlueprint.model_validate(ungrounded)
+
+
+def test_course_contract_validator_rejects_missing_mode(tmp_path: Path) -> None:
+    target = render_course_skill_package(_blueprint(), tmp_path / "transition-course")
+    skill = target / "SKILL.md"
+    skill.write_text(
+        skill.read_text(encoding="utf-8").replace("### Practice", "### Exercises"),
+        encoding="utf-8",
+    )
+
+    report = validate_skill(target, run_official=False)
+    assert not report.valid
+    assert "missing-course-mode" in {item.code for item in report.issues}

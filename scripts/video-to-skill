@@ -1,0 +1,23 @@
+#!/bin/sh
+set -eu
+
+script_dir=$(CDPATH= cd "$(dirname "$0")" && pwd)
+
+if [ -n "${VIDEO_TO_SKILL_PYTHON:-}" ]; then
+  python_executable=$VIDEO_TO_SKILL_PYTHON
+else
+  python_executable=
+  for candidate in python3.12 python3.11 python3.13 python3; do
+    if command -v "$candidate" >/dev/null 2>&1 &&
+      "$candidate" -c 'import sys; raise SystemExit(not ((3, 11) <= sys.version_info[:2] < (3, 14)))' >/dev/null 2>&1; then
+      python_executable=$candidate
+      break
+    fi
+  done
+  if [ -z "$python_executable" ]; then
+    echo "video-to-skill needs Python 3.11, 3.12, or 3.13." >&2
+    exit 127
+  fi
+fi
+
+exec "$python_executable" "$script_dir/video_to_skill.py" "$@"

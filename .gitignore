@@ -1,0 +1,15 @@
+.DS_Store
+.coverage
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.venv/
+__pycache__/
+build/
+dist/
+*.egg-info/
+*.py[cod]
+
+# Local media and evidence workspaces may contain copyrighted/private content.
+.video-to-skill/
+video_skill_work/

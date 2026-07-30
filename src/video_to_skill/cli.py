@@ -1,0 +1,977 @@
+"""Command-line interface for deterministic video evidence processing."""
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+from typing import Annotated
+
+import typer
+
+from video_to_skill import __version__
+from video_to_skill.agentic import (
+    MAX_ANNOTATION_PAYLOAD_BYTES,
+    analyze_evidence_gaps,
+    assemble_agent_context,
+    ingest_annotations,
+)
+from video_to_skill.config import Settings, load_settings
+from video_to_skill.doctor import diagnostics_ok, run_diagnostics
+from video_to_skill.errors import ProcessingError, VideoToSkillError
+from video_to_skill.evaluation import (
+    evaluate_workspace,
+    load_labels,
+    render_evaluation_report,
+)
+from video_to_skill.generation import (
+    blueprint_authoring_payload,
+    blueprint_from_json,
+    encode_blueprint_authoring_payload,
+    render_course_skill_package,
+    validate_blueprint_against_workspace,
+)
+from video_to_skill.installation import (
+    SkillHost,
+    host_skill_root,
+    install_generated_skill,
+    install_generator_skill,
+)
+from video_to_skill.investigation import (
+    MAX_CONTACT_SHEET_EVENTS,
+    extract_workspace_window_frames,
+    generate_contact_sheet,
+)
+from video_to_skill.maintenance import clean_cached_media
+from video_to_skill.models import AgentContext, EvidenceGap, VisualEvent
+from video_to_skill.pipeline import (
+    default_workspace_path,
+    extract_sources,
+    inspect_inputs_with_completeness,
+)
+from video_to_skill.query import (
+    inventory_markdown,
+    parse_time,
+    query_workspace,
+    render_query_markdown,
+    select_source,
+)
+from video_to_skill.sources import describe_source
+from video_to_skill.transcript import load_transcriber
+from video_to_skill.utils import atomic_write_text, format_timestamp
+from video_to_skill.validation import render_validation_report, validate_skill
+from video_to_skill.workspace import Workspace
+
+app = typer.Typer(
+    name="video-to-skill",
+    help="Compile videos and courses into grounded Agent Skill evidence.",
+    no_args_is_help=True,
+    pretty_exceptions_enable=False,
+)
+
+
+def _version(value: bool) -> None:
+    if value:
+        typer.echo(__version__)
+        raise typer.Exit()
+
+
+@app.callback()
+def main(
+    version: Annotated[
+        bool,
+        typer.Option("--version", callback=_version, is_eager=True, help="Show version."),
+    ] = False,
+) -> None:
+    del version
+
+
+def _settings(
+    config: Path | None,
+    *,
+    language: str | None = None,
+    visual_profile: str | None = None,
+    max_workers: int | None = None,
+) -> Settings:
+    return load_settings(
+        config,
+        language=language,
+        visual_profile=visual_profile,
+        max_workers=max_workers,
+    )
+
+
+def _output_format(value: str) -> str:
+    normalized = value.casefold()
+    if normalized not in {"markdown", "json"}:
+        raise ProcessingError("--format must be 'markdown' or 'json'")
+    return normalized
+
+
+def _sample_visuals(events: list[VisualEvent], limit: int) -> list[VisualEvent]:
+    if limit < 1 or limit > MAX_CONTACT_SHEET_EVENTS:
+        raise ProcessingError(f"--max-events must be between 1 and {MAX_CONTACT_SHEET_EVENTS}")
+    if len(events) <= limit:
+        return events
+    if limit == 1:
+        return [events[0]]
+    last = len(events) - 1
+    indices = [round(position * last / (limit - 1)) for position in range(limit)]
+    return [events[index] for index in indices]
+
+
+def _render_agent_context(context: AgentContext) -> str:
+    source = context.source
+    lines = [
+        f"# Agent Context: {source.title}",
+        "",
+        f"- Source ID: `{source.id}`",
+        (
+            f"- Window: {format_timestamp(context.window.start)}-"
+            f"{format_timestamp(context.window.end)}"
+        ),
+        f"- Truncated: {'yes' if context.truncated else 'no'}",
+        "",
+        "## Transcript evidence",
+        "",
+    ]
+    for transcript in context.transcripts:
+        lines.append(
+            f"- {format_timestamp(transcript.start)}-{format_timestamp(transcript.end)} "
+            f"`{transcript.id}`: {transcript.text}"
+        )
+    lines.extend(["", "## Visual evidence", ""])
+    for visual in context.visuals:
+        lines.append(
+            f"- {format_timestamp(visual.timestamp)} `{visual.kind.value}` "
+            f"`{visual.id}`: `{visual.path}`"
+        )
+        if visual.ocr_text:
+            lines.append(f"  - OCR: {visual.ocr_text.replace(chr(10), ' · ')}")
+        if visual.description:
+            lines.append(f"  - Visible state: {visual.description}")
+    lines.extend(["", "## Agent observations", ""])
+    for observation in context.observations:
+        lines.append(
+            f"- {format_timestamp(observation.start)}-"
+            f"{format_timestamp(observation.end)} `{observation.type.value}` "
+            f"`{observation.status.value}` confidence={observation.confidence:.2f} "
+            f"`{observation.id}`: {observation.claim}"
+        )
+        references = [*observation.frame_ids, *observation.transcript_ids]
+        if references:
+            lines.append(f"  - Evidence: {', '.join(f'`{item}`' for item in references)}")
+        if observation.uncertainty:
+            lines.append(f"  - Uncertainty: {observation.uncertainty}")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _render_gaps(gaps: list[EvidenceGap]) -> str:
+    if not gaps:
+        return "# Evidence Gaps\n\nNo evidence gaps detected.\n"
+    lines = ["# Evidence Gaps", ""]
+    for gap in gaps:
+        state = "resolved" if gap.resolved else "open"
+        lines.extend(
+            [
+                (
+                    f"## {gap.severity.value.upper()} · {gap.gap_type.value} · "
+                    f"{format_timestamp(gap.start)}-{format_timestamp(gap.end)}"
+                ),
+                "",
+                f"- Gap ID: `{gap.id}`",
+                f"- Source ID: `{gap.source_id}`",
+                f"- State: {state}",
+                f"- Finding: {gap.message}",
+                f"- Next action: {gap.suggested_next_action}",
+            ]
+        )
+        if gap.resolution:
+            lines.append(f"- Resolution: {gap.resolution}")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+@app.command()
+def doctor(
+    config: Annotated[
+        Path | None, typer.Option("--config", help="Explicit TOML configuration.")
+    ] = None,
+    as_json: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
+) -> None:
+    """Check runtime programs, optional providers, credentials, and storage."""
+
+    try:
+        diagnostics = run_diagnostics(_settings(config))
+    except VideoToSkillError as exc:
+        typer.echo(f"ERROR: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    if as_json:
+        typer.echo(json.dumps([item.__dict__ for item in diagnostics], indent=2))
+    else:
+        for item in diagnostics:
+            typer.echo(f"{item.status.upper():8} {item.capability}: {item.detail}")
+    if not diagnostics_ok(diagnostics):
+        raise typer.Exit(1)
+
+
+@app.command("inspect")
+def inspect_command(
+    sources: Annotated[list[str], typer.Argument(help="URLs or local media paths.")],
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+    language: Annotated[str | None, typer.Option("--language")] = None,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Resolve inputs and report course structure without downloading media."""
+
+    try:
+        settings = _settings(config, language=language)
+        inspection = inspect_inputs_with_completeness(sources, settings)
+    except VideoToSkillError as exc:
+        typer.echo(f"ERROR: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    inspected = inspection.sources
+    if as_json:
+        typer.echo(
+            json.dumps(
+                {
+                    "sources": [item.model_dump(mode="json") for item in inspected],
+                    "completeness": [item.model_dump(mode="json") for item in inspection.reports],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        if not inspected:
+            raise typer.Exit(1)
+        return
+    total_duration = sum(item.duration or 0 for item in inspected)
+    estimated_bytes = sum(
+        int(item.metadata.get("estimated_media_bytes") or 0) for item in inspected
+    )
+    estimated_transcript_tokens = round(total_duration / 60 * 200)
+    typer.echo(
+        f"Sources: {len(inspected)} · duration: {total_duration / 60:.1f} min "
+        f"· estimated media: {estimated_bytes / 1024**2:.1f} MiB\n"
+        f"Estimated semantic input: ~{estimated_transcript_tokens:,} transcript tokens "
+        "(provider pricing not included)"
+    )
+    for report in inspection.reports:
+        expected = (
+            str(report.expected_entries) if report.expected_entries is not None else "unknown"
+        )
+        proof = "proven" if report.completeness_proven else "not proven"
+        typer.echo(
+            f"- completeness={proof} expected={expected} "
+            f"accessible={report.accessible_entries} "
+            f"inaccessible={report.inaccessible_entries} failed={report.failed_entries} "
+            f"input={report.locator}"
+        )
+        if report.disclaimer:
+            typer.echo(f"  {report.disclaimer}")
+    for item in inspected:
+        typer.echo(f"- {describe_source(item)}")
+        if item.captions:
+            route = "platform captions"
+        else:
+            try:
+                backend = load_transcriber(settings.asr_provider)
+                route = f"media download + {backend.name} ASR"
+            except VideoToSkillError:
+                route = "media download + ASR required (backend unavailable)"
+        visual_candidates = int((item.duration or 0) / settings.periodic_frame_interval) + 1
+        typer.echo(
+            f"  captions={len(item.captions)} chapters={len(item.chapters)} id={item.id}\n"
+            f"  route={route}; up to {visual_candidates} periodic visual samples "
+            "plus scene changes"
+        )
+    if not inspected:
+        raise typer.Exit(1)
+
+
+@app.command()
+def extract(
+    sources: Annotated[list[str], typer.Argument(help="URLs or local media paths.")],
+    workspace: Annotated[
+        Path | None, typer.Option("--workspace", help="Evidence workspace path.")
+    ] = None,
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+    language: Annotated[str | None, typer.Option("--language")] = None,
+    visual_profile: Annotated[
+        str | None,
+        typer.Option("--visual-profile", help="adaptive, always, or transcript"),
+    ] = None,
+    max_workers: Annotated[int | None, typer.Option("--max-workers")] = None,
+    refresh: Annotated[bool, typer.Option("--refresh", help="Re-inspect source metadata.")] = False,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Create or resume a normalized, queryable evidence workspace."""
+
+    try:
+        settings = _settings(
+            config,
+            language=language,
+            visual_profile=visual_profile,
+            max_workers=max_workers,
+        )
+        root = workspace or default_workspace_path(sources, settings)
+        evidence, manifest = extract_sources(
+            sources,
+            settings,
+            workspace_path=root,
+            progress=lambda message: typer.echo(message, err=True),
+            refresh=refresh,
+        )
+    except VideoToSkillError as exc:
+        typer.echo(f"ERROR: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    if as_json:
+        typer.echo(manifest.model_dump_json(indent=2))
+    else:
+        typer.echo(f"Workspace: {evidence.root}")
+        typer.echo(f"State: {manifest.state.value}")
+        typer.echo(f"Sources: {len(manifest.sources)}")
+        typer.echo(f"Warnings: {len(manifest.warnings)}")
+
+
+@app.command()
+def query(
+    workspace: Annotated[Path, typer.Argument(help="Evidence workspace.")],
+    source: Annotated[
+        str | None, typer.Option("--source", help="Source index, ID, or title fragment.")
+    ] = None,
+    section: Annotated[int | None, typer.Option("--section")] = None,
+    start: Annotated[str | None, typer.Option("--start", help="Seconds or HH:MM:SS.")] = None,
+    end: Annotated[str | None, typer.Option("--end", help="Seconds or HH:MM:SS.")] = None,
+    search: Annotated[str | None, typer.Option("--search", help="FTS5 query.")] = None,
+    inventory: Annotated[
+        bool, typer.Option("--inventory", help="List sources and semantic sections.")
+    ] = False,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Retrieve a bounded evidence slice for grounded skill generation."""
+
+    try:
+        evidence = Workspace.open(workspace)
+        if inventory:
+            typer.echo(inventory_markdown(evidence))
+            return
+        results = query_workspace(
+            evidence,
+            source_selector=source,
+            section=section,
+            start=parse_time(start),
+            end=parse_time(end),
+            search=search,
+        )
+    except VideoToSkillError as exc:
+        typer.echo(f"ERROR: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    if as_json:
+        typer.echo(
+            json.dumps(
+                [item.model_dump(mode="json") for item in results],
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    else:
+        typer.echo(render_query_markdown(results))
+
+
+@app.command("contact-sheet")
+def contact_sheet(
+    workspace: Annotated[Path, typer.Argument(help="Evidence workspace.")],
+    source: Annotated[str, typer.Option("--source", help="Source index, ID, or title fragment.")],
+    section: Annotated[int | None, typer.Option("--section", min=1)] = None,
+    output: Annotated[
+        Path | None, typer.Option("--output", help="Output JPEG; defaults inside workspace.")
+    ] = None,
+    force: Annotated[
+        bool, typer.Option("--force", help="Replace an existing explicit output path.")
+    ] = False,
+    max_events: Annotated[
+        int,
+        typer.Option(
+            "--max-events",
+            min=1,
+            max=MAX_CONTACT_SHEET_EVENTS,
+            help="Maximum evenly sampled visual events.",
+        ),
+    ] = 36,
+    columns: Annotated[int, typer.Option("--columns", min=1, max=10)] = 4,
+    tile_width: Annotated[int, typer.Option("--tile-width", min=160, max=800)] = 320,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Render a bounded chronological visual overview for native agent inspection."""
+
+    try:
+        evidence = Workspace.open(workspace)
+        selected = select_source(evidence, source)
+        title = selected.title
+        start: float | None = None
+        end: float | None = None
+        if section is not None:
+            segment = next(
+                (
+                    item
+                    for item in evidence.semantic_segments(selected.id)
+                    if item.ordinal == section
+                ),
+                None,
+            )
+            if segment is None:
+                raise ProcessingError(
+                    f"Source '{selected.title}' has no semantic section {section}"
+                )
+            start, end = segment.start, segment.end
+            title = f"{selected.title} · section {section}: {segment.title}"
+        available = evidence.visuals(selected.id, start=start, end=end)
+        sampled = _sample_visuals(available, max_events)
+        if not sampled:
+            raise ProcessingError(
+                "No visual events are available for that scope; visual extraction may "
+                "have been disabled or its cache may have been cleaned"
+            )
+        explicit_output = output is not None
+        if output is None:
+            suffix = f"section-{section:04d}" if section is not None else "overview"
+            output = evidence.source_directory(selected.id) / "contact-sheets" / f"{suffix}.jpg"
+        elif output.exists() and not force:
+            raise ProcessingError(f"Output already exists: {output}. Use --force to replace it.")
+        rendered = generate_contact_sheet(
+            sampled,
+            output,
+            title=title,
+            columns=columns,
+            tile_width=tile_width,
+        )
+    except (VideoToSkillError, ValueError) as exc:
+        typer.echo(f"ERROR: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    payload = {
+        "path": str(rendered),
+        "source_id": selected.id,
+        "section": section,
+        "events_rendered": len(sampled),
+        "events_available": len(available),
+        "explicit_output": explicit_output,
+    }
+    if as_json:
+        typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        typer.echo(
+            f"Contact sheet: {rendered}\n"
+            f"Frames: {len(sampled)}/{len(available)} · source: {selected.id}"
+        )
+
+
+@app.command("frames")
+def frames(
+    workspace: Annotated[Path, typer.Argument(help="Evidence workspace.")],
+    source: Annotated[str, typer.Option("--source", help="Source index, ID, or title fragment.")],
+    from_time: Annotated[str, typer.Option("--from", help="Window start in seconds or HH:MM:SS.")],
+    to_time: Annotated[
+        str, typer.Option("--to", help="Exclusive window end in seconds or HH:MM:SS.")
+    ],
+    fps: Annotated[float, typer.Option("--fps", min=0.1, max=30)] = 1.0,
+    deduplicate: Annotated[
+        bool,
+        typer.Option(
+            "--deduplicate/--no-deduplicate",
+            help="Drop near-identical adjacent samples.",
+        ),
+    ] = True,
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Extract and persist a short dense frame window for targeted investigation."""
+
+    try:
+        evidence = Workspace.open(workspace)
+        selected = select_source(evidence, source)
+        start = parse_time(from_time)
+        end = parse_time(to_time)
+        if start is None or end is None:
+            raise ProcessingError("--from and --to are required")
+        if selected.duration is not None and end > selected.duration + 1e-6:
+            raise ProcessingError(
+                f"Window end {end:g}s exceeds source duration {selected.duration:g}s"
+            )
+        events = extract_workspace_window_frames(
+            evidence,
+            selected.id,
+            _settings(config),
+            start=start,
+            end=end,
+            fps=fps,
+            deduplicate=deduplicate,
+        )
+        evidence.upsert_visuals(events)
+    except (VideoToSkillError, ValueError) as exc:
+        typer.echo(f"ERROR: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    if as_json:
+        typer.echo(
+            json.dumps(
+                [item.model_dump(mode="json") for item in events],
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    else:
+        typer.echo(
+            f"Frames: {len(events)} · source: {selected.id} · "
+            f"window: {format_timestamp(start)}-{format_timestamp(end)}"
+        )
+        for event in events:
+            typer.echo(f"- {format_timestamp(event.timestamp)} `{event.id}` {event.path}")
+
+
+@app.command("context")
+def context(
+    workspace: Annotated[Path, typer.Argument(help="Evidence workspace.")],
+    source: Annotated[str, typer.Option("--source", help="Source index, ID, or title fragment.")],
+    section: Annotated[int | None, typer.Option("--section", min=1)] = None,
+    at: Annotated[
+        str | None, typer.Option("--at", help="Center timestamp in seconds or HH:MM:SS.")
+    ] = None,
+    window: Annotated[
+        float | None,
+        typer.Option("--window", min=0.1, help="Seconds on each side of --at."),
+    ] = None,
+    output_format: Annotated[str, typer.Option("--format", help="markdown or json")] = "markdown",
+    max_items: Annotated[int, typer.Option("--max-items", min=1, max=1000)] = 250,
+) -> None:
+    """Return a bounded synchronized transcript, visual, and observation packet."""
+
+    try:
+        evidence = Workspace.open(workspace)
+        selected = select_source(evidence, source)
+        timestamp = parse_time(at)
+        if section is None and timestamp is None:
+            raise ProcessingError("Provide exactly one of --section or --at")
+        if section is not None and timestamp is not None:
+            raise ProcessingError("Provide exactly one of --section or --at")
+        if section is not None and window is not None:
+            raise ProcessingError("--window can only be used with --at")
+        radius = (15.0 if window is None else window) if timestamp is not None else None
+        packet = assemble_agent_context(
+            evidence,
+            source_id=selected.id,
+            section=section,
+            at=timestamp,
+            window=radius,
+            max_items_per_kind=max_items,
+        )
+        selected_format = _output_format(output_format)
+    except (VideoToSkillError, ValueError) as exc:
+        typer.echo(f"ERROR: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    if selected_format == "json":
+        typer.echo(packet.model_dump_json(indent=2))
+    else:
+        typer.echo(_render_agent_context(packet), nl=False)
+
+
+@app.command("annotate")
+def annotate(
+    workspace: Annotated[Path, typer.Argument(help="Evidence workspace.")],
+    annotations: Annotated[Path, typer.Argument(help="Observation JSON file, or '-' for stdin.")],
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Validate and persist agent observations grounded in workspace evidence."""
+
+    try:
+        evidence = Workspace.open(workspace)
+        if str(annotations) == "-":
+            binary_stdin = getattr(sys.stdin, "buffer", sys.stdin)
+            payload: Path | str | bytes = binary_stdin.read(MAX_ANNOTATION_PAYLOAD_BYTES + 1)
+        else:
+            payload = annotations
+        observations = ingest_annotations(evidence, payload)
+    except (VideoToSkillError, ValueError) as exc:
+        typer.echo(f"ERROR: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    if as_json:
+        typer.echo(
+            json.dumps(
+                [item.model_dump(mode="json") for item in observations],
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    else:
+        typer.echo(f"Stored {len(observations)} grounded observation(s).")
+        for observation in observations:
+            typer.echo(f"- {observation.id}: {observation.claim}")
+
+
+@app.command("gaps")
+def gaps(
+    workspace: Annotated[Path, typer.Argument(help="Evidence workspace.")],
+    source: Annotated[
+        str | None, typer.Option("--source", help="Source index, ID, or title fragment.")
+    ] = None,
+    output_format: Annotated[str, typer.Option("--format", help="markdown or json")] = "markdown",
+    include_resolved: Annotated[
+        bool, typer.Option("--include-resolved", help="Include manually resolved gaps.")
+    ] = False,
+) -> None:
+    """Recompute actionable multimodal evidence gaps for the next agent turn."""
+
+    try:
+        evidence = Workspace.open(workspace)
+        source_id = select_source(evidence, source).id if source is not None else None
+        detected = analyze_evidence_gaps(evidence, source_id=source_id)
+        visible = detected if include_resolved else [item for item in detected if not item.resolved]
+        selected_format = _output_format(output_format)
+    except (VideoToSkillError, ValueError) as exc:
+        typer.echo(f"ERROR: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    if selected_format == "json":
+        typer.echo(
+            json.dumps(
+                [item.model_dump(mode="json") for item in visible],
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    else:
+        typer.echo(_render_gaps(visible), nl=False)
+
+
+@app.command()
+def validate(
+    skill_directory: Annotated[Path, typer.Argument(help="Generated skill folder.")],
+    skip_official: Annotated[
+        bool, typer.Option("--skip-official", help="Do not call skills-ref if installed.")
+    ] = False,
+    check_code: Annotated[
+        bool,
+        typer.Option(
+            "--check-code",
+            help="Parse-check supported fenced code blocks without executing them.",
+        ),
+    ] = False,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Validate Agent Skills format, grounding, links, and shareability."""
+
+    try:
+        report = validate_skill(
+            skill_directory,
+            run_official=not skip_official,
+            check_code=check_code,
+        )
+    except VideoToSkillError as exc:
+        typer.echo(f"ERROR: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    typer.echo(report.model_dump_json(indent=2) if as_json else render_validation_report(report))
+    if not report.valid:
+        raise typer.Exit(1)
+
+
+@app.command()
+def clean(
+    workspace: Annotated[Path, typer.Argument(help="Evidence workspace.")],
+    yes: Annotated[bool, typer.Option("--yes", help="Skip confirmation.")] = False,
+) -> None:
+    """Remove reproducible cached media while preserving evidence and manifests."""
+
+    try:
+        evidence = Workspace.open(workspace)
+        if not yes and not typer.confirm(
+            f"Remove cached media and frames under {evidence.sources_dir}?"
+        ):
+            raise typer.Abort()
+        files, size = clean_cached_media(evidence)
+    except VideoToSkillError as exc:
+        typer.echo(f"ERROR: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    typer.echo(f"Removed {files} files ({size / 1024**2:.1f} MiB).")
+
+
+@app.command()
+def evaluate(
+    workspace: Annotated[Path, typer.Argument(help="Evidence workspace.")],
+    labels: Annotated[Path, typer.Argument(help="Labeled evaluation JSON.")],
+    tolerance: Annotated[
+        float, typer.Option("--tolerance", help="Timestamp matching tolerance in seconds.")
+    ] = 2.5,
+    required_visual_recall: Annotated[
+        float,
+        typer.Option(
+            "--required-visual-recall",
+            min=0,
+            max=1,
+            help="Minimum critical visual-state recall.",
+        ),
+    ] = 0.90,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Score visual-state recall and semantic-boundary accuracy."""
+
+    try:
+        report = evaluate_workspace(
+            Workspace.open(workspace),
+            load_labels(labels),
+            tolerance_seconds=tolerance,
+            required_visual_recall=required_visual_recall,
+        )
+    except VideoToSkillError as exc:
+        typer.echo(f"ERROR: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    typer.echo(report.model_dump_json(indent=2) if as_json else render_evaluation_report(report))
+    if not report.passed:
+        raise typer.Exit(1)
+
+
+@app.command("install-skill")
+def install_skill(
+    skill_root: Annotated[
+        Path,
+        typer.Argument(
+            help=(
+                "Agent Skills root; installs the complete video-to-skill generator "
+                "bundle beneath it."
+            )
+        ),
+    ],
+    force: Annotated[
+        bool,
+        typer.Option(
+            "--force",
+            help="Update the managed files in an existing video-to-skill generator bundle.",
+        ),
+    ] = False,
+) -> None:
+    """Install the invocation-complete generator bundle into a compatible Agent host."""
+
+    try:
+        path, status = install_generator_skill(skill_root, overwrite=force)
+    except VideoToSkillError as exc:
+        typer.echo(f"ERROR: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    typer.echo(f"{status.capitalize()}: {path}")
+
+
+@app.command("install-generated")
+def install_generated(
+    skill_directory: Annotated[Path, typer.Argument(help="Validated generated skill folder.")],
+    host: Annotated[
+        SkillHost,
+        typer.Option(
+            "--host",
+            case_sensitive=False,
+            help="Install for claude or codex.",
+        ),
+    ],
+    project: Annotated[
+        bool,
+        typer.Option(
+            "--project",
+            help="Install into the current project instead of the user Skill directory.",
+        ),
+    ] = False,
+    skip_official: Annotated[
+        bool,
+        typer.Option("--skip-official", help="Do not call skills-ref if installed."),
+    ] = False,
+) -> None:
+    """Validate and safely install a generated course Skill for the active host."""
+
+    try:
+        report = validate_skill(
+            skill_directory,
+            run_official=not skip_official,
+            check_code=True,
+        )
+        if not report.valid:
+            raise ProcessingError(render_validation_report(report))
+        root = host_skill_root(host, project=project)
+        path, status = install_generated_skill(skill_directory, root)
+    except VideoToSkillError as exc:
+        typer.echo(f"ERROR: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    scope = "project" if project else "user"
+    typer.echo(f"{status.capitalize()}: {path} ({host.value}, {scope})")
+
+
+@app.command("blueprint-schema")
+def blueprint_schema(
+    workspace: Annotated[
+        Path | None,
+        typer.Option(
+            "--workspace",
+            help=(
+                "Persisted evidence workspace whose full sanitized source and inspection "
+                "ledger should be preseeded."
+            ),
+        ),
+    ] = None,
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "--output",
+            help="Write the bounded JSON authoring contract atomically instead of stdout.",
+        ),
+    ] = None,
+) -> None:
+    """Emit the strict blueprint schema and an optional workspace-derived authoring seed."""
+
+    try:
+        evidence = Workspace.open(workspace) if workspace is not None else None
+        encoded = encode_blueprint_authoring_payload(blueprint_authoring_payload(evidence))
+        if output is None:
+            typer.echo(encoded)
+            return
+        target = output.expanduser().resolve()
+        if target.exists():
+            raise ProcessingError(
+                f"Blueprint authoring output already exists: {target}. Choose a new path."
+            )
+        atomic_write_text(target, encoded + "\n")
+    except VideoToSkillError as exc:
+        typer.echo(f"ERROR: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    typer.echo(f"Blueprint authoring contract: {target}")
+
+
+@app.command("build-skill")
+def build_skill(
+    blueprint: Annotated[
+        Path,
+        typer.Argument(
+            help=(
+                "CourseSkillBlueprint JSON authored from `blueprint-schema`; when "
+                "--workspace is set, preserve its preseeded source ledger exactly."
+            )
+        ),
+    ],
+    host: Annotated[
+        SkillHost,
+        typer.Option(
+            "--host",
+            case_sensitive=False,
+            help="Validate and install for claude or codex.",
+        ),
+    ],
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "--output",
+            help="Portable artifact path; defaults to ./generated-skills/<name>.",
+        ),
+    ] = None,
+    workspace: Annotated[
+        Path | None,
+        typer.Option(
+            "--workspace",
+            help=(
+                "Persisted evidence workspace used to verify every active, retired, "
+                "inaccessible, and failed course entry before rendering."
+            ),
+        ),
+    ] = None,
+    project: Annotated[
+        bool,
+        typer.Option(
+            "--project",
+            help="Install into the current project instead of the user Skill directory.",
+        ),
+    ] = False,
+    skip_official: Annotated[
+        bool,
+        typer.Option("--skip-official", help="Do not call skills-ref if installed."),
+    ] = False,
+    as_json: Annotated[bool, typer.Option("--json", help="Emit the completion record.")] = False,
+) -> None:
+    """Verify the full-course blueprint, then render, validate, and safely install it."""
+
+    generated: Path | None = None
+    evidence_workspace: Workspace | None = None
+    ignored_unverified_ledger = False
+    try:
+        specification = blueprint_from_json(blueprint)
+        if workspace is not None:
+            evidence_workspace = Workspace.open(workspace)
+            validate_blueprint_against_workspace(specification, evidence_workspace)
+        elif specification.coverage_ledger is not None:
+            specification = specification.model_copy(update={"coverage_ledger": None})
+            ignored_unverified_ledger = True
+        destination = output or Path.cwd() / "generated-skills" / specification.name
+        generated = render_course_skill_package(
+            specification,
+            destination,
+            workspace_root=evidence_workspace.root if evidence_workspace is not None else None,
+        )
+        report = validate_skill(
+            generated,
+            run_official=not skip_official,
+            check_code=True,
+        )
+        if not report.valid:
+            raise ProcessingError(render_validation_report(report))
+        root = host_skill_root(host, project=project)
+        installed, status = install_generated_skill(generated, root)
+    except VideoToSkillError as exc:
+        retained = f"\nGenerated artifact retained at: {generated}" if generated else ""
+        typer.echo(f"ERROR: {exc}{retained}", err=True)
+        raise typer.Exit(2) from exc
+
+    payload = {
+        "name": specification.name,
+        "generated_path": str(generated),
+        "installed_path": str(installed),
+        "installation_status": status,
+        "host": host.value,
+        "scope": "project" if project else "user",
+        "valid": True,
+        "workspace_verified": evidence_workspace is not None,
+        "course_coverage": (
+            specification.coverage_ledger.state
+            if evidence_workspace is not None and specification.coverage_ledger is not None
+            else "unverified"
+        ),
+        "warnings": (
+            []
+            if evidence_workspace is not None
+            else [
+                (
+                    "No --workspace was supplied; the unverified blueprint coverage ledger "
+                    "was omitted from the package."
+                    if ignored_unverified_ledger
+                    else (
+                        "No --workspace was supplied; full-course source and inspection "
+                        "coverage was not independently verified."
+                    )
+                )
+            ]
+        ),
+    }
+    if as_json:
+        typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        typer.echo(
+            f"Built and {status}: {specification.name}\n"
+            f"Portable artifact: {generated}\n"
+            f"Installed Skill: {installed}\n"
+            + (
+                f"Coverage verification: {specification.coverage_ledger.state}\n"
+                if evidence_workspace is not None and specification.coverage_ledger is not None
+                else (
+                    "Coverage verification: NOT PERFORMED; rebuild with --workspace "
+                    "before claiming full-course coverage.\n"
+                )
+            )
+            + f"Invoke with {'/' if host == SkillHost.CLAUDE else '$'}{specification.name}"
+        )
+
+
+def run() -> None:
+    try:
+        app()
+    except KeyboardInterrupt:
+        typer.echo("Interrupted.", err=True)
+        sys.exit(130)

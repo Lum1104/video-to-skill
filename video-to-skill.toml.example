@@ -1,0 +1,36 @@
+[video_to_skill]
+# Private, resumable workspaces. Relative paths resolve from the calling directory.
+cache_root = ".video-to-skill/jobs"
+
+language = "auto"
+output_language = "source"
+visual_profile = "adaptive" # adaptive | always | transcript
+
+ocr_provider = "auto"       # auto | rapidocr | none
+asr_provider = "auto"       # auto | faster-whisper | whisperx | plugin name | none
+asr_model = "small"
+diarize = false              # WhisperX only; requires HF_TOKEN when true
+
+vision_provider = "none"    # native host vision is preferred; auto | openai-compatible | none
+vision_base_url = "https://api.openai.com/v1"
+vision_model = "gpt-4.1-mini"
+vision_api_key_env = "OPENAI_API_KEY"
+
+scene_threshold = 0.32
+periodic_frame_interval = 30
+frame_width = 1280
+
+min_segment_seconds = 45
+target_segment_seconds = 300
+max_segment_seconds = 600
+
+max_source_duration_seconds = 28800
+max_local_file_bytes = 21474836480
+max_download_bytes = 21474836480
+max_course_items = 500
+max_workers = 2
+command_timeout_seconds = 7200
+
+# Authentication can instead be provided through the corresponding environment vars.
+# cookies_from_browser = "chrome"
+# cookies_file = "/secure/path/cookies.txt"
