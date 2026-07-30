@@ -73,7 +73,7 @@ inventory
   → repeat or generate
 ```
 
-Contact sheets and dense frames are private, reproducible cache artifacts. Observations contain concise factual conclusions and evidence references, never hidden model reasoning. A generated skill receives only selected visual assets and synthesized claims with provenance.
+Contact sheets and dense frames are private, reproducible cache artifacts. Observations contain concise factual conclusions and evidence references, never hidden model reasoning. Before publication, the host turns the inspected evidence into a canonical semantic map: source-backed concepts, procedures, examples, decisions, cautions, and demonstrations, plus their relationships and publication dispositions.
 
 ## Extension points
 
@@ -89,6 +89,30 @@ Provider implementations must return typed models and raise domain errors with a
 
 ## Generated skill boundary
 
-Before semantic authoring, `blueprint-schema --workspace` emits the strict Pydantic schema and a sanitized seed containing the workspace's exact active, retired, inaccessible, and failed course ledger. The seed contains digests and public metadata rather than local locators, raw failure text, transcripts, frames, or media. `build-skill --workspace` recomputes that ledger and rejects omissions, additions, metadata changes, stale workspace identity, and unsupported coverage upgrades before rendering.
+The complete V2 product contract and its design rationale live in [generated-skill-v2.md](generated-skill-v2.md). This section summarizes the implementation boundary.
 
-The generated skill is a derivative distribution artifact. It receives selected keyframes and synthesized Markdown, but never the workspace database, raw video/audio, subtitle files, or complete transcript. `sources.md` preserves the verified course accounting, while `provenance.json` connects rendered claims to workspace source IDs, times, modalities, and evidence IDs without copying transcript text. A build without a workspace is explicitly marked unverified and cannot retain a self-asserted coverage ledger.
+Before semantic authoring, `blueprint-schema --workspace` emits the strict V2 Pydantic schema and a sanitized seed containing the workspace's exact active, retired, inaccessible, and failed course ledger. The seed contains digests and public metadata rather than local locators, raw failure text, transcripts, frames, or media. The author completes:
+
+- a high-recall semantic map whose material units are included, merged, or omitted with an explicit reason;
+- semantic relations and source-level evidence links;
+- a capability profile for teaching, practice, application, and reference behavior;
+- one recommended curriculum plus optional alternate paths over the same semantic map;
+- an evidence-driven artifact plan in which every separate file states why independent loading is useful.
+
+`build-skill --workspace` recomputes the ledger and rejects omissions, additions, metadata changes, stale workspace identity, unsupported coverage upgrades, invalid semantic links, and material semantic units that silently disappear. It does not enforce a fixed chapter count or an artifact quota per interaction mode.
+
+The generated Skill is a derivative distribution artifact. It receives selected keyframes and synthesized Markdown, but never the workspace database, raw video/audio, subtitle files, or complete transcript. Its stable contract is:
+
+```text
+SKILL.md
+source-map.md
+sources.md
+provenance.json
+build-manifest.json
+[evidence-driven Markdown collections]
+[selected assets]
+```
+
+`SKILL.md` is an adaptive front door rather than a mode menu. An empty invocation gives a short welcome and offers `start` without creating files or launching a workflow. A substantive request may ask up to three useful context questions, then teaches, coaches practice without exposing answers early, applies the material to the user's situation, or retrieves a precise reference according to intent. It follows the user's language and distinguishes source-grounded content, explicit inference, and outside or current knowledge.
+
+`source-map.md` exposes what the source covers and how the generated curriculum relates to it. `sources.md` preserves verified course accounting. `provenance.json` connects rendered claims and semantic units to workspace source IDs, times, modalities, and evidence IDs without copying transcript text. `build-manifest.json` records the deterministic build identity, source and workspace digests, curriculum choice, managed-file hashes, and optional parent build so later updates can distinguish regenerated content from human edits. A build without a workspace is explicitly marked unverified and cannot retain a self-asserted coverage ledger.

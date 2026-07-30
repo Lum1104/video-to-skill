@@ -25,7 +25,7 @@ Ask only when a material boundary cannot be inferred safely: private or paid con
 The user interacts with two layers:
 
 1. `video-to-skill` is the generator and evidence compiler.
-2. The generated course-specific Skill is the teacher and practitioner. It must support Learn, Practice, Apply, and Reference itself.
+2. The generated course-specific Skill is the teacher and practitioner. It must understand learning, practice, application, and reference intents itself, while the evidence determines the relative depth of each behavior.
 
 Do not create a second generic video tutor Skill for the MVP.
 
@@ -104,7 +104,7 @@ Infer the dominant source type per semantic section:
 | Physical procedure | Object state, hand/tool action, before/after condition | Ordered state changes and safety-relevant omissions |
 | Mixed | Section-specific combination | Route each section independently |
 
-Use all four generated Skill modes regardless of the dominant type. The user's wording may change which artifacts receive the most depth, but it must not remove Learn, Practice, Apply, or Reference behavior.
+Do not turn those four behaviors into artifact quotas. Record a strong, medium, light, or unsupported capability level for learning, practice, application, and reference. A source may support all four user intents without needing four directories or four separate files.
 
 ## 3. Extract or resume evidence
 
@@ -143,7 +143,7 @@ For one short source, one investigator plus an independent critic is enough. Do 
 
 ## 5. Run the multimodal evidence loop
 
-Set a bounded investigation budget. By default, use at most two escalation passes per unresolved gap, dense windows no longer than 30 seconds at no more than 4 fps, and at most 12 dense windows per source. Expand only for a central or safety-relevant capability.
+Set a bounded investigation budget that scales with semantic sections, source duration, information density, and visual activity. Fixed pass, window, and frame limits are safety valves rather than quality targets. Stop when material gaps close or remain explicitly partial; never claim completeness merely because the default budget was exhausted.
 
 For each source or semantic section:
 
@@ -199,22 +199,36 @@ Use native host multimodal inspection before any hosted vision provider. Keep ho
 
 Use high confidence for independently corroborated evidence, medium for one clear appropriate modality, and low for ambiguous or incomplete evidence. Never turn low-confidence exact details into authoritative steps.
 
-## 6. Build the capability graph
+## 6. Build the canonical semantic map
 
-Synthesize evidence into reusable records:
+Before designing a curriculum, perform a high-recall pass that preserves:
 
-- Concept: operational meaning, prerequisites, use conditions, and evidence.
-- Procedure: goal, inputs, ordered actions, state checks, recovery, and evidence per step.
-- Decision rule: condition, choice, trade-off, and evidence.
-- Demonstration: initial state, action, result, lesson, and evidence.
-- Warning or anti-pattern: risk, consequence, correction, and evidence.
-- Teaching inference: a new explanation, question, exercise, hint, or rubric clearly labeled as generator-created.
+- questions, claims, reasons, examples, analogies, definitions, distinctions;
+- qualifications, counterpoints, predictions, recommendations, warnings;
+- value judgments and open questions; and
+- the relationships that answer, support, explain, exemplify, qualify, contrast, depend on, update, contradict, raise, or leave another unit unresolved.
 
-Each consequential record retains source ID, start and end time, modalities including temporal evidence when relevant, evidence IDs, observed-versus-inferred status, confidence, and uncertainty. Keep a presenter's claim distinct from the generator's pedagogical inference.
+Each semantic unit retains a stable ID, source ID, start and end time, speaker when known, kind, compact summary and detail, core/supporting/contextual/incidental materiality, included/merged/context-only/omitted disposition, modalities, evidence IDs, observed-versus-inferred status, confidence, and uncertainty. A merged, context-only, or omitted unit needs a reason; a merged unit identifies its retained target.
 
-Normalize terminology only when equivalence is supported. Merge duplicate demonstrations, preserve meaningful variants, connect prerequisites, and retain attributed conflicts.
+Use four separate passes: high-recall extraction, terminology normalization and linking, materiality review, then curriculum design. Normalize only when equivalence is supported. Deduplicate presentation in curriculum views, never by deleting original semantic units.
 
-## 7. Generate the course-specific Skill
+Report source-acquisition coverage separately from semantic coverage. Every material semantic unit must have a disposition. Every included core or supporting unit must appear in a grounded course artifact.
+
+## 7. Design the curriculum
+
+Use a thematic course as the default primary design. Set no fixed chapter count; split by semantic independence and learning value.
+
+After the semantic map is complete and before artifact authoring, propose two or three materially different designs when the source justifies them:
+
+1. source-faithful companion;
+2. thematic course, recommended by default; and
+3. application-first operating system.
+
+Ask the user to choose the learning experience, not a chapter count. Preserve the semantic map regardless of the choice. Alternate paths may reference the same canonical content without duplicating it.
+
+Create an artifact only when users may request it independently, it is rarely needed, it must be withheld, it is large enough to benefit from progressive disclosure, it represents a distinct workflow, or it uses a machine-readable format. Give every artifact a stable ID, supported behaviors, an explicit `normal` or `after-attempt` disclosure policy, use condition, independent loading reason, semantic-unit links, and grounded claims. If no independent loading reason exists, merge it with the nearest artifact.
+
+## 8. Generate the course-specific Skill
 
 Derive a lowercase hyphenated name under 64 characters unless the user supplied one. The shareable package and raw workspace must be separate directory trees.
 
@@ -223,16 +237,13 @@ The course Skill must contain:
 ```text
 <course-skill>/
 ├── SKILL.md
+├── source-map.md
 ├── sources.md
 ├── provenance.json
-├── chapters/          # semantic lessons, not one dump per video
-├── exercises/         # generator-created practice
-├── solutions/         # rubrics/answers loaded only after an attempt
-├── playbooks/         # grounded application workflows
-└── reference/         # precise terms, commands, states, and decisions
+└── build-manifest.json
 ```
 
-Add `learning-path.md`, `glossary.md`, `patterns.md`, `cheatsheet.md`, or indispensable cropped images only when the evidence justifies them. Never include raw video, audio, subtitles, complete transcripts, databases, cookies, caches, secrets, or decorative frame collections.
+Add content, learning paths, application guides, exercises, separate solutions, references, or indispensable teaching assets only when the evidence and independent loading boundaries justify them. Never include raw video, audio, subtitles, complete transcripts, databases, cookies, caches, secrets, or decorative frame collections.
 
 Generate the strict machine-readable authoring contract outside the evidence workspace before writing a blueprint:
 
@@ -242,7 +253,7 @@ Generate the strict machine-readable authoring contract outside the evidence wor
 
 Read `AUTHORING_JSON` as an authoring envelope. Use its `blueprint_schema` to validate field shapes and copy `blueprint_seed` into a separate `BLUEPRINT_JSON`. Preserve the seed's `sources` and `coverage_ledger` exactly; complete only the semantic fields, artifacts, claims, principles, and limitations. Do not pass the authoring envelope itself to `build-skill`.
 
-The resulting `CourseSkillBlueprint` separates structured sources, the workspace-bound coverage ledger, claims, artifacts, and core principles. Every mode needs at least one grounded artifact, Practice needs both an exercise and a separate solution or rubric, and every artifact needs a provenance claim. When `build-skill` receives `--workspace`, it must reject omitted, invented, retired, inaccessible, or failed course entries and any coverage upgrade that disagrees with the persisted workspace.
+The resulting V2 `CourseSkillBlueprint` separates structured sources, workspace-bound acquisition coverage, semantic units and relations, capability levels, curriculum paths, interaction behavior, claims, justified artifacts, and core principles. It does not require one artifact per behavior. Exercises that have solutions keep those solutions separate and unindexed. When `build-skill` receives `--workspace`, it rejects omitted, invented, retired, inaccessible, or failed course entries and any coverage upgrade that disagrees with the persisted workspace.
 
 Assets are optional and minimal. Each selected image source must be a regular non-symlink file inside the declared workspace, be linked from a Markdown artifact, and have a visual or temporal provenance claim for that artifact. Give it a safe `assets/<name>.png` destination. The renderer rejects path escapes and unsafe sizes or formats, then decodes and re-encodes the image as metadata-free PNG; it never copies a raw frame byte-for-byte.
 
@@ -251,36 +262,32 @@ Assets are optional and minimal. Each selected image source must be a regular no
 Mark generated course Skills with:
 
 ```html
-<!-- video-to-skill:course-skill:v1 -->
+<!-- video-to-skill:course-skill:v2 -->
 ```
 
-Keep the resident file concise and operational. It is a routing and teaching workflow, not a course summary. Put these sections in this order:
+Keep the resident file concise and operational. It is a routing and teaching workflow, not a course summary. Include:
 
 1. Scope and operating contract.
-2. Learn, Practice, Apply, and Reference behavior.
-3. Evidence and honest uncertainty rules.
-4. A small set of evidence-linked core principles.
-5. Learning, practice, application, and reference indexes.
-6. Coverage limits and provenance pointers.
+2. An empty-invocation contract with a course-specific welcome of no more than two short sentences that offers `start`, loads no supporting file, inspects no project, runs no command, creates no file, and waits.
+3. One to three course-specific starter questions, used only for missing initial context.
+4. Adaptive learning, practice, application, and reference behavior without exposing a mode-selection menu to users.
+5. Evidence, inference, outside-knowledge, language, and honest uncertainty rules.
+6. The evidence-derived capability profile and a small set of evidence-linked core principles.
+7. The recommended thematic path, alternate paths, additional justified material, coverage limits, and pointers to the source map, sources, provenance, and build manifest.
 
-The four modes behave as follows:
+Treat chapters as teaching material rather than response scripts. Default to one useful cognitive move, one grounded example when useful, and one transfer or retrieval question. Do not dump a chapter or announce a formal lesson unless asked. After the initial context packet, ask at most one next-step question per turn.
 
-- Learn diagnoses goals and prerequisite mastery one question at a time, chooses an adaptive next lesson, teaches one bounded concept with a grounded demonstration, checks retrieval or application, repairs misconceptions, and recommends the next step.
-- Practice selects an appropriate exercise, presents success criteria without its solution, evaluates the learner's attempt with a rubric, gives the smallest useful hint, permits a retry, and reveals a solution only after an attempt or explicit request.
-- Apply inspects the user's actual context, maps source assumptions to it, labels adaptations as inference, uses observable checkpoints, verifies results, and reports deviations from what the course demonstrated.
-- Reference answers directly, loads only the smallest relevant file, preserves exact details only when supported, cites source timestamps, and distinguishes course evidence from outside knowledge.
+Use source-grounded material first. Mark teaching or application inference naturally. Use outside or current knowledge when the request calls for it while keeping it distinct from the source; ask permission only for material external actions, private data, paid access, or an explicit source-only boundary.
+
+Use one canonical artifact language per build and respond in the user's language unless requested otherwise.
 
 Keep learner progress in the active conversation or host memory, not in the shareable Skill package.
 
 ### Supporting artifacts
 
-Chapters follow semantic topics rather than video boundaries. Each includes objectives, prerequisites, core idea, demonstrated method, visual evidence, failure modes, a knowledge check, practice, and evidence.
+Artifacts follow semantic and loading boundaries rather than video or behavior quotas. They may contain a core idea, source reasoning, examples, qualifications, misconceptions, diagnostic prompts, transfer prompts, and deepening prompts, but the runtime selects what is useful instead of emitting the template.
 
-Playbooks contain use conditions, preconditions, ordered steps, expected states, verification, recovery, limits, and evidence. Every authoritative numbered step needs a provenance claim.
-
-Exercises and solutions are separate. Label exercises, hints, and rubrics as generator-created when the source did not contain them. Do not index solution files where the consuming agent might load them before an attempt.
-
-Reference files favor compact decision tables, checklists, exact labels, state constraints, and timestamp pointers over repeated prose.
+Exercises and solutions are separate. Label exercises, hints, rubrics, and conceptual application workflows as generator-created when the source did not demonstrate them. Mark solutions and answer-bearing rubrics `after-attempt`; do not rely on their directory name or index them where the consuming agent might load them before an attempt.
 
 ### Provenance
 
@@ -294,9 +301,9 @@ Use modality values `speech`, `visual`, `ocr`, `metadata`, and `temporal`. The l
 
 `sources.md` records each source's title, creator, platform, canonical URL when available, complete/partial/failed/skipped coverage, limitations, and timestamped claim map. Never expose private local paths.
 
-## 8. Critique, build, validate, and install
+## 9. Critique, build, validate, and install
 
-Run an independent critic pass over the blueprint. Check that the planned package teaches and applies demonstrated capability rather than recapping narration; all four modes are actionable; solutions are withheld; source failures and uncertainty remain visible; each consequential claim uses the right modality; and no raw workspace artifact is planned for the package.
+Run an independent critic pass over the blueprint. Check what important source meaning was lost, not only whether retained claims are grounded. Verify that every material semantic unit is accounted for; artifact boundaries have independent loading reasons; the thematic and alternate paths fit the source; capability levels are honest; empty invocation is inviting and side-effect free; solutions are withheld; source failures and uncertainty remain visible; each consequential claim uses the right modality; and no raw workspace artifact is planned for the package.
 
 For a new full conversion, use the one internal build operation. It renders a new portable artifact, enforces workspace separation, validates the package and code fences, installs it into the active host, and returns the invocation:
 
@@ -317,11 +324,13 @@ For update/fold-in, keep the staged semantic-merge workflow. Validate the update
 "$V2S_ENGINE" install-generated STAGED_SKILL --host codex
 ```
 
-The build operation and installer own discovery of the Claude Code or Codex Skill root, conflict detection, staging, validation, and atomic installation. They never overwrite different same-name content. For an actual update conflict, return the validated staged artifact and the exact conflict instead of claiming the installed version changed. Stop only for conflicting different content, ambiguous host, exhausted repair attempts, or a real permission failure.
+The build operation also writes `source-map.md`, V2 `provenance.json`, and `build-manifest.json`. The manifest records a stable build ID, optional parent build ID, generator version, artifact language, selected curriculum, source, workspace, and semantic-map digests, plus the generated hash and stable artifact ID of every managed file.
+
+The build operation and installer own discovery of the Claude Code or Codex Skill root, conflict detection, staging, validation, and atomic installation. They never overwrite different same-name content. Regeneration compares previous generated hashes, current possibly human-edited files, and a new staged build; only unchanged generated files are safe to replace. Preserve unmanaged files and stage human-edited conflicts. For an actual update conflict, return the validated staged artifact and exact conflict instead of claiming the installed version changed.
 
 ## Completion report
 
-Return the installed Skill name and path, its invocation form, workspace path, processed/partial/failed source counts, coverage and material limitations, files created, unresolved evidence gaps, critic repairs, and final validator result.
+Return the installed Skill name and path, invocation form, workspace path and retention state, processed/partial/failed source counts, source-acquisition and semantic-coverage results, selected curriculum, files created, unresolved evidence gaps, critic repairs, build ID, and final structural, semantic, and behavior validation results.
 
 Show the next action as:
 
