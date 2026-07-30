@@ -30,7 +30,7 @@ ocr = ["rapidocr>=3.0,<4", "onnxruntime>=1.18,<2"]
 dev = [
   "mypy>=1.11,<2",
   "pytest>=8.2,<9",
-  "pytest-cov>=5,<7",
+  "pytest-cov>=5,<8",
   "ruff>=0.6,<1",
   "skills-ref>=0.1.1,<1",
 ]
