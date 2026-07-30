@@ -1,0 +1,3 @@
+[submodule "generated-skills/ambitious-ai-startup-playbook"]
+	path = generated-skills/ambitious-ai-startup-playbook
+	url = https://github.com/Lum1104/ambitious-ai-startup-playbook.git
