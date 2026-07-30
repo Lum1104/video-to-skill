@@ -50,6 +50,8 @@ If the generated Skill is named `react-performance-course`, use `/react-performa
 
 The generated course Skill is the tutor, practice partner, operational guide, and reference. There is no second generic tutor to install.
 
+See [Ambitious AI Startup Playbook](https://github.com/Lum1104/ambitious-ai-startup-playbook) for a real generated Skill. It is pinned in this repository as a submodule under `generated-skills/`; fetch it locally with `git submodule update --init --recursive`.
+
 ## What it does
 
 1. **Acquire:** resolve every accessible course item and collect the metadata, captions, audio, and analysis-quality video needed for understanding.
