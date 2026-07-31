@@ -471,13 +471,31 @@ class RunEnvelope(OrchestrationModel):
         return self
 
 
+class DeliverySelection(OrchestrationModel):
+    schema_version: Literal[1] = 1
+    name: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$",
+    )
+    output: Path
+    conflicting_build_id: str = Field(pattern=r"^v2s-[a-f0-9]{20}$")
+
+    @field_validator("output")
+    @classmethod
+    def absolute_output(cls, value: Path) -> Path:
+        if not value.is_absolute():
+            raise ValueError("delivery output must be absolute")
+        return value
+
+
 class DecisionResult(OrchestrationModel):
     schema_version: Literal[1] = 1
     task_id: str
     lease_token: str = Field(min_length=20)
     snapshot_digest: str
     producer: ObservationProducer
-    selected_path_id: str = Field(min_length=1, max_length=160)
+    selected_option_id: str = Field(min_length=1, max_length=160)
 
 
 class SubmissionReceipt(OrchestrationModel):

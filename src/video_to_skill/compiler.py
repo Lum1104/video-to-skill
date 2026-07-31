@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -35,6 +35,7 @@ from video_to_skill.installation import (
 )
 from video_to_skill.orchestration import (
     ArtifactDraftSpec,
+    DeliverySelection,
     InstructionalAffordance,
 )
 from video_to_skill.utils import atomic_write_json, hash_file
@@ -64,6 +65,7 @@ class WorkspaceBuildReceipt(CompileModel):
     instructional_affordance_digest: str
     critic_report_digest: str
     behavior_report_digest: str
+    delivery_selection_digest: str | None = None
     artifacts: list[CompiledArtifactReference]
 
 
@@ -114,6 +116,54 @@ def _quality_gate(workspace: Workspace) -> tuple[str, str]:
     return critic_record.digest, behavior_record.digest
 
 
+def portable_build_matches(root: Path, expected_build_id: str) -> bool:
+    candidate = root.expanduser()
+    if candidate.is_symlink() or not candidate.is_dir():
+        return False
+    manifest_path = candidate / "build-manifest.json"
+    try:
+        if (
+            manifest_path.is_symlink()
+            or not manifest_path.is_file()
+            or manifest_path.stat().st_size > 4 * 1024 * 1024
+        ):
+            return False
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if (
+            not isinstance(manifest, dict)
+            or manifest.get("schema_version") != 2
+            or manifest.get("build_id") != expected_build_id
+        ):
+            return False
+        managed = manifest.get("managed_files")
+        if not isinstance(managed, dict) or not managed:
+            return False
+        expected_paths = {"build-manifest.json"}
+        for relative, entry in managed.items():
+            if not isinstance(relative, str) or not isinstance(entry, dict):
+                return False
+            portable_path = PurePosixPath(relative)
+            if portable_path.is_absolute() or ".." in portable_path.parts:
+                return False
+            managed_path = candidate.joinpath(*portable_path.parts)
+            if (
+                managed_path.is_symlink()
+                or not managed_path.is_file()
+                or hash_file(managed_path) != entry.get("sha256")
+            ):
+                return False
+            expected_paths.add(portable_path.as_posix())
+        actual_paths: set[str] = set()
+        for path in candidate.rglob("*"):
+            if path.is_symlink():
+                return False
+            if path.is_file():
+                actual_paths.add(path.relative_to(candidate).as_posix())
+        return actual_paths == expected_paths
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+
+
 def compile_workspace_blueprint(
     workspace: Workspace,
 ) -> tuple[CourseSkillBlueprint, WorkspaceBuildReceipt, Path]:
@@ -149,6 +199,15 @@ def compile_workspace_blueprint(
         label="assets",
     )
     course = _canonical_json(workspace, "course")
+    delivery_record = workspace.canonical_record("delivery-selection")
+    try:
+        delivery_selection = (
+            DeliverySelection.model_validate(_canonical_json(workspace, "delivery-selection"))
+            if delivery_record is not None
+            else None
+        )
+    except PydanticValidationError as exc:
+        raise ProcessingError(f"Invalid canonical delivery selection: {exc}") from exc
     seed = blueprint_seed_from_workspace(workspace)
     rendered_artifacts: list[CourseArtifact] = []
     artifact_references: list[CompiledArtifactReference] = []
@@ -203,7 +262,7 @@ def compile_workspace_blueprint(
     course_limitations = list(course.get("limitations", []))
     try:
         blueprint = CourseSkillBlueprint(
-            name=course["name"],
+            name=(delivery_selection.name if delivery_selection is not None else course["name"]),
             title=course["title"],
             description=course["description"],
             scope=course["scope"],
@@ -245,6 +304,7 @@ def compile_workspace_blueprint(
         instructional_affordance_digest=affordance_record.digest,
         critic_report_digest=critic_digest,
         behavior_report_digest=behavior_digest,
+        delivery_selection_digest=(delivery_record.digest if delivery_record is not None else None),
         artifacts=artifact_references,
     )
     build_directory = workspace.root / "builds" / build_id

@@ -12,7 +12,8 @@ from video_to_skill.config import Settings
 from video_to_skill.coordinator import advance_run, submit_workspace_result
 from video_to_skill.errors import ProcessingError
 from video_to_skill.installation import SkillHost
-from video_to_skill.orchestration import RunEnvelope
+from video_to_skill.models import ObservationProducer
+from video_to_skill.orchestration import DecisionResult, RunEnvelope
 from video_to_skill.utils import atomic_write_json
 from video_to_skill.workspace import Workspace
 
@@ -29,19 +30,21 @@ def _resume(
     )
 
 
-def test_run_and_submit_complete_without_main_agent_data_forwarding(
+def _reviewed_workspace(
     tmp_path: Path,
-) -> None:
+) -> tuple[Workspace, Settings, Path, Path]:
     workspace, _analyze_task = _analyzed_workspace(tmp_path)
     settings = Settings(cache_root=tmp_path)
+    output = tmp_path / "generated" / "evidence-updated-conviction"
+    skill_root = tmp_path / "skills"
 
     author_envelope = advance_run(
         sources=[],
         workspace_path=workspace.root,
         settings=settings,
         host=SkillHost.CODEX,
-        output=tmp_path / "generated" / "evidence-updated-conviction",
-        skill_root=tmp_path / "skills",
+        output=output,
+        skill_root=skill_root,
         run_official_validation=False,
     )
 
@@ -89,6 +92,13 @@ def test_run_and_submit_complete_without_main_agent_data_forwarding(
         review_result_path,
     )
     assert review_receipt.status == "complete"
+    return workspace, settings, output, skill_root
+
+
+def test_run_and_submit_complete_without_main_agent_data_forwarding(
+    tmp_path: Path,
+) -> None:
+    workspace, settings, _output, _skill_root = _reviewed_workspace(tmp_path)
 
     complete = _resume(workspace, settings)
 
@@ -99,6 +109,55 @@ def test_run_and_submit_complete_without_main_agent_data_forwarding(
     assert complete.completion["instructional_affordance_coverage"]["provided"] == 5
     resumed = _resume(workspace, settings)
     assert resumed == complete
+
+
+def test_run_recovers_from_generated_and_installed_name_conflicts(
+    tmp_path: Path,
+) -> None:
+    workspace, settings, output, skill_root = _reviewed_workspace(tmp_path)
+    output.mkdir(parents=True)
+    (output / "different.txt").write_text("different generated build", encoding="utf-8")
+    installed_conflict = skill_root / "evidence-updated-conviction"
+    installed_conflict.mkdir(parents=True)
+    (installed_conflict / "SKILL.md").write_text("different installed Skill", encoding="utf-8")
+
+    decision_envelope = _resume(workspace, settings)
+
+    [action] = decision_envelope.actions
+    assert action.kind == "ask-user"
+    assert action.role == "decision"
+    assert len(action.options) == 3
+    repeated = _resume(workspace, settings)
+    [repeated_action] = repeated.actions
+    assert repeated_action.task_id == action.task_id
+    assert repeated_action.already_leased is True
+
+    task = workspace.get_work_item(action.task_id)
+    lease = json.loads((action.task_path / "lease.json").read_text(encoding="utf-8"))
+    selected = action.options[0]
+    result = DecisionResult(
+        task_id=task.id,
+        lease_token=str(lease["lease_token"]),
+        snapshot_digest=task.snapshot_digest,
+        producer=ObservationProducer(name="user"),
+        selected_option_id=selected["id"],
+    )
+    result_path = action.task_path / "output" / "result.json"
+    atomic_write_json(result_path, result)
+    submit_workspace_result(workspace, task.id, result_path)
+
+    complete = _resume(workspace, settings)
+
+    assert complete.status == "complete"
+    assert complete.completion is not None
+    assert complete.completion["name"] == selected["id"]
+    assert Path(str(complete.completion["generated_path"])) == Path(selected["output"])
+    assert Path(str(complete.completion["installed_path"])).name == selected["id"]
+    assert (output / "different.txt").read_text(encoding="utf-8") == "different generated build"
+    assert (installed_conflict / "SKILL.md").read_text(
+        encoding="utf-8"
+    ) == "different installed Skill"
+    assert workspace.canonical_record("delivery-selection") is not None
 
 
 def test_run_reclaims_expired_task_lease(tmp_path: Path) -> None:

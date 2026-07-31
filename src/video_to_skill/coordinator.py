@@ -18,13 +18,15 @@ from video_to_skill.compiler import (
     WorkspaceBuildResult,
     build_workspace_skill,
     compile_workspace_blueprint,
+    portable_build_matches,
 )
 from video_to_skill.config import Settings
 from video_to_skill.errors import ProcessingError
 from video_to_skill.generation import CurriculumDesign
-from video_to_skill.installation import SkillHost
+from video_to_skill.installation import SkillHost, host_skill_root
 from video_to_skill.orchestration import (
     DecisionResult,
+    DeliverySelection,
     RunAction,
     RunEnvelope,
     SubmissionReceipt,
@@ -36,7 +38,7 @@ from video_to_skill.review import (
     plan_review_task,
     submit_review_result,
 )
-from video_to_skill.utils import atomic_write_json
+from video_to_skill.utils import atomic_write_json, stable_hash
 from video_to_skill.work import AnalysisRun, WorkItem, WorkRole, WorkState
 from video_to_skill.workspace import Workspace
 
@@ -194,6 +196,81 @@ def _plan_decision_task(
     )
 
 
+def _verified_task_packet(workspace: Workspace, task: WorkItem) -> dict[str, object]:
+    packet = _load_json(workspace.root / task.packet_path)
+    if not isinstance(packet, dict) or stable_hash(packet, length=64) != task.packet_digest:
+        raise ProcessingError("Decision task packet failed its digest check")
+    return packet
+
+
+def _available_delivery_options(
+    *,
+    name: str,
+    output: Path,
+    skill_root: Path,
+) -> list[dict[str, str]]:
+    options: list[dict[str, str]] = []
+    for ordinal in range(2, 102):
+        suffix = f"-{ordinal}"
+        prefix = name[: 64 - len(suffix)].rstrip("-")
+        candidate = f"{prefix}{suffix}"
+        candidate_output = output.with_name(candidate)
+        if candidate_output.exists() or (skill_root / candidate).exists():
+            continue
+        options.append(
+            {
+                "id": candidate,
+                "label": candidate,
+                "description": (f"Generate at {candidate_output} and install as {candidate}."),
+                "output": str(candidate_output),
+            }
+        )
+        if len(options) == 3:
+            return options
+    raise ProcessingError("Could not find an available generated Skill name")
+
+
+def _plan_delivery_decision_task(
+    workspace: Workspace,
+    run: AnalysisRun,
+    *,
+    author_task: WorkItem,
+    review_task: WorkItem,
+    build_id: str,
+    name: str,
+    output: Path,
+    skill_root: Path,
+    conflicts: list[str],
+) -> WorkItem:
+    options = _available_delivery_options(
+        name=name,
+        output=output,
+        skill_root=skill_root,
+    )
+    return workspace.ensure_work_item(
+        run_id=run.id,
+        role=WorkRole.DECISION,
+        scope={
+            "kind": "delivery-name-selection",
+            "author_task_id": author_task.id,
+            "conflicting_build_id": build_id,
+        },
+        persona_hint="User generated Skill naming decision.",
+        packet={
+            "prompt": (
+                f"The generated Skill name '{name}' conflicts with different content. "
+                "Choose an available portable name and output."
+            ),
+            "options": options,
+            "conflicts": conflicts,
+            "build_id": build_id,
+        },
+        result_schema=DecisionResult.model_json_schema(mode="validation"),
+        dependencies=[review_task.id],
+        snapshot_digest=run.snapshot_digest,
+    )
+
+
 def submit_decision_result(
     workspace: Workspace,
     task_id: str,
@@ -208,23 +285,66 @@ def submit_decision_result(
         raise ProcessingError(f"Invalid user decision result: {exc}") from exc
     if result.task_id != task.id or result.snapshot_digest != task.snapshot_digest:
         raise ProcessingError("User decision does not belong to this task snapshot")
-    curriculum_record = workspace.canonical_record("curriculum")
-    if curriculum_record is None:
-        raise ProcessingError("User decision requires canonical curriculum state")
-    curriculum = CurriculumDesign.model_validate(
-        _load_json(workspace.root / curriculum_record.path)
-    )
-    if result.selected_path_id not in {path.id for path in curriculum.paths}:
-        raise ProcessingError("User selected an unknown curriculum path")
-    selected = curriculum.model_copy(update={"selected_path_id": result.selected_path_id})
-    output = workspace.tasks_dir / task.id / "output" / "curriculum.json"
-    atomic_write_json(output, selected)
+    canonical_outputs: list[tuple[str, str, Path]]
+    if task.scope.get("kind") == "curriculum-selection":
+        curriculum_record = workspace.canonical_record("curriculum")
+        if curriculum_record is None:
+            raise ProcessingError("User decision requires canonical curriculum state")
+        curriculum = CurriculumDesign.model_validate(
+            _load_json(workspace.root / curriculum_record.path)
+        )
+        if result.selected_option_id not in {path.id for path in curriculum.paths}:
+            raise ProcessingError("User selected an unknown curriculum path")
+        selected = curriculum.model_copy(update={"selected_path_id": result.selected_option_id})
+        output = workspace.tasks_dir / task.id / "output" / "curriculum.json"
+        atomic_write_json(output, selected)
+        canonical_outputs = [("curriculum", "default", output)]
+    elif task.scope.get("kind") == "delivery-name-selection":
+        packet = _verified_task_packet(workspace, task)
+        payload = packet.get("payload")
+        if not isinstance(payload, dict):
+            raise ProcessingError("Delivery decision packet has no payload")
+        options = payload.get("options")
+        if not isinstance(options, list):
+            raise ProcessingError("Delivery decision packet has no options")
+        selected_option = next(
+            (
+                option
+                for option in options
+                if isinstance(option, dict) and option.get("id") == result.selected_option_id
+            ),
+            None,
+        )
+        if selected_option is None:
+            raise ProcessingError("User selected an unknown delivery option")
+        selected_name = selected_option.get("id")
+        selected_output = selected_option.get("output")
+        conflicting_build_id = task.scope.get("conflicting_build_id")
+        if (
+            not isinstance(selected_name, str)
+            or not isinstance(selected_output, str)
+            or not isinstance(conflicting_build_id, str)
+        ):
+            raise ProcessingError("Selected delivery option is malformed")
+        try:
+            selection = DeliverySelection(
+                name=selected_name,
+                output=Path(selected_output).resolve(),
+                conflicting_build_id=conflicting_build_id,
+            )
+        except PydanticValidationError as exc:
+            raise ProcessingError(f"Selected delivery option is invalid: {exc}") from exc
+        output = workspace.tasks_dir / task.id / "output" / "delivery-selection.json"
+        atomic_write_json(output, selection)
+        canonical_outputs = [("delivery-selection", "default", output)]
+    else:
+        raise ProcessingError("Decision task has an unknown kind")
     accepted, _records = workspace.accept_work_result(
         task_id=task.id,
         lease_token=result.lease_token,
         result_path=result_path,
         producer=result.producer.model_dump(mode="json"),
-        canonical_outputs=[("curriculum", "default", output)],
+        canonical_outputs=canonical_outputs,
     )
     return accepted
 
@@ -269,6 +389,57 @@ def _matching_tasks(
     scope_value: object,
 ) -> list[WorkItem]:
     return [item for item in tasks if item.scope.get(scope_key) == scope_value]
+
+
+def _delivery_targets(
+    workspace: Workspace,
+    configuration: dict[str, object],
+    *,
+    name: str,
+) -> tuple[Path, Path]:
+    selection_record = workspace.canonical_record("delivery-selection")
+    if selection_record is not None:
+        try:
+            selection = DeliverySelection.model_validate(
+                _load_json(workspace.root / selection_record.path)
+            )
+        except PydanticValidationError as exc:
+            raise ProcessingError(f"Invalid canonical delivery selection: {exc}") from exc
+        if selection.name != name:
+            raise ProcessingError("Canonical delivery selection disagrees with the build")
+        output = selection.output
+    else:
+        output = Path(str(configuration["output"]))
+        if bool(configuration["output_is_default"]):
+            output = output.with_name(name)
+    skill_root = (
+        Path(str(configuration["skill_root"]))
+        if configuration.get("skill_root")
+        else host_skill_root(
+            SkillHost(str(configuration["host"])),
+            project=bool(configuration["project"]),
+            project_root=Path(str(configuration["project_root"])),
+        )
+    )
+    return output, skill_root
+
+
+def _delivery_conflicts(
+    *,
+    name: str,
+    build_id: str,
+    output: Path,
+    skill_root: Path,
+) -> list[str]:
+    candidates = {
+        "generated output": output,
+        "installed Skill": skill_root / name,
+    }
+    return [
+        f"{label}: {path}"
+        for label, path in candidates.items()
+        if (path.exists() or path.is_symlink()) and not portable_build_matches(path, build_id)
+    ]
 
 
 def _completion_payload(
@@ -363,11 +534,15 @@ def advance_run(
 
         decision_dependency: list[str] = []
         if _course_requires_decision(workspace):
-            decisions = _matching_tasks(
-                workspace.list_work_items(run.id, role=WorkRole.DECISION),
-                scope_key="author_task_id",
-                scope_value=author_task.id,
-            )
+            decisions = [
+                item
+                for item in _matching_tasks(
+                    workspace.list_work_items(run.id, role=WorkRole.DECISION),
+                    scope_key="author_task_id",
+                    scope_value=author_task.id,
+                )
+                if item.scope.get("kind") == "curriculum-selection"
+            ]
             if not decisions:
                 _plan_decision_task(workspace, run, author_task)
                 continue
@@ -420,7 +595,46 @@ def advance_run(
         if critic.get("verdict") != "pass":
             raise ProcessingError("Canonical critic report has an invalid verdict")
 
-        blueprint, _receipt, build_directory = compile_workspace_blueprint(workspace)
+        blueprint, receipt, build_directory = compile_workspace_blueprint(workspace)
+        configured_output, configured_skill_root = _delivery_targets(
+            workspace,
+            configuration,
+            name=blueprint.name,
+        )
+        delivery_conflicts = _delivery_conflicts(
+            name=blueprint.name,
+            build_id=receipt.build_id,
+            output=configured_output,
+            skill_root=configured_skill_root,
+        )
+        if delivery_conflicts:
+            delivery_decisions = [
+                item
+                for item in _matching_tasks(
+                    workspace.list_work_items(run.id, role=WorkRole.DECISION),
+                    scope_key="conflicting_build_id",
+                    scope_value=receipt.build_id,
+                )
+                if item.scope.get("kind") == "delivery-name-selection"
+            ]
+            if not delivery_decisions:
+                _plan_delivery_decision_task(
+                    workspace,
+                    run,
+                    author_task=author_task,
+                    review_task=review_task,
+                    build_id=receipt.build_id,
+                    name=blueprint.name,
+                    output=configured_output,
+                    skill_root=configured_skill_root,
+                    conflicts=delivery_conflicts,
+                )
+                continue
+            if delivery_decisions[-1].state != WorkState.COMPLETE:
+                return _actions_required(workspace, [delivery_decisions[-1]])
+            raise ProcessingError(
+                "Completed delivery decision did not resolve generated Skill conflicts"
+            )
         completion_path = build_directory / "completion.json"
         if completion_path.exists():
             completion = _load_json(completion_path)
@@ -430,12 +644,6 @@ def advance_run(
                 workspace=workspace.root,
                 completion=completion,
             )
-        configured_output = Path(str(configuration["output"]))
-        if bool(configuration["output_is_default"]):
-            configured_output = configured_output.with_name(blueprint.name)
-        configured_skill_root = (
-            Path(str(configuration["skill_root"])) if configuration.get("skill_root") else None
-        )
         result = build_workspace_skill(
             workspace,
             host=SkillHost(str(configuration["host"])),
