@@ -12,8 +12,8 @@ from pydantic import ValidationError as PydanticValidationError
 from video_to_skill.errors import ProcessingError
 from video_to_skill.generation import SemanticUnit
 from video_to_skill.orchestration import AnalyzeResult
-from video_to_skill.utils import atomic_write_json
-from video_to_skill.work import AnalysisRun, WorkItem, WorkRole
+from video_to_skill.utils import atomic_write_json, hash_file, stable_hash
+from video_to_skill.work import AnalysisRun, WorkItem, WorkRole, WorkState
 from video_to_skill.workspace import Workspace
 
 MAX_ANALYZE_SECTIONS_PER_TASK = 8
@@ -132,6 +132,17 @@ def plan_analyze_tasks(workspace: Workspace, run: AnalysisRun) -> list[WorkItem]
                 for item in packet[category]
             }
         )
+        allowed_evidence_by_source: dict[str, list[str]] = {}
+        for source_id in source_sections:
+            allowed_evidence_by_source[source_id] = sorted(
+                {
+                    str(item["id"])
+                    for packet in section_packets
+                    for category in ("transcripts", "visuals", "observations")
+                    for item in packet[category]
+                    if item["source_id"] == source_id
+                }
+            )
         packet = {
             "instructions": (
                 "Perform high-recall extraction, terminology normalization, relation linking, "
@@ -145,6 +156,7 @@ def plan_analyze_tasks(workspace: Workspace, run: AnalysisRun) -> list[WorkItem]
             ],
             "sections": section_packets,
             "allowed_evidence_ids": allowed_evidence_ids,
+            "allowed_evidence_by_source": allowed_evidence_by_source,
         }
         tasks.append(
             workspace.ensure_work_item(
@@ -167,17 +179,61 @@ def plan_analyze_integration_task(
 ) -> WorkItem:
     if not shard_tasks or any(item.role != WorkRole.ANALYZE for item in shard_tasks):
         raise ProcessingError("Analyze integration requires Analyze shard tasks")
+    shard_results: list[AnalyzeResult] = []
+    shard_result_paths: list[str] = []
+    for item in shard_tasks:
+        if item.state != WorkState.COMPLETE or item.result_path is None:
+            raise ProcessingError("Analyze integration requires completed shard results")
+        path = workspace.root / item.result_path
+        if (
+            not path.is_file()
+            or path.is_symlink()
+            or item.result_digest is None
+            or hash_file(path) != item.result_digest
+        ):
+            raise ProcessingError(f"Accepted Analyze shard failed its digest check: {item.id}")
+        shard_results.append(_load_analyze_result(path))
+        shard_result_paths.append(str(item.result_path))
     packet = {
         "instructions": (
             "Integrate the completed shard results without deleting source-specific semantic "
             "units. Normalize terminology only where equivalence is supported, adjudicate or "
             "retain conflicts, recompute relations and coverage, and emit an integrated result."
         ),
-        "shard_results": [
-            str(item.result_path)
-            for item in shard_tasks
-            if item.result_path is not None
-        ],
+        "shard_results": shard_result_paths,
+        "allowed_evidence_ids": sorted(
+            {
+                evidence_id
+                for result in shard_results
+                for unit in result.semantic_units
+                for evidence_id in unit.evidence_ids
+            }
+        ),
+        "allowed_evidence_by_source": {
+            source_id: sorted(
+                {
+                    evidence_id
+                    for result in shard_results
+                    for unit in result.semantic_units
+                    if unit.source_id == source_id
+                    for evidence_id in unit.evidence_ids
+                }
+            )
+            for source_id in sorted(
+                {
+                    unit.source_id
+                    for result in shard_results
+                    for unit in result.semantic_units
+                }
+            )
+        },
+        "required_semantic_unit_ids": sorted(
+            {
+                unit.id
+                for result in shard_results
+                for unit in result.semantic_units
+            }
+        ),
     }
     return workspace.ensure_work_item(
         run_id=run.id,
@@ -214,7 +270,15 @@ def _validate_analyze_evidence(
         packet = json.loads(packet_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ProcessingError(f"Invalid Analyze task packet: {exc}") from exc
+    if stable_hash(packet, length=64) != task.packet_digest:
+        raise ProcessingError("Analyze task packet failed its digest check")
     allowed = set(packet["payload"].get("allowed_evidence_ids", []))
+    allowed_by_source = {
+        str(source_id): set(evidence_ids)
+        for source_id, evidence_ids in packet["payload"]
+        .get("allowed_evidence_by_source", {})
+        .items()
+    }
     scoped_sources = {
         source_id
         for source_id in task.scope.get("source_sections", {})
@@ -227,7 +291,10 @@ def _validate_analyze_evidence(
             raise ProcessingError(
                 f"Semantic unit {unit.id} references source outside its Analyze task"
             )
-        if not set(unit.evidence_ids) <= allowed and task.scope.get("kind") != "course-integration":
+        if (
+            not set(unit.evidence_ids) <= allowed
+            or not set(unit.evidence_ids) <= allowed_by_source.get(unit.source_id, set())
+        ):
             raise ProcessingError(
                 f"Semantic unit {unit.id} references evidence outside its Analyze packet"
             )
@@ -243,6 +310,13 @@ def _validate_analyze_evidence(
         unit.source_id for unit in result.semantic_units
     }:
         raise ProcessingError("Semantic coverage source IDs disagree with submitted units")
+    required_unit_ids = set(packet["payload"].get("required_semantic_unit_ids", []))
+    submitted_unit_ids = {unit.id for unit in result.semantic_units}
+    if not required_unit_ids <= submitted_unit_ids:
+        raise ProcessingError(
+            "Integrated Analyze result omits shard semantic units: "
+            + ", ".join(sorted(required_unit_ids - submitted_unit_ids))
+        )
     counts = {
         "core_units": sum(unit.materiality == "core" for unit in result.semantic_units),
         "supporting_units": sum(

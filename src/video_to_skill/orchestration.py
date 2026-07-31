@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
@@ -137,6 +138,12 @@ AffordanceKind = Literal[
 ]
 AffordanceStatus = Literal["provided", "unsupported", "not-applicable"]
 ArtifactDisclosure = Literal["normal", "after-attempt"]
+_ROOT_ARTIFACTS = {
+    "learning-path.md",
+    "glossary.md",
+    "patterns.md",
+    "cheatsheet.md",
+}
 
 AFFORDANCE_CATALOG: dict[SkillMode, tuple[AffordanceKind, ...]] = {
     "learn": (
@@ -251,6 +258,18 @@ class ArtifactDraftSpec(OrchestrationModel):
             or path.name in {"SKILL.md", "source-map.md", "sources.md"}
         ):
             raise ValueError("artifact path must be a safe relative Markdown path")
+        if len(path.parts) == 1:
+            if path.as_posix() not in _ROOT_ARTIFACTS:
+                raise ValueError("root artifact path is not an allowed portable artifact")
+        elif (
+            len(path.parts) > 4
+            or path.parts[0] in {"assets", "."}
+            or any(
+                not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", part)
+                for part in path.parts
+            )
+        ):
+            raise ValueError("artifact collection path is unsafe or too deeply nested")
         return path.as_posix()
 
     @field_validator("draft_path")

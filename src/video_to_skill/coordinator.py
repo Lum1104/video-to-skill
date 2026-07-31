@@ -244,14 +244,26 @@ def submit_workspace_result(
     result_path: Path,
 ) -> SubmissionReceipt:
     item = workspace.get_work_item(task_id)
+    submitted_result = result_path.absolute()
+    resolved_result = result_path.resolve()
+    task_output = (workspace.tasks_dir / task_id / "output").resolve()
+    if (
+        not resolved_result.is_file()
+        or submitted_result.is_symlink()
+        or not resolved_result.is_relative_to(task_output)
+        or resolved_result.stat().st_size > 8 * 1024 * 1024
+    ):
+        raise ProcessingError(
+            "Submitted result must be a regular task-output JSON file no larger than 8 MiB"
+        )
     if item.role == WorkRole.ANALYZE:
-        accepted = submit_analyze_result(workspace, task_id, result_path)
+        accepted = submit_analyze_result(workspace, task_id, resolved_result)
     elif item.role == WorkRole.AUTHOR:
-        accepted = submit_author_result(workspace, task_id, result_path)
+        accepted = submit_author_result(workspace, task_id, resolved_result)
     elif item.role == WorkRole.REVIEW:
-        accepted = submit_review_result(workspace, task_id, result_path)
+        accepted = submit_review_result(workspace, task_id, resolved_result)
     else:
-        accepted = submit_decision_result(workspace, task_id, result_path)
+        accepted = submit_decision_result(workspace, task_id, resolved_result)
     assert accepted.result_digest is not None
     return SubmissionReceipt(
         task_id=accepted.id,
@@ -342,6 +354,7 @@ def advance_run(
     )
     run = workspace.create_analysis_run()
     for _transition in range(100):
+        workspace.ready_work_items(run.id)
         analyze_tasks = workspace.list_work_items(run.id, role=WorkRole.ANALYZE)
         if not analyze_tasks:
             plan_analyze_tasks(workspace, run)

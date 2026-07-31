@@ -129,6 +129,8 @@ def _validate_author_result(
 ) -> None:
     units = _load_semantic_units(workspace)
     known_units = {unit.id for unit in units}
+    units_by_id = {unit.id: unit for unit in units}
+    sources = {source.id: source for source in workspace.list_sources()}
     ceilings = {item.mode: item.ceiling for item in _load_capability_evidence(workspace)}
     levels: dict[SkillMode, CapabilityLevel] = {
         "learn": result.capability_profile.learn,
@@ -178,6 +180,30 @@ def _validate_author_result(
             raise ProcessingError(f"Claim {claim.id} references unknown semantic units")
         if claim.file not in {"SKILL.md", "source-map.md", "sources.md"} | artifact_paths:
             raise ProcessingError(f"Claim {claim.id} references an unauthored file")
+        referenced_units = [units_by_id[unit_id] for unit_id in claim.semantic_unit_ids]
+        allowed_evidence_by_source = {
+            source_id: {
+                evidence_id
+                for unit in referenced_units
+                if unit.source_id == source_id
+                for evidence_id in unit.evidence_ids
+            }
+            for source_id in {unit.source_id for unit in referenced_units}
+        }
+        for evidence in claim.evidence:
+            if evidence.source_id not in allowed_evidence_by_source:
+                raise ProcessingError(
+                    f"Claim {claim.id} evidence references an unrelated source"
+                )
+            if not set(evidence.evidence_ids) <= allowed_evidence_by_source[evidence.source_id]:
+                raise ProcessingError(
+                    f"Claim {claim.id} references evidence outside its semantic units"
+                )
+            source = sources[evidence.source_id]
+            if source.duration is not None and evidence.end > source.duration:
+                raise ProcessingError(
+                    f"Claim {claim.id} evidence extends beyond source duration"
+                )
 
 
 def submit_author_result(

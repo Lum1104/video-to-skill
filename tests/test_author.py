@@ -300,3 +300,39 @@ def test_author_submission_rejects_changed_draft(tmp_path: Path) -> None:
 
     with pytest.raises(ProcessingError, match="digest does not match"):
         submit_author_result(workspace, task.id, result_path)
+
+
+def test_author_submission_rejects_claim_evidence_outside_semantic_units(
+    tmp_path: Path,
+) -> None:
+    workspace, analyze_task = _analyzed_workspace(tmp_path)
+    run = workspace.create_analysis_run(analyze_task.snapshot_digest)
+    task = plan_author_task(workspace, run, analyze_task=analyze_task)
+    lease = workspace.lease_work_item(task.id, owner="codex")
+    draft = lease.output_directory / "course.md"
+    draft.write_text("# Course\n", encoding="utf-8")
+    payload = _author_result(task, lease.token, draft).model_dump(mode="json")
+    payload["claims"][0]["evidence"][0]["evidence_ids"] = ["invented-evidence"]
+    result_path = lease.output_directory / "result.json"
+    atomic_write_json(result_path, payload)
+
+    with pytest.raises(ProcessingError, match="outside its semantic units"):
+        submit_author_result(workspace, task.id, result_path)
+
+
+def test_author_artifact_paths_match_portable_renderer_contract(tmp_path: Path) -> None:
+    draft = tmp_path / "course.md"
+    draft.write_text("# Course\n", encoding="utf-8")
+    with pytest.raises(PydanticValidationError, match="root artifact path"):
+        ArtifactDraftSpec(
+            id="artifact-course",
+            path="course.md",
+            title="Course",
+            modes=["learn"],
+            disclosure="normal",
+            use_when="learning the course",
+            independent_loading_reason="Load the course as one coherent guide.",
+            semantic_unit_ids=["unit-conviction"],
+            draft_path=draft.name,
+            draft_sha256=hash_file(draft),
+        )
