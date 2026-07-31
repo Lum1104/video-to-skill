@@ -235,6 +235,8 @@ On macOS, a browser keychain prompt may appear once. Repeated prompts during one
 
 Treat cookies, headers, tokens, expiring URLs, and browser snapshots as runtime secrets. Never quote them back, place them in task packets or logs, persist them in the workspace, or include them in the generated Skill.
 
+Let the engine record tool provenance directly at its subprocess and provider boundaries. It stores stable logical runs, attempts, failures, cache reuse, normalized non-secret arguments, input digests, and workspace-relative output digests in SQLite; do not ask workers or the main agent to reconstruct or relay this data. Use `tool-runs WORKSPACE` only when a maintainer needs the canonical sanitized JSONL under `WORKSPACE/logs/`. Raw stdout, stderr, environment variables, credentials, signed URLs, private absolute paths, and tool records themselves never enter the portable generated Skill.
+
 ## Generated Skill contract
 
 The portable package and raw workspace must be separate trees. Every generated course Skill contains five fixed root records and at least one authored Markdown artifact. A representative evidence-justified package can contain:

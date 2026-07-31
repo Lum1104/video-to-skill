@@ -169,6 +169,14 @@ video-to-skill extract \
 
 The extractor records isolated source failures without discarding successful course items.
 
+The engine records deterministic subprocess and provider executions directly in SQLite. Export the canonical sanitized view only when debugging or reproducing a workspace:
+
+```bash
+video-to-skill tool-runs ./video_skill_work
+```
+
+The command creates `logs/tool-runs.jsonl` inside the private workspace and reports its SHA-256 digest. It accepts an existing export only when the bytes are identical and never overwrites a different file. Records have stable logical IDs, immutable generation-numbered attempt histories, cache-hit counts, status and duration, tool versions when resolvable, normalized non-secret arguments, input SHA-256 values, workspace-relative file digests, and verified semantic digests for typed ASR, OCR, and vision records. They never contain raw stdout, stderr, environment variables, cookies, authorization values, expiring URLs, or private absolute paths, and they are not copied into generated Skills.
+
 ### Query bounded evidence
 
 List the course inventory and semantic sections:
@@ -372,6 +380,8 @@ The private, resumable workspace has this shape:
 manifest.json
 coverage.json
 evidence.sqlite3
+logs/
+  tool-runs.jsonl
 sources/
   <source-id>/
     media.*
@@ -382,7 +392,7 @@ sources/
     contact-sheets/
 ```
 
-The SQLite evidence schema is version 4. It stores ordered source descriptors, per-stage state, transcript segments, visual events, semantic sections, agent observations, evidence gaps, input inspection reports, and warnings. Older supported workspaces migrate forward when opened; workspaces created by an unsupported newer schema are refused.
+The SQLite evidence schema is version 10. It stores ordered source descriptors, per-stage state, transcript segments, visual events, semantic sections, agent observations, evidence gaps, input inspection reports, orchestration state, immutable publication heads, identity baselines, sanitized logical tool runs with immutable execution attempts, and warnings. WAL mode and one connection per operation allow concurrent source workers and tool-run writers to commit safely. Older supported workspaces migrate forward when opened; workspaces created by an unsupported newer schema are refused.
 
 Successful refreshed inspection tombstones sources that disappeared from the latest course inventory instead of deleting them. Active queries omit retired sources by default, while the tombstone retains the descriptor, removal time, and reason. Existing transcripts, frames, observations, and provenance references remain available for audit or an explicit update workflow.
 

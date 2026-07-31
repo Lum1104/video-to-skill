@@ -65,6 +65,8 @@ def _export_browser_cookies(
         ],
         timeout=settings.command_timeout_seconds,
         check=False,
+        provenance_operation="snapshot-browser-cookies",
+        provenance_outputs=[],
     )
     if not cookie_path.is_file() or cookie_path.is_symlink() or cookie_path.stat().st_size == 0:
         detail = redact((result.stderr or result.stdout).strip())[-1200:]

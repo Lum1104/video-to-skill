@@ -20,6 +20,7 @@ from video_to_skill.models import (
     TranscriptSegment,
     TranscriptWord,
 )
+from video_to_skill.tool_runs import digest_value, python_package_version, tracked_operation
 from video_to_skill.utils import run_command, stable_hash
 
 _TIMING_RE = re.compile(
@@ -465,6 +466,7 @@ def extract_audio(media_path: Path, destination: Path, settings: Settings) -> Pa
             str(destination),
         ],
         timeout=settings.command_timeout_seconds,
+        provenance_operation="extract-asr-audio",
     )
     if not destination.is_file() or destination.stat().st_size == 0:
         raise ProcessingError(f"FFmpeg did not produce audio: {destination}")
@@ -495,10 +497,27 @@ def transcribe(
     if not audio_path.exists():
         extract_audio(materialized.media_path, audio_path, settings)
     backend = transcriber or load_transcriber(settings.asr_provider)
-    segments = backend.transcribe(
-        audio_path,
-        source_id=materialized.source.id,
-        language=materialized.source.language or settings.language,
-        settings=settings,
-    )
+    requested_language = materialized.source.language or settings.language
+    with tracked_operation(
+        tool=backend.name,
+        version=python_package_version(backend.name),
+        operation="transcribe-audio",
+        arguments={
+            "language": requested_language,
+            "model": settings.asr_model,
+            "diarize": settings.diarize,
+        },
+        input_paths=[audio_path],
+    ) as tool_run:
+        segments = backend.transcribe(
+            audio_path,
+            source_id=materialized.source.id,
+            language=requested_language,
+            settings=settings,
+        )
+        tool_run.add_logical_output(
+            "transcript-segments",
+            materialized.source.id,
+            digest_value([segment.model_dump(mode="json") for segment in segments]),
+        )
     return segments, [*caption_warnings, "caption-replaced-by-asr"]

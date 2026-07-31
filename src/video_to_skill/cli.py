@@ -969,6 +969,32 @@ def validate(
         raise typer.Exit(1)
 
 
+@app.command("tool-runs")
+def tool_runs(
+    workspace: Annotated[Path, typer.Argument(help="Evidence workspace.")],
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "--output",
+            help="Workspace-contained JSONL path; defaults to logs/tool-runs.jsonl.",
+        ),
+    ] = None,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Export sanitized deterministic tool provenance inside the raw workspace."""
+
+    try:
+        evidence = Workspace.open(workspace)
+        report = evidence.export_tool_runs(output)
+    except VideoToSkillError as exc:
+        typer.echo(f"ERROR: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    if as_json:
+        typer.echo(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        typer.echo(f"Tool runs: {report['records']} · {report['path']} · sha256={report['sha256']}")
+
+
 @app.command()
 def clean(
     workspace: Annotated[Path, typer.Argument(help="Evidence workspace.")],

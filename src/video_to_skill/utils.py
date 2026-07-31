@@ -89,29 +89,41 @@ def run_command(
     cwd: Path | None = None,
     env: Mapping[str, str] | None = None,
     check: bool = True,
+    provenance_operation: str | None = None,
+    provenance_outputs: Sequence[Path] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run without a shell so untrusted locators cannot become commands."""
 
     if not args:
         raise ValueError("command cannot be empty")
-    try:
-        result = subprocess.run(
-            list(args),
-            cwd=cwd,
-            env=dict(env) if env else None,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise ProcessingError(f"Command timed out after {timeout}s: {args[0]}") from exc
-    except OSError as exc:
-        raise ProcessingError(f"Could not start {args[0]}: {exc}") from exc
-    if check and result.returncode != 0:
-        detail = redact((result.stderr or result.stdout).strip())[-2000:]
-        raise ProcessingError(f"{args[0]} failed with exit {result.returncode}: {detail}")
-    return result
+    # Import lazily so the provenance layer can reuse hashing/path helpers without
+    # creating an import cycle. With no active engine scope this is a no-op.
+    from video_to_skill.tool_runs import tracked_command
+
+    with tracked_command(
+        args,
+        operation=provenance_operation,
+        output_paths=provenance_outputs,
+    ) as tracked:
+        try:
+            result = subprocess.run(
+                list(args),
+                cwd=cwd,
+                env=dict(env) if env else None,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ProcessingError(f"Command timed out after {timeout}s: {args[0]}") from exc
+        except OSError as exc:
+            raise ProcessingError(f"Could not start {args[0]}: {exc}") from exc
+        tracked.return_code = result.returncode
+        if check and result.returncode != 0:
+            detail = redact((result.stderr or result.stdout).strip())[-2000:]
+            raise ProcessingError(f"{args[0]} failed with exit {result.returncode}: {detail}")
+        return result
 
 
 def atomic_write_text(path: Path, content: str) -> None:

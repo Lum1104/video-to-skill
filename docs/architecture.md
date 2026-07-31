@@ -14,6 +14,8 @@ Each workspace contains:
 manifest.json
 coverage.json
 evidence.sqlite3
+logs/
+  tool-runs.jsonl
 sources/
   <source-id>/
     media.*
@@ -24,7 +26,7 @@ sources/
     contact-sheets/
 ```
 
-SQLite schema version 4 uses WAL mode and one connection per operation so multiple source workers can commit safely. Supported older workspaces migrate forward when opened. Stage state is stored per source with a cache key containing the input identity, relevant configuration, and backend selection. A stage is reused only when its cache key still matches.
+SQLite schema version 10 uses WAL mode and one connection per operation so multiple source workers and tool-run writers can commit safely. Supported older workspaces migrate forward when opened. Stage state is stored per source with a cache key containing the input identity, relevant configuration, and backend selection. A stage is reused only when its cache key still matches.
 
 The database stores:
 
@@ -36,6 +38,7 @@ The database stores:
 - semantic timeline segments
 - agent-authored observations grounded in transcript and frame IDs
 - unresolved and resolved evidence gaps with suggested investigation windows
+- stable logical tool executions with attempt, failure, cache-reuse, input, argument, and output-digest metadata
 - structured warnings
 
 Successful refreshed inspection tombstones a source missing from the latest inventory instead of deleting it or its evidence. Active queries omit retired sources by default, while the tombstone and retained transcripts, visuals, observations, and provenance references remain auditable.
@@ -45,6 +48,8 @@ Baseline visual events are the scene and periodic candidates produced by determi
 Teaching-asset selection is a separate publication pipeline. Analyze proposes an evidence-grounded frame, normalized crop, or ordered two-to-four-frame sequence; deterministic code validates the frame IDs, decodes and composes the image, removes metadata, emits PNG, and records its digest. Author selects only from those immutable candidates and must link each selection from its consuming artifacts, while Review audits necessity, legibility, context, privacy, and on-demand loading. The generated Skill receives only selected sanitized images, never the baseline or dense-frame collections.
 
 `coverage.json` schema version 2 aggregates the persisted inspection reports into a course-completeness proof, count totals, disclaimers, active source coverage, retired-source tombstones, and warnings. Completeness remains unproven when the expected count is unknown or any expected entry is inaccessible or failed.
+
+The shared subprocess runner automatically records yt-dlp, FFmpeg, ffprobe, and other commands whenever an engine scope is active; ASR, OCR, vision, and retained investigation outputs use the same tracked-operation primitive because they do not all cross a subprocess boundary. SQLite is authoritative and uses one stable identity per tool version, operation, source, stage cache key, normalized arguments, and input-digest set. Every execution gets an immutable generation-numbered attempt, so a late completion cannot replace newer state and failure history remains inspectable; a reused stage increments the logical run's cache-hit count rather than emitting agent-written log chatter. ASR, OCR, and vision outputs identify typed workspace records and carry semantic digests that exports verify against SQLite. `tool-runs` exports records in stable ID order to canonical JSONL under `logs/`; no-follow traversal and atomic create-only publication accept an existing file only when its bytes are identical. It stores no raw output, arbitrary environment, credentials, signed URLs, or host-private absolute paths, and the raw tool history is never part of the generated Skill.
 
 `manifest.json` also owns the analysis-depth contract. Inspection deterministically summarizes duration, active and expected item counts, chapters, caption coverage, course structure, and visible content signals. `auto` resolves to `standard` or `deep`; `archival` is explicit because its storage and review boundary is material. The versioned budget summary controls frame cadence, scene sensitivity, width, perceptual deduplication, duration-scaled frame retention, semantic segment size, Analyze packet limits and fanout, and investigation affordances. Absolute course, media, packet, frame, and investigation maxima remain hard safety caps.
 

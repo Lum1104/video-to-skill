@@ -41,6 +41,7 @@ from video_to_skill.sources import (
     local_source_changed,
     source_cache_identity,
 )
+from video_to_skill.tool_runs import digest_value, opaque_input_set_id, tool_run_scope
 from video_to_skill.transcript import (
     captions_are_adequate,
     load_transcriber,
@@ -161,11 +162,25 @@ def _process_source(
     materialized = None
     if workspace.stage_complete(source.id, ProcessingStage.ACQUIRE, acquire_key):
         materialized = _materialized_from_cache(workspace, source)
+        if materialized is not None:
+            workspace.record_tool_cache_hit(source.id, ProcessingStage.ACQUIRE, acquire_key)
     if materialized is None:
         progress(f"[{source.title}] acquiring source")
         workspace.start_stage(source.id, ProcessingStage.ACQUIRE, acquire_key)
         try:
-            materialized = registry.materialize(source, source_dir, settings, need_media=need_media)
+            with tool_run_scope(
+                workspace,
+                source_id=source.id,
+                stage=ProcessingStage.ACQUIRE.value,
+                cache_key=acquire_key,
+                input_digests={"source": digest_value(source_cache_identity(source))},
+            ):
+                materialized = registry.materialize(
+                    source,
+                    source_dir,
+                    settings,
+                    need_media=need_media,
+                )
             workspace.update_materialization(
                 source.id,
                 content_hash=materialized.content_hash,
@@ -194,7 +209,19 @@ def _process_source(
         )
         workspace.start_stage(source.id, ProcessingStage.ACQUIRE, acquire_key)
         try:
-            materialized = registry.materialize(source, source_dir, settings, need_media=True)
+            with tool_run_scope(
+                workspace,
+                source_id=source.id,
+                stage=ProcessingStage.ACQUIRE.value,
+                cache_key=acquire_key,
+                input_digests={"source": digest_value(source_cache_identity(source))},
+            ):
+                materialized = registry.materialize(
+                    source,
+                    source_dir,
+                    settings,
+                    need_media=True,
+                )
             workspace.update_materialization(
                 source.id,
                 content_hash=materialized.content_hash,
@@ -217,11 +244,20 @@ def _process_source(
             "model": settings.asr_model,
         }
     )
-    if not workspace.stage_complete(source.id, ProcessingStage.TRANSCRIBE, transcript_key):
+    if workspace.stage_complete(source.id, ProcessingStage.TRANSCRIBE, transcript_key):
+        workspace.record_tool_cache_hit(source.id, ProcessingStage.TRANSCRIBE, transcript_key)
+    else:
         progress(f"[{source.title}] selecting captions / transcribing")
         workspace.start_stage(source.id, ProcessingStage.TRANSCRIBE, transcript_key)
         try:
-            transcripts, warnings = transcribe(materialized, settings)
+            with tool_run_scope(
+                workspace,
+                source_id=source.id,
+                stage=ProcessingStage.TRANSCRIBE.value,
+                cache_key=transcript_key,
+                input_digests={"materialized": digest_value(materialized.content_hash)},
+            ):
+                transcripts, warnings = transcribe(materialized, settings)
             workspace.replace_transcripts(source.id, transcripts)
             for warning in warnings:
                 _record_warning(
@@ -257,11 +293,20 @@ def _process_source(
             ),
         }
     )
-    if not workspace.stage_complete(source.id, ProcessingStage.VISUALS, visual_key):
+    if workspace.stage_complete(source.id, ProcessingStage.VISUALS, visual_key):
+        workspace.record_tool_cache_hit(source.id, ProcessingStage.VISUALS, visual_key)
+    else:
         progress(f"[{source.title}] analyzing visual state")
         workspace.start_stage(source.id, ProcessingStage.VISUALS, visual_key)
         try:
-            visuals, warnings = analyze_visuals(materialized, settings)
+            with tool_run_scope(
+                workspace,
+                source_id=source.id,
+                stage=ProcessingStage.VISUALS.value,
+                cache_key=visual_key,
+                input_digests={"materialized": digest_value(materialized.content_hash)},
+            ):
+                visuals, warnings = analyze_visuals(materialized, settings)
             retention = settings._analysis_visual_retention_report
             if isinstance(retention, VisualRetentionReport):
                 if (
@@ -612,7 +657,17 @@ def extract_sources(
     """Extract all sources while reusing one browser-cookie snapshot."""
 
     root = workspace_path or default_workspace_path(inputs, settings)
-    with browser_cookie_session(settings, inputs) as authenticated:
+    workspace = Workspace.create(root=root, inputs=inputs, settings=settings)
+    input_set_id = opaque_input_set_id(inputs)
+    with (
+        tool_run_scope(
+            workspace,
+            source_id=input_set_id,
+            stage=ProcessingStage.INSPECT.value,
+            input_digests={"input-set": digest_value({"id": input_set_id})},
+        ),
+        browser_cookie_session(settings, inputs) as authenticated,
+    ):
         return _extract_sources_authenticated(
             inputs,
             authenticated,

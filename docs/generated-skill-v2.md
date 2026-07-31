@@ -180,21 +180,22 @@ Never retain cookies, authorization headers, temporary tokens, private absolute 
 
 ### Sanitized tool records
 
-Save reproducibility metadata for deterministic media operations:
+Save reproducibility metadata for deterministic media operations in the raw workspace, not the generated Skill:
 
 ```json
 {
   "tool": "ffmpeg",
-  "version": "7.1",
-  "operation": "extract-dense-window",
+  "tool_version": "7.1",
+  "operation": "extract-investigation-window",
   "source_id": "youtube-ZIaOBAjvc38",
-  "input_sha256": "…",
-  "arguments": ["-ss", "762", "-to", "810", "-vf", "fps=2"],
-  "outputs": ["sources/youtube-ZIaOBAjvc38/investigation-frames/…"]
+  "input_sha256": {"media": "…"},
+  "arguments": {"argv": ["ffmpeg", "-ss", "762", "-to", "810", "-vf", "fps=2"]},
+  "outputs": [{"path": "sources/youtube-ZIaOBAjvc38/investigation-frames/…", "sha256": "…"}],
+  "execution": {"status": "complete", "attempt_count": 1, "cache_hit_count": 0}
 }
 ```
 
-Records use workspace-relative paths and sanitized arguments. They never include credentials or expiring source URLs.
+SQLite is authoritative. The engine captures subprocesses at the shared runner boundary and uses the same operation recorder for ASR, OCR, vision, and deterministic image work. Stable logical IDs group immutable generation-numbered attempts, concurrent writers use WAL transactions, late completions cannot replace newer state, and cache reuse increments a counter. Typed ASR, OCR, and vision outputs reference workspace records with semantic digests that the export verifies against SQLite. `tool-runs WORKSPACE` creates deterministic ID-ordered JSONL under `logs/` in the raw workspace and accepts an existing target only when its bytes are identical. Records use workspace-relative paths and sanitized arguments; they never include raw stdout or stderr, arbitrary environment variables, credentials, expiring source URLs, or private absolute paths, and they are never copied into the portable Skill.
 
 ### Evidence retention levels
 

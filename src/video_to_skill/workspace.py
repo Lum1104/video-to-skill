@@ -37,6 +37,17 @@ from video_to_skill.models import (
     VisualRetentionReport,
     WarningRecord,
 )
+from video_to_skill.tool_runs import (
+    MAX_ARGUMENT_BYTES,
+    MAX_EXPORTED_RECORD_BYTES,
+    MAX_OUTPUT_BYTES,
+    TOOL_RUN_SCHEMA,
+    ToolRunFinish,
+    ToolRunStart,
+    bounded_json_text,
+    digest_value,
+    sanitize_value,
+)
 from video_to_skill.utils import atomic_write_json, is_within, stable_hash
 from video_to_skill.work import (
     AnalysisRun,
@@ -47,7 +58,7 @@ from video_to_skill.work import (
     WorkState,
 )
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 10
 
 _EDITION_ID_RE = re.compile(r"^edition-[a-f0-9]{20}$")
 
@@ -699,6 +710,7 @@ class Workspace:
             connection.executescript(_AGENT_EVIDENCE_SCHEMA)
             connection.executescript(_INSPECTION_SCHEMA)
             connection.executescript(_ORCHESTRATION_SCHEMA)
+            connection.executescript(TOOL_RUN_SCHEMA)
             if existing_version is None:
                 connection.execute(
                     "INSERT INTO metadata(key, value) VALUES('schema_version', ?)",
@@ -733,6 +745,82 @@ class Workspace:
         }
         if column not in columns:
             connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+
+    @staticmethod
+    def _upgrade_tool_run_attempts(connection: sqlite3.Connection) -> None:
+        """Split the provisional mutable execution row into immutable attempts."""
+
+        table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='tool_runs'"
+        ).fetchone()
+        if table is None:
+            connection.executescript(TOOL_RUN_SCHEMA)
+            return
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(tool_runs)").fetchall()
+        }
+        if "status" not in columns:
+            connection.executescript(TOOL_RUN_SCHEMA)
+            return
+        legacy_rows = connection.execute("SELECT * FROM tool_runs ORDER BY id").fetchall()
+        connection.execute("DROP TABLE IF EXISTS tool_run_attempts")
+        connection.execute("DROP INDEX IF EXISTS tool_run_source_stage")
+        connection.execute("DROP INDEX IF EXISTS tool_run_status")
+        connection.execute("ALTER TABLE tool_runs RENAME TO tool_runs_v9")
+        connection.executescript(TOOL_RUN_SCHEMA)
+        for row in legacy_rows:
+            created_at = str(row["first_started_at"])
+            updated_at = str(row["updated_at"])
+            legacy_attempt_count = max(1, int(row["attempt_count"]))
+            connection.execute(
+                """
+                INSERT INTO tool_runs(
+                    id, identity_digest, tool, tool_version, operation, source_id,
+                    stage, input_digests_json, arguments_json, cache_key,
+                    attempt_count, cache_hit_count, created_at, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["id"],
+                    row["identity_digest"],
+                    row["tool"],
+                    row["tool_version"],
+                    row["operation"],
+                    row["source_id"],
+                    row["stage"],
+                    row["input_digests_json"],
+                    row["arguments_json"],
+                    row["cache_key"],
+                    legacy_attempt_count,
+                    row["cache_hit_count"],
+                    created_at,
+                    updated_at,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO tool_run_attempts(
+                    id, tool_run_id, generation, status, outputs_json,
+                    return_code, error_kind, started_at, completed_at,
+                    duration_ms, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    f"{row['id']}-attempt-{legacy_attempt_count:06d}",
+                    row["id"],
+                    legacy_attempt_count,
+                    row["status"],
+                    row["outputs_json"],
+                    row["return_code"],
+                    row["error_kind"],
+                    row["last_started_at"],
+                    row["completed_at"],
+                    row["duration_ms"],
+                    updated_at,
+                ),
+            )
+        connection.execute("DROP TABLE tool_runs_v9")
 
     def _upgrade_schema(self, connection: sqlite3.Connection, version: int) -> None:
         if version < 2:
@@ -833,6 +921,10 @@ class Workspace:
                 )
                 """
             )
+        if version < 9:
+            connection.executescript(TOOL_RUN_SCHEMA)
+        if version < 10:
+            self._upgrade_tool_run_attempts(connection)
         connection.execute(
             "UPDATE metadata SET value=? WHERE key='schema_version'",
             (str(SCHEMA_VERSION),),
@@ -1953,6 +2045,447 @@ class Workspace:
                     (source_id,),
                 ).fetchone(),
             )
+
+    def start_tool_run(self, start: ToolRunStart) -> str:
+        """Atomically allocate one immutable attempt for a stable logical run."""
+
+        self._require_shared_evidence_view("tool-run start")
+        now = start.started_at.isoformat()
+        arguments_json = bounded_json_text(
+            start.arguments,
+            max_bytes=MAX_ARGUMENT_BYTES,
+            label="tool-run arguments",
+        )
+        inputs_json = bounded_json_text(
+            start.input_digests,
+            max_bytes=MAX_ARGUMENT_BYTES,
+            label="tool-run inputs",
+        )
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO tool_runs(
+                    id, identity_digest, tool, tool_version, operation, source_id,
+                    stage, input_digests_json, arguments_json, cache_key,
+                    attempt_count, cache_hit_count, created_at, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)
+                ON CONFLICT(id) DO NOTHING
+                """,
+                (
+                    start.id,
+                    start.identity_digest,
+                    start.tool,
+                    start.tool_version,
+                    start.operation,
+                    start.source_id,
+                    start.stage,
+                    inputs_json,
+                    arguments_json,
+                    start.cache_key,
+                    now,
+                    now,
+                ),
+            )
+            row = connection.execute(
+                "SELECT identity_digest FROM tool_runs WHERE id=?",
+                (start.id,),
+            ).fetchone()
+            if row is None or str(row["identity_digest"]) != start.identity_digest:
+                raise ProcessingError("Tool-run identity collision detected")
+            generation_row = connection.execute(
+                """
+                UPDATE tool_runs
+                SET attempt_count=attempt_count + 1, updated_at=?
+                WHERE id=?
+                RETURNING attempt_count
+                """,
+                (now, start.id),
+            ).fetchone()
+            if generation_row is None:
+                raise ProcessingError(f"Unknown logical tool run: {start.id}")
+            generation = int(generation_row["attempt_count"])
+            attempt_id = f"{start.id}-attempt-{generation:06d}"
+            connection.execute(
+                """
+                INSERT INTO tool_run_attempts(
+                    id, tool_run_id, generation, status, outputs_json,
+                    started_at, updated_at
+                ) VALUES(?, ?, ?, 'running', '[]', ?, ?)
+                """,
+                (attempt_id, start.id, generation, now, now),
+            )
+        return attempt_id
+
+    def finish_tool_run(self, finish: ToolRunFinish) -> None:
+        """Finish a tool execution without retaining raw stdout, stderr, or errors."""
+
+        self._require_shared_evidence_view("tool-run completion")
+        sanitized_outputs = sanitize_value(finish.outputs, workspace_root=self.root)
+        if not isinstance(sanitized_outputs, list):
+            raise ProcessingError("Tool-run outputs must be a list")
+        outputs_json = bounded_json_text(
+            sanitized_outputs,
+            max_bytes=MAX_OUTPUT_BYTES,
+            label="tool-run outputs",
+        )
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE tool_run_attempts SET
+                    outputs_json=?, status=?, return_code=?, error_kind=?,
+                    completed_at=?, duration_ms=?, updated_at=?
+                WHERE id=? AND status='running'
+                """,
+                (
+                    outputs_json,
+                    finish.status,
+                    finish.return_code,
+                    finish.error_kind,
+                    finish.completed_at.isoformat(),
+                    finish.duration_ms,
+                    finish.completed_at.isoformat(),
+                    finish.attempt_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ProcessingError(
+                    f"Unknown or already completed tool-run attempt: {finish.attempt_id}"
+                )
+
+    def record_tool_cache_hit(
+        self,
+        source_id: str,
+        stage: ProcessingStage,
+        cache_key: str,
+    ) -> int:
+        """Associate a resumed stage with its prior completed tool executions."""
+
+        self._require_shared_evidence_view("tool-run cache hit")
+        now = datetime.now(UTC).isoformat()
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE tool_runs
+                SET cache_hit_count=cache_hit_count + 1, updated_at=?
+                WHERE source_id=? AND stage=? AND cache_key=?
+                  AND EXISTS (
+                      SELECT 1 FROM tool_run_attempts attempts
+                      WHERE attempts.tool_run_id=tool_runs.id
+                        AND attempts.status='complete'
+                  )
+                """,
+                (now, source_id, stage.value, cache_key),
+            )
+        return cursor.rowcount
+
+    @staticmethod
+    def _load_bounded_tool_json(
+        payload: object,
+        *,
+        max_bytes: int,
+        label: str,
+    ) -> object:
+        text = str(payload)
+        if len(text.encode("utf-8")) > max_bytes:
+            raise ProcessingError(f"{label} exceeds its storage limit")
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ProcessingError(f"{label} is not valid JSON") from exc
+
+    def _verify_logical_tool_output(
+        self,
+        output: dict[str, object],
+    ) -> str:
+        """Verify a typed semantic digest against its authoritative SQLite record."""
+
+        record_type = output.get("record_type")
+        record_id = output.get("record_id")
+        expected = output.get("semantic_sha256")
+        if not all(isinstance(value, str) for value in (record_type, record_id, expected)):
+            return "mismatch"
+        assert isinstance(record_type, str)
+        assert isinstance(record_id, str)
+        assert isinstance(expected, str)
+        if record_type == "transcript-segments":
+            with self.connect() as connection:
+                source = connection.execute(
+                    "SELECT 1 FROM sources WHERE id=?",
+                    (record_id,),
+                ).fetchone()
+            if source is None:
+                return "missing"
+            actual = digest_value(
+                [
+                    segment.model_dump(mode="json")
+                    for segment in self.transcripts(record_id, limit=1_000_000)
+                ]
+            )
+            return "verified" if actual == expected else "mismatch"
+        if record_type in {"visual-event-ocr", "visual-event-analysis"}:
+            with self.connect() as connection:
+                row = connection.execute(
+                    "SELECT data_json FROM visual_events WHERE id=?",
+                    (record_id,),
+                ).fetchone()
+            if row is None:
+                return "missing"
+            try:
+                event = VisualEvent.model_validate_json(str(row["data_json"]))
+            except ValueError:
+                return "mismatch"
+            if record_type == "visual-event-ocr":
+                value = {
+                    "event_id": event.id,
+                    "ocr_text": event.ocr_text,
+                    "ocr_confidence": event.ocr_confidence,
+                }
+            else:
+                value = {
+                    "event_id": event.id,
+                    "kind": event.kind.value,
+                    "description": event.description,
+                    "confidence": event.confidence,
+                }
+            return "verified" if digest_value(value) == expected else "mismatch"
+        return "mismatch"
+
+    def _prepare_tool_outputs(self, payload: object) -> list[dict[str, object]]:
+        parsed = self._load_bounded_tool_json(
+            payload,
+            max_bytes=MAX_OUTPUT_BYTES,
+            label="Tool-run outputs",
+        )
+        sanitized = sanitize_value(parsed, workspace_root=self.root)
+        if not isinstance(sanitized, list):
+            raise ProcessingError("Tool-run outputs must be a list")
+        outputs: list[dict[str, object]] = []
+        for item in sanitized:
+            if not isinstance(item, dict):
+                raise ProcessingError("Tool-run output entries must be objects")
+            prepared = cast(dict[str, object], item)
+            if prepared.get("kind") == "logical-record":
+                prepared = {
+                    **prepared,
+                    "verification": self._verify_logical_tool_output(prepared),
+                }
+            outputs.append(prepared)
+        bounded_json_text(
+            outputs,
+            max_bytes=MAX_OUTPUT_BYTES,
+            label="tool-run outputs",
+        )
+        return outputs
+
+    def tool_run_records(self) -> list[dict[str, object]]:
+        """Return canonical sanitized records in stable identity order."""
+
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM tool_runs
+                ORDER BY id
+                """
+            ).fetchall()
+            attempt_rows = connection.execute(
+                """
+                SELECT * FROM tool_run_attempts
+                ORDER BY tool_run_id, generation
+                """
+            ).fetchall()
+        attempts_by_run: dict[str, list[sqlite3.Row]] = {}
+        for attempt_row in attempt_rows:
+            attempts_by_run.setdefault(str(attempt_row["tool_run_id"]), []).append(attempt_row)
+        records: list[dict[str, object]] = []
+        for row in rows:
+            input_digests = self._load_bounded_tool_json(
+                row["input_digests_json"],
+                max_bytes=MAX_ARGUMENT_BYTES,
+                label="Tool-run inputs",
+            )
+            arguments = self._load_bounded_tool_json(
+                row["arguments_json"],
+                max_bytes=MAX_ARGUMENT_BYTES,
+                label="Tool-run arguments",
+            )
+            attempts: list[dict[str, object]] = []
+            for attempt_row in attempts_by_run.get(str(row["id"]), []):
+                attempts.append(
+                    {
+                        "id": str(attempt_row["id"]),
+                        "generation": int(attempt_row["generation"]),
+                        "status": str(attempt_row["status"]),
+                        "outputs": self._prepare_tool_outputs(attempt_row["outputs_json"]),
+                        "return_code": cast(int | None, attempt_row["return_code"]),
+                        "error_kind": cast(str | None, attempt_row["error_kind"]),
+                        "started_at": str(attempt_row["started_at"]),
+                        "completed_at": cast(str | None, attempt_row["completed_at"]),
+                        "duration_ms": cast(int | None, attempt_row["duration_ms"]),
+                    }
+                )
+            if not attempts:
+                raise ProcessingError(f"Tool run has no execution attempts: {row['id']}")
+            latest = attempts[-1]
+            record: dict[str, object] = {
+                "schema_version": 1,
+                "id": str(row["id"]),
+                "tool": str(row["tool"]),
+                "tool_version": cast(str | None, row["tool_version"]),
+                "operation": str(row["operation"]),
+                "source_id": cast(str | None, row["source_id"]),
+                "stage": cast(str | None, row["stage"]),
+                "input_sha256": input_digests,
+                "arguments": arguments,
+                "outputs": latest["outputs"],
+                "cache_key": cast(str | None, row["cache_key"]),
+                "attempts": attempts,
+                "execution": {
+                    "status": latest["status"],
+                    "return_code": latest["return_code"],
+                    "error_kind": latest["error_kind"],
+                    "attempt_count": int(row["attempt_count"]),
+                    "cache_hit_count": int(row["cache_hit_count"]),
+                    "first_started_at": str(row["created_at"]),
+                    "last_started_at": latest["started_at"],
+                    "completed_at": latest["completed_at"],
+                    "duration_ms": latest["duration_ms"],
+                },
+            }
+            sanitized = sanitize_value(record, workspace_root=self.root)
+            if not isinstance(sanitized, dict):
+                raise ProcessingError("Tool-run sanitizer returned an invalid record")
+            prepared_record = cast(dict[str, object], sanitized)
+            bounded_json_text(
+                prepared_record,
+                max_bytes=MAX_EXPORTED_RECORD_BYTES,
+                label="tool-run export record",
+            )
+            records.append(prepared_record)
+        return records
+
+    def export_tool_runs(self, output: Path | None = None) -> dict[str, object]:
+        """Write canonical JSONL inside the private raw workspace."""
+
+        destination = output or self.root / "logs" / "tool-runs.jsonl"
+        lexical_destination = Path(os.path.abspath(destination.expanduser()))
+        lexical_root = Path(os.path.abspath(self.root))
+        try:
+            relative = lexical_destination.relative_to(lexical_root)
+        except ValueError as exc:
+            raise ProcessingError("Tool-run exports must remain inside the raw workspace") from exc
+        if (
+            not relative.parts
+            or relative.parts[0] != "logs"
+            or relative.suffix != ".jsonl"
+            or any(part in {"", ".", ".."} for part in relative.parts)
+        ):
+            raise ProcessingError("Tool-run export path is invalid")
+        records = self.tool_run_records()
+        payload = b"".join(
+            (
+                json.dumps(
+                    record,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("utf-8")
+            for record in records
+        )
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        descriptors: list[int] = []
+        temporary_name = f".{relative.name}.{secrets.token_hex(12)}.tmp"
+
+        def read_existing(directory_fd: int) -> bytes:
+            flags = os.O_RDONLY | nofollow
+            descriptor = os.open(relative.name, flags, dir_fd=directory_fd)
+            try:
+                metadata = os.fstat(descriptor)
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise ProcessingError("Tool-run export target is not a regular file")
+                if metadata.st_size != len(payload):
+                    raise ProcessingError(
+                        "Tool-run export target already exists with different content"
+                    )
+                with os.fdopen(descriptor, "rb", closefd=False) as handle:
+                    existing_payload = handle.read(len(payload) + 1)
+            finally:
+                os.close(descriptor)
+            if existing_payload != payload:
+                raise ProcessingError(
+                    "Tool-run export target already exists with different content"
+                )
+            return existing_payload
+
+        try:
+            current_fd = os.open(self.root, directory_flags | nofollow)
+            descriptors.append(current_fd)
+            for part in relative.parts[:-1]:
+                with suppress(FileExistsError):
+                    os.mkdir(part, mode=0o700, dir_fd=current_fd)
+                current_fd = os.open(part, directory_flags | nofollow, dir_fd=current_fd)
+                descriptors.append(current_fd)
+            try:
+                existing = os.stat(relative.name, dir_fd=current_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                existing = None
+            if existing is not None and not stat.S_ISREG(existing.st_mode):
+                raise ProcessingError("Tool-run export target is not a regular file")
+            if existing is not None:
+                read_existing(current_fd)
+                os.fsync(current_fd)
+                existing = None
+                return self._tool_run_export_report(records, payload, relative)
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow
+            output_fd = os.open(temporary_name, flags, 0o600, dir_fd=current_fd)
+            try:
+                with os.fdopen(output_fd, "wb", closefd=False) as handle:
+                    handle.write(payload)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            finally:
+                os.close(output_fd)
+            try:
+                os.link(
+                    temporary_name,
+                    relative.name,
+                    src_dir_fd=current_fd,
+                    dst_dir_fd=current_fd,
+                    follow_symlinks=False,
+                )
+            except FileExistsError:
+                read_existing(current_fd)
+            os.fsync(current_fd)
+        except OSError as exc:
+            raise ProcessingError(f"Tool-run export path is unsafe: {relative}") from exc
+        finally:
+            if descriptors:
+                with suppress(FileNotFoundError):
+                    os.unlink(temporary_name, dir_fd=descriptors[-1])
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
+        return self._tool_run_export_report(records, payload, relative)
+
+    @staticmethod
+    def _tool_run_export_report(
+        records: list[dict[str, object]],
+        payload: bytes,
+        relative: Path,
+    ) -> dict[str, object]:
+        statuses: dict[str, int] = {}
+        for record in records:
+            execution = cast(dict[str, object], record["execution"])
+            status = str(execution["status"])
+            statuses[status] = statuses.get(status, 0) + 1
+        return {
+            "schema_version": 1,
+            "path": relative.as_posix(),
+            "sha256": sha256(payload).hexdigest(),
+            "records": len(records),
+            "statuses": dict(sorted(statuses.items())),
+        }
 
     def stage_complete(self, source_id: str, stage: ProcessingStage, cache_key: str) -> bool:
         with self.connect() as connection:

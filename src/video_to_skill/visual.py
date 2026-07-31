@@ -27,6 +27,7 @@ from video_to_skill.models import (
     VisualRetentionInterval,
     VisualRetentionReport,
 )
+from video_to_skill.tool_runs import digest_value, python_package_version, tracked_operation
 from video_to_skill.utils import run_command, stable_hash
 
 MAX_EXTRACTED_FRAME_WIDTH = 3_840
@@ -81,6 +82,7 @@ def has_video_stream(media_path: Path, settings: Settings) -> bool:
         ],
         timeout=settings.command_timeout_seconds,
         check=False,
+        provenance_operation="probe-video-stream",
     )
     return result.returncode == 0 and "video" in result.stdout
 
@@ -196,6 +198,7 @@ def extract_candidate_frames(
             str(scene_pattern),
         ],
         timeout=settings.command_timeout_seconds,
+        provenance_operation="extract-scene-frames",
     )
     scene_times = _parse_scene_metadata(scene_result.stderr)
     scene_paths = sorted(destination.glob("scene-*.jpg"))
@@ -239,6 +242,7 @@ def extract_candidate_frames(
             str(periodic_pattern),
         ],
         timeout=settings.command_timeout_seconds,
+        provenance_operation="extract-periodic-frames",
     )
     for index, path in enumerate(sorted(destination.glob("periodic-*.jpg"))):
         timestamp = float(index * settings.periodic_frame_interval)
@@ -669,7 +673,25 @@ def analyze_visuals(
     for event in events:
         if use_ocr:
             try:
-                event.ocr_text, event.ocr_confidence = ocr_backend.recognize(event.path)
+                with tracked_operation(
+                    tool=ocr_backend.name,
+                    version=python_package_version(ocr_backend.name),
+                    operation="recognize-frame",
+                    arguments={"provider": ocr_backend.name},
+                    input_paths=[event.path],
+                ) as tool_run:
+                    event.ocr_text, event.ocr_confidence = ocr_backend.recognize(event.path)
+                    tool_run.add_logical_output(
+                        "visual-event-ocr",
+                        event.id,
+                        digest_value(
+                            {
+                                "event_id": event.id,
+                                "ocr_text": event.ocr_text,
+                                "ocr_confidence": event.ocr_confidence,
+                            }
+                        ),
+                    )
             except Exception as exc:
                 warnings.append(f"ocr-failed:{type(exc).__name__}")
         classify_from_ocr(event)
@@ -693,7 +715,30 @@ def analyze_visuals(
                 VisualKind.PHYSICAL,
             }:
                 try:
-                    vision_backend.analyze(event, settings)
+                    with tracked_operation(
+                        tool=vision_backend.name,
+                        version=python_package_version("httpx"),
+                        operation="analyze-frame",
+                        arguments={
+                            "provider": configured,
+                            "model": settings.vision_model,
+                            "endpoint": settings.vision_base_url,
+                        },
+                        input_paths=[event.path],
+                    ) as tool_run:
+                        vision_backend.analyze(event, settings)
+                        tool_run.add_logical_output(
+                            "visual-event-analysis",
+                            event.id,
+                            digest_value(
+                                {
+                                    "event_id": event.id,
+                                    "kind": event.kind.value,
+                                    "description": event.description,
+                                    "confidence": event.confidence,
+                                }
+                            ),
+                        )
                 except Exception as exc:
                     warnings.append(f"vision-failed:{type(exc).__name__}")
     return events, sorted(set(warnings))

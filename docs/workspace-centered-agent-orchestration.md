@@ -100,9 +100,12 @@ work_item_dependencies
 work_results
 canonical_records
 canonical_heads
+tool_runs
 ```
 
 This deliberately replaces the earlier proposal for many phase-specific tables. Semantic and design payloads are immutable files indexed by generic canonical records; execution state remains small.
+
+`tool_runs` is a separate engine-owned observability surface, not an agent result channel. Shared subprocess instrumentation and explicit non-subprocess provider wrappers persist one sanitized logical identity with immutable generation-numbered attempts, retained failures, cache reuse, status, timing, tool version, normalized arguments, input SHA-256 values, workspace-relative file digests, and verifiable typed semantic outputs. The main agent never transports these records; `tool-runs WORKSPACE` deterministically creates a no-clobber export under `logs/` in the private raw workspace when needed.
 
 Each canonical revision records:
 
