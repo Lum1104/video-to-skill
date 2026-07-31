@@ -84,12 +84,14 @@ def _settings(
     config: Path | None,
     *,
     language: str | None = None,
+    output_language: str | None = None,
     visual_profile: str | None = None,
     max_workers: int | None = None,
 ) -> Settings:
     return load_settings(
         config,
         language=language,
+        output_language=output_language,
         visual_profile=visual_profile,
         max_workers=max_workers,
     )
@@ -213,7 +215,13 @@ def doctor(
 def inspect_command(
     sources: Annotated[list[str], typer.Argument(help="URLs or local media paths.")],
     config: Annotated[Path | None, typer.Option("--config")] = None,
-    language: Annotated[str | None, typer.Option("--language")] = None,
+    language: Annotated[
+        str | None,
+        typer.Option(
+            "--language",
+            help="Preferred source caption/ASR language; does not set artifact language.",
+        ),
+    ] = None,
     as_json: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
     """Resolve inputs and report course structure without downloading media."""
@@ -290,7 +298,20 @@ def extract(
         Path | None, typer.Option("--workspace", help="Evidence workspace path.")
     ] = None,
     config: Annotated[Path | None, typer.Option("--config")] = None,
-    language: Annotated[str | None, typer.Option("--language")] = None,
+    language: Annotated[
+        str | None,
+        typer.Option(
+            "--language",
+            help="Preferred source caption/ASR language; does not set artifact language.",
+        ),
+    ] = None,
+    output_language: Annotated[
+        str | None,
+        typer.Option(
+            "--output-language",
+            help="Canonical generated-artifact language, or 'source' (default).",
+        ),
+    ] = None,
     visual_profile: Annotated[
         str | None,
         typer.Option("--visual-profile", help="adaptive, always, or transcript"),
@@ -305,6 +326,7 @@ def extract(
         settings = _settings(
             config,
             language=language,
+            output_language=output_language,
             visual_profile=visual_profile,
             max_workers=max_workers,
         )
@@ -665,7 +687,23 @@ def run_workflow(
         ),
     ] = None,
     config: Annotated[Path | None, typer.Option("--config")] = None,
-    language: Annotated[str | None, typer.Option("--language")] = None,
+    language: Annotated[
+        str | None,
+        typer.Option(
+            "--language",
+            help="Preferred source caption/ASR language; does not set artifact language.",
+        ),
+    ] = None,
+    output_language: Annotated[
+        str | None,
+        typer.Option(
+            "--output-language",
+            help=(
+                "Canonical generated-artifact language, or 'source'; on resume, an explicit "
+                "value must match the persisted contract."
+            ),
+        ),
+    ] = None,
     visual_profile: Annotated[
         str | None,
         typer.Option("--visual-profile", help="adaptive, always, or transcript"),
@@ -683,6 +721,7 @@ def run_workflow(
         settings = _settings(
             config,
             language=language,
+            output_language=output_language,
             visual_profile=visual_profile,
             max_workers=max_workers,
         )
@@ -690,6 +729,7 @@ def run_workflow(
             sources=list(sources or []),
             workspace_path=workspace,
             settings=settings,
+            output_language_override=output_language,
             host=host,
             output=output,
             project=project,

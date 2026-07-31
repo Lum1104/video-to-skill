@@ -11,6 +11,10 @@ from pathlib import Path
 
 from pydantic import ValidationError as PydanticValidationError
 
+from video_to_skill.artifact_language import (
+    canonical_artifact_language_state,
+    ensure_artifact_language_contract,
+)
 from video_to_skill.author import AUTHOR_PERSONA
 from video_to_skill.behavior import (
     BEHAVIOR_CATALOG_VERSION,
@@ -343,6 +347,10 @@ def plan_behavior_trial_tasks(
     if repair_cycle < 0 or repair_cycle > MAX_REPAIR_CYCLES:
         raise ProcessingError("Behavior trial repair cycle is outside the supported range")
     plan = _behavior_evaluation_plan(workspace, author_task=author_task)
+    language_state = canonical_artifact_language_state(
+        workspace,
+        expected_author_task_id=author_task.id,
+    )
     target_path = plan.target.path.relative_to(workspace.root)
     tasks: list[WorkItem] = []
     for scenario in plan.scenarios:
@@ -365,6 +373,8 @@ def plan_behavior_trial_tasks(
                     "target_build_id": plan.target.build_id,
                     "target_content_digest": plan.target.content_digest,
                     "repair_cycle": repair_cycle,
+                    "artifact_language_contract_digest": language_state.contract_digest,
+                    "artifact_language_declaration_digest": language_state.declaration_digest,
                 },
                 persona_hint=BEHAVIOR_TRIAL_PERSONA,
                 packet={
@@ -529,6 +539,10 @@ def plan_review_task(
         behavior_trial_tasks,
         plan=plan,
     )
+    language_state = canonical_artifact_language_state(
+        workspace,
+        expected_author_task_id=author_task.id,
+    )
     packet = {
         "instructions": (
             "Independently audit source-meaning retention and instructional-affordance "
@@ -539,8 +553,16 @@ def plan_review_task(
             "validation or recovery, capstone scoring, progressive hints, retry, and teaching "
             "scaffolds as product losses when the claimed capability requires them. Inspect "
             "every selected teaching visual and audit necessity, legibility, surrounding "
-            "context, privacy, evidence grounding, and whether artifacts load it only on demand."
+            "context, privacy, evidence grounding, and whether artifacts load it only on demand. "
+            f"The canonical artifact language is {language_state.declaration.artifact_language!r}; "
+            "audit all authored prose, titles, welcome text, and metadata for consistency with "
+            "that declaration. Do not infer consistency merely from the declared field. Runtime "
+            "interaction must still follow the learner's language by default."
         ),
+        "artifact_language_contract": language_state.contract.model_dump(mode="json"),
+        "artifact_language_contract_digest": language_state.contract_digest,
+        "artifact_language_declaration": language_state.declaration.model_dump(mode="json"),
+        "artifact_language_declaration_digest": language_state.declaration_digest,
         "reviewed_snapshot_digest": plan.reviewed_snapshot_digest,
         "canonical": plan.canonical_packet,
         "behavior_catalog": {
@@ -581,6 +603,8 @@ def plan_review_task(
             "target_build_id": plan.target.build_id,
             "target_content_digest": plan.target.content_digest,
             "repair_cycle": repair_cycle,
+            "artifact_language_contract_digest": language_state.contract_digest,
+            "artifact_language_declaration_digest": language_state.declaration_digest,
         },
         persona_hint=REVIEW_PERSONA,
         packet=packet,
@@ -643,6 +667,10 @@ def submit_review_result(
         workspace,
         author_task=author_task,
     )
+    language_state = canonical_artifact_language_state(
+        workspace,
+        expected_author_task_id=author_task.id,
+    )
     if (
         result.reviewed_snapshot_digest != plan.reviewed_snapshot_digest
         or result.reviewed_snapshot_digest != task.scope.get("reviewed_snapshot_digest")
@@ -654,10 +682,23 @@ def submit_review_result(
         or result.target_build_id != task.scope.get("target_build_id")
         or result.target_content_digest != plan.target.content_digest
         or result.target_content_digest != task.scope.get("target_content_digest")
+        or task.scope.get("artifact_language_contract_digest") != language_state.contract_digest
+        or task.scope.get("artifact_language_declaration_digest")
+        != language_state.declaration_digest
     ):
         raise ProcessingError("Review result targets a stale behavior catalog or Skill snapshot")
     packet = _verified_task_packet(workspace, task)
     payload = packet.get("payload")
+    if (
+        not isinstance(payload, dict)
+        or payload.get("artifact_language_contract")
+        != language_state.contract.model_dump(mode="json")
+        or payload.get("artifact_language_contract_digest") != language_state.contract_digest
+        or payload.get("artifact_language_declaration")
+        != language_state.declaration.model_dump(mode="json")
+        or payload.get("artifact_language_declaration_digest") != language_state.declaration_digest
+    ):
+        raise ProcessingError("Review packet has stale artifact-language state")
     trial_entries = payload.get("behavior_trials") if isinstance(payload, dict) else None
     if not isinstance(trial_entries, list):
         raise ProcessingError("Review packet has no behavior trial evidence")
@@ -848,6 +889,21 @@ def plan_author_repair_task(
                 "digest": selection_record.digest,
             },
         }
+    ensure_artifact_language_contract(workspace)
+    language_state = canonical_artifact_language_state(
+        workspace,
+        expected_author_task_id=prior_author_task.id,
+    )
+    language_scope = {
+        "artifact_language_contract_digest": language_state.contract_digest,
+        "artifact_language_declaration_digest": language_state.declaration_digest,
+    }
+    language_packet: dict[str, object] = {
+        "contract": language_state.contract.model_dump(mode="json"),
+        "contract_digest": language_state.contract_digest,
+        "declaration": language_state.declaration.model_dump(mode="json"),
+        "declaration_digest": language_state.declaration_digest,
+    }
     packet = {
         "instructions": (
             "Repair every blocking critic finding against the current canonical state. "
@@ -856,7 +912,9 @@ def plan_author_repair_task(
             "material and do not weaken capability claims merely to hide missing affordances. "
             "Reuse only verified visual asset candidates, keep indispensable images linked "
             "on demand, and remove decorative, illegible, private, or misleading selections. "
-            "Preserve the pinned selected curriculum and do not reopen its user decision."
+            "Preserve the pinned selected curriculum and do not reopen its user decision. "
+            "Preserve the canonical artifact language exactly; do not translate or relabel the "
+            "repair into another language."
         ),
         "prior_author_result": str(prior_author_task.result_path),
         "critic_report": {"path": str(review_record.path), "digest": review_record.digest},
@@ -876,6 +934,7 @@ def plan_author_repair_task(
         "repair_cycle": repair_cycle,
         "visual_asset_candidates": visual_asset_candidate_packet(workspace),
         "canonical_curriculum": curriculum_packet,
+        "artifact_language": language_packet,
     }
     return workspace.ensure_work_item(
         run_id=run.id,
@@ -886,6 +945,7 @@ def plan_author_repair_task(
             "repair_of": prior_author_task.id,
             "review_task_id": failed_review_task.id,
             **curriculum_scope,
+            **language_scope,
         },
         persona_hint=AUTHOR_PERSONA,
         packet=packet,

@@ -8,6 +8,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from video_to_skill.config import normalize_concrete_language
 from video_to_skill.generation import (
     CapabilityLevel,
     CapabilityProfile,
@@ -211,7 +212,13 @@ class CurriculumPlanResult(OrchestrationModel):
     lease_token: str = Field(min_length=20)
     snapshot_digest: str
     producer: ObservationProducer
+    artifact_language: str = Field(min_length=2, max_length=80)
     curriculum: CurriculumPlan
+
+    @field_validator("artifact_language")
+    @classmethod
+    def concrete_artifact_language(cls, value: str) -> str:
+        return normalize_concrete_language(value)
 
 
 class CurriculumSelection(OrchestrationModel):
@@ -464,10 +471,15 @@ class AuthorResult(OrchestrationModel):
     curriculum_decision_required: bool = False
     curriculum_decision_summary: str | None = Field(default=None, max_length=1200)
 
-    @field_validator("title", "description", "scope", "artifact_language")
+    @field_validator("title", "description", "scope")
     @classmethod
     def compact_text(cls, value: str) -> str:
         return " ".join(value.split())
+
+    @field_validator("artifact_language")
+    @classmethod
+    def concrete_artifact_language(cls, value: str) -> str:
+        return normalize_concrete_language(value)
 
     @model_validator(mode="after")
     def coherent_authoring(self) -> AuthorResult:

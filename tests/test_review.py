@@ -466,3 +466,11 @@ def test_failed_review_creates_new_author_revision_task(tmp_path: Path) -> None:
     assert (
         repair.scope["curriculum_selection_digest"] == author.scope["curriculum_selection_digest"]
     )
+    assert (
+        repair.scope["artifact_language_contract_digest"]
+        == author.scope["artifact_language_contract_digest"]
+    )
+    assert (
+        repair.scope["artifact_language_declaration_digest"]
+        == author.scope["artifact_language_declaration_digest"]
+    )

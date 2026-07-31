@@ -27,6 +27,12 @@ def test_curriculum_plan_automatically_selects_recommended_path(tmp_path: Path) 
     selection_record = workspace.canonical_record("selected-curriculum")
     assert options_record is not None
     assert selection_record is not None
+    language_record = workspace.canonical_record("artifact-language-declaration")
+    assert language_record is not None
+    language = json.loads((workspace.root / language_record.path).read_text(encoding="utf-8"))
+    assert language["artifact_language"] == "English"
+    assert language["resolution"] == "source-unknown"
+    assert language["declaration_state"] == "agent-declared"
     selection = json.loads((workspace.root / selection_record.path).read_text(encoding="utf-8"))
     assert selection == {
         "schema_version": 1,
@@ -73,4 +79,21 @@ def test_curriculum_plan_rejects_unknown_units_and_packet_drift(tmp_path: Path) 
     atomic_write_json(packet_path, packet)
     atomic_write_json(result_path, _curriculum_result(task, lease.token))
     with pytest.raises(ProcessingError, match="packet failed its digest check"):
+        submit_curriculum_plan_result(workspace, task.id, result_path)
+
+
+def test_curriculum_rejects_language_that_conflicts_with_explicit_intent(
+    tmp_path: Path,
+) -> None:
+    workspace, analyze_task = _analyzed_workspace(tmp_path)
+    manifest = workspace.load_manifest()
+    manifest.output_language = "French"
+    workspace.save_manifest(manifest)
+    run = workspace.create_analysis_run(analyze_task.snapshot_digest)
+    task = plan_curriculum_task(workspace, run, analyze_task=analyze_task)
+    lease = workspace.lease_work_item(task.id, owner="codex")
+    result_path = lease.output_directory / "result.json"
+    atomic_write_json(result_path, _curriculum_result(task, lease.token))
+
+    with pytest.raises(ProcessingError, match="conflicts with the fixed"):
         submit_curriculum_plan_result(workspace, task.id, result_path)

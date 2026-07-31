@@ -10,6 +10,30 @@ def test_hosted_vision_is_opt_in() -> None:
     assert Settings().vision_provider == "none"
 
 
+def test_output_language_normalizes_locale_and_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(config_module, "user_config_path", lambda _name: tmp_path / "user")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("VIDEO_TO_SKILL_OUTPUT_LANGUAGE", "ZH_hans_cn")
+
+    assert load_settings().output_language == "zh-Hans-CN"
+    assert Settings(output_language=" SOURCE ").output_language == "source"
+
+
+def test_output_language_rejects_blank_or_control_text() -> None:
+    with pytest.raises(ValueError, match="output_language"):
+        Settings(output_language=" \n ")
+    with pytest.raises(ValueError, match="control"):
+        Settings(output_language="English\nFrench")
+
+
+@pytest.mark.parametrize("sentinel", ["auto", "unknown", "und", "mixed", "mul", "zxx"])
+def test_output_language_rejects_non_concrete_sentinels(sentinel: str) -> None:
+    with pytest.raises(ValueError, match="concrete"):
+        Settings(output_language=sentinel)
+
+
 def test_configuration_precedence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(config_module, "user_config_path", lambda _name: tmp_path / "user")
     project = tmp_path / "project"

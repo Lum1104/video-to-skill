@@ -2,7 +2,9 @@
 # Private, resumable workspaces. Relative paths resolve from the calling directory.
 cache_root = ".video-to-skill/jobs"
 
+# Source caption/ASR preference; this does not control generated artifact prose.
 language = "auto"
+# Canonical artifact language/locale, or "source" for source-following resolution.
 output_language = "source"
 visual_profile = "adaptive" # adaptive | always | transcript
 

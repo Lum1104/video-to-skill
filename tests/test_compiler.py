@@ -6,8 +6,13 @@ from pathlib import Path
 import pytest
 from test_author import _analyzed_workspace, _author_result, _plan_course_author_task
 from test_generation import _blueprint
-from test_review import _complete_behavior_trials, _review_result
+from test_review import _authored_workspace, _complete_behavior_trials, _plan_review, _review_result
 
+from video_to_skill.artifact_language import (
+    artifact_language_contract_path,
+    canonical_artifact_language_state,
+    ensure_artifact_language_contract,
+)
 from video_to_skill.author import submit_author_result
 from video_to_skill.compiler import (
     build_workspace_skill,
@@ -22,13 +27,20 @@ from video_to_skill.models import (
     SemanticSegment,
     SourceDescriptor,
     SourcePlatform,
+    TranscriptOrigin,
+    TranscriptSegment,
 )
 from video_to_skill.orchestration import (
     AFFORDANCE_CATALOG,
     ArtifactDraftSpec,
+    AuthorResult,
     InstructionalAffordance,
 )
-from video_to_skill.review import plan_review_task, submit_review_result
+from video_to_skill.review import (
+    plan_author_repair_task,
+    plan_review_task,
+    submit_review_result,
+)
 from video_to_skill.utils import atomic_write_json, hash_file
 from video_to_skill.work import WorkRole
 from video_to_skill.workspace import Workspace
@@ -190,10 +202,188 @@ def test_compiler_uses_digest_references_in_workspace_receipt(tmp_path: Path) ->
     assert blueprint.name == "transition-course"
     receipt_text = (build_directory / "blueprint.json").read_text(encoding="utf-8")
     assert receipt.build_id in receipt_text
+    assert receipt.artifact_language == "English"
+    assert receipt.requested_output_language == "English"
+    assert receipt.artifact_language_declaration_state == "legacy-agent-declared"
     assert "Observe both the action and its result" not in receipt_text
     assert all(
         reference.draft_path.is_relative_to(Path("analysis")) for reference in receipt.artifacts
     )
+
+
+@pytest.mark.parametrize("source_languages", [["en"], ["en", "zh-Hans"]])
+def test_legacy_compiler_migrates_to_course_derived_explicit_language(
+    tmp_path: Path,
+    source_languages: list[str],
+) -> None:
+    workspace = _compiled_workspace(tmp_path)
+    source = workspace.list_sources()[0]
+    workspace.replace_transcripts(
+        source.id,
+        [
+            TranscriptSegment(
+                id=f"legacy-language-{index}",
+                source_id=source.id,
+                start=index,
+                end=index + 1,
+                text=f"Legacy segment {index}.",
+                language=language,
+                origin=TranscriptOrigin.MANUAL_CAPTION,
+            )
+            for index, language in enumerate(source_languages)
+        ],
+    )
+
+    contract, _digest = ensure_artifact_language_contract(workspace)
+    course_record = workspace.canonical_record("course")
+    assert course_record is not None
+    state = canonical_artifact_language_state(
+        workspace,
+        expected_author_task_id=course_record.producer_task_id,
+    )
+    blueprint, receipt, _build_directory = compile_workspace_blueprint(workspace)
+
+    assert contract.resolution == "explicit"
+    assert contract.fixed_artifact_language == "English"
+    assert state.declaration.declaration_state == "legacy-agent-declared"
+    assert blueprint.artifact_language == "English"
+    assert receipt.artifact_language_resolution == "explicit"
+
+
+def test_legacy_repair_pins_course_derived_explicit_language(tmp_path: Path) -> None:
+    workspace, run, author = _authored_workspace(tmp_path)
+    artifact_language_contract_path(workspace).unlink()
+    language_record = workspace.canonical_record("artifact-language-declaration")
+    assert language_record is not None
+    (workspace.root / language_record.path).unlink()
+    legacy_scope = dict(author.scope)
+    legacy_scope.pop("artifact_language_contract_digest")
+    legacy_scope.pop("artifact_language_declaration_digest")
+    with workspace.connect() as connection:
+        connection.execute(
+            "DELETE FROM canonical_heads WHERE kind=?",
+            ("artifact-language-declaration",),
+        )
+        connection.execute(
+            "DELETE FROM canonical_records WHERE kind=?",
+            ("artifact-language-declaration",),
+        )
+        connection.execute(
+            "UPDATE work_items SET scope_json=? WHERE id=?",
+            (json.dumps(legacy_scope, sort_keys=True), author.id),
+        )
+    author = workspace.get_work_item(author.id)
+    source = workspace.list_sources()[0]
+    workspace.replace_transcripts(
+        source.id,
+        [
+            TranscriptSegment(
+                id="legacy-en",
+                source_id=source.id,
+                start=0,
+                end=1,
+                text="English.",
+                language="en",
+                origin=TranscriptOrigin.MANUAL_CAPTION,
+            ),
+            TranscriptSegment(
+                id="legacy-zh",
+                source_id=source.id,
+                start=1,
+                end=2,
+                text="Chinese.",
+                language="zh-Hans",
+                origin=TranscriptOrigin.MANUAL_CAPTION,
+            ),
+        ],
+    )
+    review = _plan_review(workspace, run, author)
+    review_lease = workspace.lease_work_item(review.id, owner="codex")
+    review_result_path = review_lease.output_directory / "result.json"
+    atomic_write_json(
+        review_result_path,
+        _review_result(workspace, review, review_lease.token, verdict="fail"),
+    )
+    failed_review = submit_review_result(workspace, review.id, review_result_path)
+
+    repair = plan_author_repair_task(
+        workspace,
+        run,
+        failed_review_task=failed_review,
+        prior_author_task=author,
+    )
+    packet = json.loads((workspace.root / repair.packet_path).read_text(encoding="utf-8"))[
+        "payload"
+    ]
+
+    assert packet["artifact_language"]["contract"]["resolution"] == "explicit"
+    assert packet["artifact_language"]["declaration"]["artifact_language"] == "English"
+    assert repair.scope["artifact_language_contract_digest"]
+    assert repair.scope["artifact_language_declaration_digest"]
+
+    repair_lease = workspace.lease_work_item(repair.id, owner="codex")
+    assert author.result_path is not None
+    prior_result = AuthorResult.model_validate_json(
+        (workspace.root / author.result_path).read_text(encoding="utf-8")
+    )
+    repaired_artifacts = []
+    for artifact in prior_result.artifacts:
+        record = workspace.canonical_record("artifact-draft", artifact.id)
+        assert record is not None
+        destination = repair_lease.output_directory / artifact.draft_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes((workspace.root / record.path).read_bytes())
+        repaired_artifacts.append(
+            artifact.model_copy(update={"draft_sha256": hash_file(destination)})
+        )
+    repaired_result = prior_result.model_copy(
+        update={
+            "task_id": repair.id,
+            "lease_token": repair_lease.token,
+            "snapshot_digest": repair.snapshot_digest,
+            "producer": ObservationProducer(
+                name="legacy-repair-worker",
+                run_id="legacy-repair-run",
+            ),
+            "artifacts": repaired_artifacts,
+        }
+    )
+    repaired_result_path = repair_lease.output_directory / "result.json"
+    atomic_write_json(repaired_result_path, repaired_result)
+    repaired = submit_author_result(workspace, repair.id, repaired_result_path)
+
+    language_state = canonical_artifact_language_state(
+        workspace,
+        expected_author_task_id=repaired.id,
+    )
+    assert language_state.declaration_digest == repair.scope["artifact_language_declaration_digest"]
+
+    trials = _complete_behavior_trials(workspace, run, repaired)
+    subsequent_review = plan_review_task(
+        workspace,
+        run,
+        author_task=repaired,
+        behavior_trial_tasks=trials,
+    )
+    subsequent_review_lease = workspace.lease_work_item(
+        subsequent_review.id,
+        owner="codex",
+    )
+    subsequent_result_path = subsequent_review_lease.output_directory / "result.json"
+    atomic_write_json(
+        subsequent_result_path,
+        _review_result(
+            workspace,
+            subsequent_review,
+            subsequent_review_lease.token,
+            verdict="pass",
+        ),
+    )
+    submit_review_result(workspace, subsequent_review.id, subsequent_result_path)
+    blueprint, receipt, _build_directory = compile_workspace_blueprint(workspace)
+
+    assert blueprint.artifact_language == "English"
+    assert receipt.artifact_language_declaration_state == "legacy-agent-declared"
 
 
 def test_workspace_build_renders_validates_and_installs(tmp_path: Path) -> None:
@@ -376,6 +566,10 @@ def test_compiler_binds_selected_visual_to_integrated_candidate(tmp_path: Path) 
     assert selection_record is not None
     assert receipt.curriculum_options_digest == options_record.digest
     assert receipt.selected_curriculum_digest == selection_record.digest
+    assert receipt.requested_output_language == "source"
+    assert receipt.artifact_language == "English"
+    assert receipt.artifact_language_resolution == "source-unknown"
+    assert receipt.artifact_language_declaration_state == "agent-declared"
     options_path = workspace.root / options_record.path
     original_options = options_path.read_bytes()
     options_path.write_bytes(original_options + b"\n")

@@ -22,6 +22,8 @@ Treat supplied URLs or local paths as authorization for reversible local process
 
 Ask only when a material boundary cannot be inferred safely: credentials are needed, local or private media would leave the machine, a billed dependency is required, scope is unexpectedly large, the user must choose between materially different curricula, or an installation name conflicts with different content.
 
+Infer one canonical artifact language for every new build from the user's substantive request and conversation language. Honor an explicit language or locale exactly. For an ordinary personal build, use the user's language; for an explicitly public international release, recommend English unless the user named another audience. Ask only when competing language choices would materially change the intended audience and the intent cannot be inferred. Keep this separate from source caption or ASR selection.
+
 Never ask the user to run internal commands, supervise extraction, select frame parameters, copy task payloads, or invoke a second tutor Skill. Never request an account password.
 
 Resolve the complete expected source set before treating acquisition as complete. Preserve playlist order and explicit complete, partial, failed, skipped, inaccessible, or retired states. Continue through isolated source failures when useful material remains, never silently omit an expected item, and report how missing material limits the generated Skill.
@@ -62,15 +64,19 @@ Choose a durable workspace outside the generated output and installed Skill. Use
 Start a new conversion:
 
 ```bash
-"$V2S_ENGINE" run SOURCES... --workspace WORKSPACE --host codex
-"$V2S_ENGINE" run SOURCES... --workspace WORKSPACE --host claude
+"$V2S_ENGINE" run SOURCES... --workspace WORKSPACE --host codex --output-language LANGUAGE
+"$V2S_ENGINE" run SOURCES... --workspace WORKSPACE --host claude --output-language LANGUAGE
 ```
+
+Always pass the inferred or explicit artifact `LANGUAGE` on a new run. Use `source` only when the user specifically wants artifacts in the source language. `--language` is a separate optional preference for source captions and ASR and never controls generated prose. If `source` evidence is uniformly known, the engine resolves it deterministically; mixed or incomplete source-language evidence requires the bounded curriculum agent to declare one canonical language under the persisted contract.
 
 Add `--project` only when the user requested project-local installation. Add `--output` only when the user supplied a portable output path. Resume without retransmitting sources or configuration:
 
 ```bash
 "$V2S_ENGINE" run --workspace WORKSPACE
 ```
+
+On resume, omit `--output-language` and reuse the persisted value. Never silently change it; an explicit conflicting resume override is rejected.
 
 `run` performs every available deterministic transition and emits one JSON envelope.
 
@@ -100,6 +106,8 @@ After all dispatched workers finish, call `run --workspace WORKSPACE` again. Rep
 ### `complete`
 
 Report the installed Skill name and path, invocation, workspace path and retention, processed and failed source counts, source and semantic coverage, instructional-affordance coverage, critic repair count, build ID, and validation results.
+
+Also report the requested output-language intent, resolved canonical artifact language, resolution state, and whether it was deterministically resolved or agent-declared.
 
 Make partial, inaccessible, skipped, retired, and failed sources visible in the completion summary. Distinguish source-acquisition coverage from semantic coverage and state any capability limits caused by missing evidence.
 
@@ -143,6 +151,8 @@ Every semantic unit needs a stable ID, source and time range, kind, compact summ
 ### Author
 
 Author has two bounded task shapes under the same internal role. First, use a principal curriculum architect to read the canonical semantic records, recommend a thematic path, and propose up to two justified alternate learning experiences. This curriculum-planning task writes only curriculum options, ordered semantic-unit sequences, and concise decision metadata—never artifact plans, claims, assets, or Markdown drafts.
+
+The curriculum packet includes the immutable artifact-language contract. It must echo a fixed explicit or uniform-source language, or make the one constrained declaration required for mixed or unknown source evidence. That declaration is canonical. Full Author and every repair must preserve it exactly; Review audits actual prose for consistency because deterministic code does not pretend to identify the language of arbitrary Markdown reliably.
 
 When the alternatives would materially change the learning experience, stop at the durable `ask-user` action. Otherwise the coordinator canonically selects the recommendation. Only after that selection exists, dispatch the full Agent Skill author with the selected-curriculum path and digest. The full Author must preserve the selected path and planned semantic order while binding them to justified artifacts and writing Markdown drafts inside its task output directory. Do not reopen the curriculum choice during authoring or repair.
 

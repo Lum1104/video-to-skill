@@ -24,6 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from pydantic import ValidationError as PydanticValidationError
 
 from video_to_skill import __version__
+from video_to_skill.config import normalize_concrete_language
 from video_to_skill.errors import ProcessingError
 from video_to_skill.models import JobState, SourceDescriptor
 from video_to_skill.url_security import UrlParameterLimitError, has_sensitive_url_parameters
@@ -725,10 +726,15 @@ class CourseSkillBlueprint(GenerationModel):
             raise ValueError("skill name must use lowercase letters, digits, and hyphens")
         return value
 
-    @field_validator("title", "description", "scope", "artifact_language")
+    @field_validator("title", "description", "scope")
     @classmethod
     def compact_text(cls, value: str) -> str:
         return _compact_required(value)
+
+    @field_validator("artifact_language")
+    @classmethod
+    def concrete_artifact_language(cls, value: str) -> str:
+        return normalize_concrete_language(value)
 
     @field_validator("prerequisites", "limitations")
     @classmethod

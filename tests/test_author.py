@@ -306,6 +306,7 @@ def _curriculum_result(
     lease_token: str,
     *,
     decision_required: bool = False,
+    artifact_language: str = "English",
 ) -> CurriculumPlanResult:
     paths = [
         CurriculumPlanPath(
@@ -331,6 +332,7 @@ def _curriculum_result(
         lease_token=lease_token,
         snapshot_digest=task.snapshot_digest,
         producer=ObservationProducer(name="curriculum-worker", run_id="curriculum-run"),
+        artifact_language=artifact_language,
         curriculum=CurriculumPlan(
             recommended_path_id="thematic",
             rationale="The thematic path connects the principle to a decision loop.",
@@ -393,6 +395,23 @@ def test_author_task_persists_affordance_ledger_and_draft(tmp_path: Path) -> Non
         .read_text(encoding="utf-8")
         .startswith("# Evidence-Updated Conviction")
     )
+
+
+def test_author_cannot_drift_from_curriculum_artifact_language(tmp_path: Path) -> None:
+    workspace, analyze_task = _analyzed_workspace(tmp_path)
+    run = workspace.create_analysis_run(analyze_task.snapshot_digest)
+    task = _plan_course_author_task(workspace, run, analyze_task)
+    lease = workspace.lease_work_item(task.id, owner="codex")
+    draft = lease.output_directory / "course.md"
+    draft.write_text("# Course\n\nGrounded content.\n", encoding="utf-8")
+    result = _author_result(task, lease.token, draft).model_copy(
+        update={"artifact_language": "French"}
+    )
+    result_path = lease.output_directory / "result.json"
+    atomic_write_json(result_path, result)
+
+    with pytest.raises(ProcessingError, match="changed the canonical"):
+        submit_author_result(workspace, task.id, result_path)
 
 
 def test_author_selects_only_materialized_visuals_linked_by_drafts(tmp_path: Path) -> None:

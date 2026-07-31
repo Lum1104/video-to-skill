@@ -788,7 +788,9 @@ Interaction language
 
 Use one canonical artifact language per build. Respond in the user's language unless requested otherwise.
 
-For ordinary generation, infer artifact language from the user. For a public, international release, recommend English unless the user specifies another audience.
+For ordinary generation, the host infers artifact language from the user's substantive request and passes it as the new-run output-language intent. For a public, international release, recommend English unless the user specifies another audience. Source caption/ASR preference is a separate setting and never controls artifact prose.
+
+The intent is either `source` or an explicit language/locale label. An explicit label is fixed. `source` resolves automatically only when every active source has known selected-transcript language and all observations agree on one normalized value. Mixed source evidence requires a declaration chosen from the observed languages; partly or wholly unknown evidence requires one evidence-informed concrete declaration. The curriculum checkpoint makes that declaration once, and full Author, repair, Review, compilation, build receipts, and completion remain bound to it. Code validates the declaration and its digests; Review audits the actual Markdown language.
 
 Do not duplicate every artifact merely to support multilingual interaction. When a separately published localized edition is needed, render it from the same semantic map with stable semantic-unit, claim, artifact, and timestamp IDs.
 

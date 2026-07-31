@@ -204,6 +204,7 @@ class Workspace:
                 inputs=inputs,
                 workspace=workspace.root,
                 configuration_hash=settings.configuration_hash,
+                output_language=settings.output_language,
             )
             workspace.save_manifest(manifest)
         else:

@@ -243,6 +243,25 @@ def test_cli_exposes_workspace_protocol_without_legacy_authoring_commands() -> N
     assert result.stdout.strip()
 
 
+def test_run_and_extract_explain_distinct_source_and_output_languages() -> None:
+    for command in ("run", "extract"):
+        result = runner.invoke(app, [command, "--help"])
+        assert result.exit_code == 0, result.output
+        assert "--output-language" in result.output
+        assert "caption/ASR" in result.output
+        assert "artifact language" in result.output
+
+
+def test_cli_rejects_non_concrete_output_language(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app,
+        ["run", "--workspace", str(tmp_path / "missing"), "--output-language", "und"],
+    )
+
+    assert result.exit_code == 2
+    assert "concrete language or locale" in result.output
+
+
 def test_query_inventory_command(tmp_path: Path) -> None:
     workspace = Workspace.create(
         root=tmp_path / "workspace",

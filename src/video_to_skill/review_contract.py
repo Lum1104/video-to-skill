@@ -6,6 +6,7 @@ import json
 
 from pydantic import ValidationError as PydanticValidationError
 
+from video_to_skill.artifact_language import canonical_artifact_language_state
 from video_to_skill.curriculum import (
     load_canonical_curriculum_checkpoint,
     validate_artifact_bound_curriculum,
@@ -72,6 +73,25 @@ def reconstruct_review_snapshot(
             "digest": record.digest,
             "producer_task_id": record.producer_task_id,
         }
+    language_state = canonical_artifact_language_state(
+        workspace,
+        expected_author_task_id=expected_author_task_id,
+    )
+    records["artifact-language-contract"] = {
+        "path": str(language_state.contract_path or ""),
+        "digest": language_state.contract_digest,
+        "producer_task_id": "",
+    }
+    language_declaration_record = workspace.canonical_record("artifact-language-declaration")
+    records["artifact-language-declaration"] = {
+        "path": str(language_state.declaration_path or ""),
+        "digest": language_state.declaration_digest,
+        "producer_task_id": (
+            language_declaration_record.producer_task_id
+            if language_declaration_record is not None
+            else ""
+        ),
+    }
     checkpoint = load_canonical_curriculum_checkpoint(workspace)
     if checkpoint is not None:
         bound_author = validate_curriculum_checkpoint_author_binding(workspace, checkpoint)

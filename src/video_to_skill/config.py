@@ -9,7 +9,14 @@ from pathlib import Path
 from typing import Any, Literal
 
 from platformdirs import user_cache_path, user_config_path
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    field_validator,
+    model_validator,
+)
 
 from video_to_skill.errors import ConfigurationError
 from video_to_skill.utils import stable_hash
@@ -50,6 +57,21 @@ class Settings(BaseModel):
     max_workers: int = Field(default=2, ge=1, le=8)
     command_timeout_seconds: int = Field(default=2 * 60 * 60, ge=10)
 
+    @field_validator("language")
+    @classmethod
+    def valid_source_language_preference(cls, value: str) -> str:
+        if any(ord(character) < 32 for character in value):
+            raise ValueError("language cannot contain control characters")
+        compact = " ".join(value.split())
+        if not compact:
+            raise ValueError("language must be a non-empty caption/ASR language preference")
+        return compact
+
+    @field_validator("output_language")
+    @classmethod
+    def valid_output_language(cls, value: str) -> str:
+        return normalize_output_language(value)
+
     @model_validator(mode="after")
     def one_cookie_source(self) -> Settings:
         if self.cookies_from_browser and self.cookies_file:
@@ -74,6 +96,66 @@ class Settings(BaseModel):
         )
         payload["authentication"] = self.authentication_cache_key
         return stable_hash(payload, length=20)
+
+
+def normalize_output_language(value: str) -> str:
+    """Normalize `source` or one concrete requested artifact language/locale."""
+
+    normalized = _normalize_language_label(value)
+    if normalized.casefold() == "source":
+        return "source"
+    return normalize_concrete_language(normalized)
+
+
+def normalize_concrete_language(value: str) -> str:
+    """Normalize a concrete language/locale and reject negotiation sentinels."""
+
+    normalized = _normalize_language_label(value)
+    if normalized.casefold() in {
+        "source",
+        "auto",
+        "unknown",
+        "und",
+        "mixed",
+        "mul",
+        "multilingual",
+        "zxx",
+    }:
+        raise ValueError(
+            "artifact language must name a concrete language or locale, not a sentinel"
+        )
+    return normalized
+
+
+def _normalize_language_label(value: str) -> str:
+    """Normalize one language label without deciding whether it is concrete."""
+
+    if any(ord(character) < 32 for character in value):
+        raise ValueError("output_language cannot contain control characters")
+    compact = " ".join(value.split())
+    if not 2 <= len(compact) <= 80:
+        raise ValueError(
+            "output_language must be `source` or a 2-80 character language/locale label"
+        )
+    # Canonicalize common BCP-47-shaped tags while preserving human labels such as
+    # "English" or "Simplified Chinese" exactly as the requester wrote them.
+    candidate = compact.replace("_", "-")
+    parts = candidate.split("-")
+    if (
+        len(parts[0]) in {2, 3}
+        and parts[0].isalpha()
+        and all(part.isalnum() and 1 <= len(part) <= 8 for part in parts[1:])
+    ):
+        normalized = [parts[0].lower()]
+        for part in parts[1:]:
+            if len(part) == 4 and part.isalpha():
+                normalized.append(part.title())
+            elif (len(part) == 2 and part.isalpha()) or (len(part) == 3 and part.isdigit()):
+                normalized.append(part.upper())
+            else:
+                normalized.append(part.lower())
+        return "-".join(normalized)
+    return compact
 
 
 def _deep_merge(base: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:

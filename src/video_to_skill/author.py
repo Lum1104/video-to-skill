@@ -10,6 +10,14 @@ from urllib.parse import urlparse
 
 from pydantic import ValidationError as PydanticValidationError
 
+from video_to_skill.artifact_language import (
+    ArtifactLanguageDeclaration,
+    canonical_artifact_language_state,
+    declare_artifact_language,
+    ensure_artifact_language_contract,
+    load_artifact_language_contract,
+    load_artifact_language_declaration,
+)
 from video_to_skill.curriculum import (
     load_canonical_curriculum_plan,
     load_canonical_curriculum_selection,
@@ -100,6 +108,16 @@ def plan_author_task(
         raise ProcessingError("Selected curriculum does not belong to the canonical options")
     if curriculum_selection.selected_path_id not in {path.id for path in curriculum_plan.paths}:
         raise ProcessingError("Selected curriculum identifies an unknown path")
+    language_contract, language_contract_digest = load_artifact_language_contract(workspace)
+    language_declaration, language_declaration_digest = load_artifact_language_declaration(
+        workspace,
+        expected_contract_digest=language_contract_digest,
+    )
+    language_record = workspace.canonical_record("artifact-language-declaration")
+    if language_record is None or language_record.producer_task_id != curriculum_task.id:
+        raise ProcessingError(
+            "Authoring requires the curriculum's canonical artifact-language declaration"
+        )
     records = {
         kind: _canonical_path(workspace, kind)
         for kind in (
@@ -125,8 +143,15 @@ def plan_author_task(
             "ceilings. Select only evidence-grounded visual_asset_candidates when a visual "
             "materially improves teaching or verification. Link every selected PNG from each "
             "used_by artifact, and leave decorative or redundant candidates unused. Curriculum "
-            "decision fields are legacy-only and must remain false and null."
+            "decision fields are legacy-only and must remain false and null. Use exactly "
+            f"{language_declaration.artifact_language!r} for all generated artifact prose, "
+            "titles, interaction text, and metadata. Preserve original proper names and "
+            "technical terms where appropriate, and echo this exact value in artifact_language."
         ),
+        "artifact_language_contract": language_contract.model_dump(mode="json"),
+        "artifact_language_contract_digest": language_contract_digest,
+        "artifact_language_declaration": language_declaration.model_dump(mode="json"),
+        "artifact_language_declaration_digest": language_declaration_digest,
         "canonical_records": {
             kind: {"path": path, "digest": digest} for kind, (path, digest) in records.items()
         },
@@ -143,6 +168,8 @@ def plan_author_task(
             "curriculum_plan_digest": curriculum_plan_record.digest,
             "curriculum_selection_digest": selection_record.digest,
             "curriculum_selection_producer_task_id": expected_selection_producer,
+            "artifact_language_contract_digest": language_contract_digest,
+            "artifact_language_declaration_digest": language_declaration_digest,
         },
         persona_hint=AUTHOR_PERSONA,
         packet=packet,
@@ -284,12 +311,58 @@ def _validate_selected_curriculum(
             )
 
 
+def _author_language_declaration(
+    workspace: Workspace,
+    task: WorkItem,
+    artifact_language: str,
+) -> ArtifactLanguageDeclaration:
+    expected_contract_digest = task.scope.get("artifact_language_contract_digest")
+    expected_declaration_digest = task.scope.get("artifact_language_declaration_digest")
+    if expected_contract_digest is None and expected_declaration_digest is None:
+        contract, contract_digest = ensure_artifact_language_contract(workspace)
+        return declare_artifact_language(
+            contract,
+            contract_digest,
+            artifact_language,
+            legacy=True,
+        )
+    if not isinstance(expected_contract_digest, str) or not isinstance(
+        expected_declaration_digest, str
+    ):
+        raise ProcessingError("Author task has a partial artifact-language binding")
+    bound_author_task_id = task.scope.get("repair_of", task.id)
+    if not isinstance(bound_author_task_id, str):
+        raise ProcessingError("Author task has an invalid artifact-language predecessor")
+    language_state = canonical_artifact_language_state(
+        workspace,
+        expected_author_task_id=bound_author_task_id,
+    )
+    if language_state.contract_digest != expected_contract_digest:
+        raise ProcessingError("Author task targets a stale artifact-language contract")
+    if language_state.declaration_digest != expected_declaration_digest:
+        raise ProcessingError("Author task targets a stale artifact-language declaration")
+    actual = declare_artifact_language(
+        language_state.contract,
+        language_state.contract_digest,
+        artifact_language,
+        legacy=language_state.legacy,
+    )
+    if actual != language_state.declaration:
+        raise ProcessingError("Author changed the canonical artifact-language declaration")
+    return language_state.declaration
+
+
 def _validate_author_result(
     workspace: Workspace,
     task: WorkItem,
     result: AuthorResult,
-) -> None:
+) -> ArtifactLanguageDeclaration:
     _validate_selected_curriculum(workspace, task, result)
+    language_declaration = _author_language_declaration(
+        workspace,
+        task,
+        result.artifact_language,
+    )
     units = _load_semantic_units(workspace)
     known_units = {unit.id for unit in units}
     units_by_id = {unit.id: unit for unit in units}
@@ -399,6 +472,7 @@ def _validate_author_result(
                 raise ProcessingError(
                     f"Artifact {artifact_path} does not link selected visual asset {selected.path}"
                 )
+    return language_declaration
 
 
 def _course_assets(workspace: Workspace, result: AuthorResult) -> list[CourseAsset]:
@@ -439,7 +513,7 @@ def submit_author_result(
     result = _load_author_result(result_path)
     if result.task_id != task_id or result.snapshot_digest != task.snapshot_digest:
         raise ProcessingError("Author result does not belong to this task snapshot")
-    _validate_author_result(workspace, task, result)
+    language_declaration = _validate_author_result(workspace, task, result)
     output = workspace.tasks_dir / task_id / "output"
     course_path = output / "course.json"
     curriculum_path = output / "curriculum.json"
@@ -456,7 +530,7 @@ def submit_author_result(
             "title": result.title,
             "description": result.description,
             "scope": result.scope,
-            "artifact_language": result.artifact_language,
+            "artifact_language": language_declaration.artifact_language,
             "prerequisites": result.prerequisites,
             "core_principles": [item.model_dump(mode="json") for item in result.core_principles],
             "limitations": result.limitations,
@@ -493,6 +567,10 @@ def submit_author_result(
         ("claims", "default", claims_path),
         ("assets", "default", assets_path),
     ]
+    if workspace.canonical_record("artifact-language-declaration") is None:
+        language_path = output / "artifact-language.json"
+        atomic_write_json(language_path, language_declaration)
+        canonical_outputs.append(("artifact-language-declaration", "default", language_path))
     for artifact in result.artifacts:
         canonical_outputs.append(("artifact-draft", artifact.id, output / artifact.draft_path))
     accepted, _records = workspace.accept_work_result(

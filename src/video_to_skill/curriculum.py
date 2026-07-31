@@ -8,6 +8,12 @@ from pathlib import Path
 
 from pydantic import ValidationError as PydanticValidationError
 
+from video_to_skill.artifact_language import (
+    ArtifactLanguageDeclaration,
+    declare_artifact_language,
+    ensure_artifact_language_contract,
+    load_artifact_language_contract,
+)
 from video_to_skill.errors import ProcessingError
 from video_to_skill.generation import CurriculumDesign, SemanticUnit
 from video_to_skill.orchestration import (
@@ -113,6 +119,23 @@ def plan_curriculum_task(
         raise ProcessingError("Curriculum planning requires the integrated canonical semantic map")
     records = {kind: _canonical_path(workspace, kind) for kind in _CURRICULUM_INPUT_KINDS}
     record_digests = {kind: digest for kind, (_path, digest) in records.items()}
+    language_contract, language_contract_digest = ensure_artifact_language_contract(workspace)
+    language_instruction = (
+        f"Use exactly {language_contract.fixed_artifact_language!r} as the canonical artifact "
+        "language and echo it in artifact_language."
+        if language_contract.fixed_artifact_language is not None
+        else (
+            "Declare exactly one observed source language in artifact_language from: "
+            + ", ".join(language_contract.source_languages)
+            + "."
+            if language_contract.resolution == "source-mixed" and language_contract.source_languages
+            else (
+                "Source language is mixed or unknown. Use evidence-informed judgment to declare "
+                "one concrete canonical artifact language in artifact_language; never return "
+                "`source`."
+            )
+        )
+    )
     return workspace.ensure_work_item(
         run_id=run.id,
         role=WorkRole.AUTHOR,
@@ -120,6 +143,7 @@ def plan_curriculum_task(
             "kind": "curriculum-planning",
             "analyze_task_id": analyze_task.id,
             "canonical_record_digests": record_digests,
+            "artifact_language_contract_digest": language_contract_digest,
         },
         persona_hint=CURRICULUM_PLANNER_PERSONA,
         packet={
@@ -130,8 +154,12 @@ def plan_curriculum_task(
                 "only when choosing among the paths would materially change the user's learning "
                 "experience, and provide a concise user-facing decision summary then. Do not "
                 "design artifact boundaries or IDs, write Markdown drafts, create claims, or "
-                "select assets."
+                f"select assets. {language_instruction} Write all user-facing curriculum "
+                "metadata in that same language while preserving proper names and technical "
+                "terms where appropriate."
             ),
+            "artifact_language_contract": language_contract.model_dump(mode="json"),
+            "artifact_language_contract_digest": language_contract_digest,
             "canonical_records": {
                 kind: {"path": path, "digest": digest} for kind, (path, digest) in records.items()
             },
@@ -397,6 +425,20 @@ def _validate_curriculum_plan(
             )
 
 
+def _curriculum_language_declaration(
+    workspace: Workspace,
+    task: WorkItem,
+    artifact_language: str,
+) -> ArtifactLanguageDeclaration:
+    expected_digest = task.scope.get("artifact_language_contract_digest")
+    if not isinstance(expected_digest, str):
+        raise ProcessingError("Curriculum task is missing its artifact-language binding")
+    contract, contract_digest = load_artifact_language_contract(workspace)
+    if contract_digest != expected_digest:
+        raise ProcessingError("Curriculum task targets a stale artifact-language contract")
+    return declare_artifact_language(contract, contract_digest, artifact_language)
+
+
 def submit_curriculum_plan_result(
     workspace: Workspace,
     task_id: str,
@@ -409,11 +451,19 @@ def submit_curriculum_plan_result(
     if result.task_id != task.id or result.snapshot_digest != task.snapshot_digest:
         raise ProcessingError("Curriculum plan result does not belong to this task snapshot")
     _validate_curriculum_plan(workspace, task, result.curriculum)
+    language_declaration = _curriculum_language_declaration(
+        workspace,
+        task,
+        result.artifact_language,
+    )
     output_directory = workspace.tasks_dir / task.id / "output"
     options_path = output_directory / "curriculum-options.json"
+    language_path = output_directory / "artifact-language.json"
     atomic_write_json(options_path, result.curriculum)
+    atomic_write_json(language_path, language_declaration)
     canonical_outputs: list[tuple[str, str, Path]] = [
-        ("curriculum-options", "default", options_path)
+        ("curriculum-options", "default", options_path),
+        ("artifact-language-declaration", "default", language_path),
     ]
     if not result.curriculum.decision_required:
         selection_path = output_directory / "selected-curriculum.json"

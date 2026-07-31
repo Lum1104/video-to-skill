@@ -12,6 +12,11 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic import ValidationError as PydanticValidationError
 
+from video_to_skill.artifact_language import (
+    ArtifactLanguageDeclarationState,
+    ArtifactLanguageResolution,
+    canonical_artifact_language_state,
+)
 from video_to_skill.behavior import (
     BEHAVIOR_CATALOG_VERSION,
     BEHAVIOR_CONTRACT_VERSION,
@@ -90,6 +95,12 @@ class WorkspaceBuildReceipt(CompileModel):
     build_id: str
     workspace_snapshot_digest: str
     name: str
+    requested_output_language: str
+    artifact_language: str
+    artifact_language_resolution: ArtifactLanguageResolution
+    artifact_language_declaration_state: ArtifactLanguageDeclarationState
+    artifact_language_contract_digest: str
+    artifact_language_declaration_digest: str
     semantic_map_digest: str
     curriculum_digest: str
     curriculum_options_digest: str | None = None
@@ -112,6 +123,10 @@ class WorkspaceBuildReceipt(CompileModel):
 class WorkspaceBuildResult(CompileModel):
     build_id: str
     name: str
+    requested_output_language: str
+    artifact_language: str
+    artifact_language_resolution: ArtifactLanguageResolution
+    artifact_language_declaration_state: ArtifactLanguageDeclarationState
     generated_path: Path
     installed_path: Path
     installation_status: str
@@ -126,6 +141,11 @@ class WorkspaceBlueprintProjection:
     """Canonical author state assembled without depending on a quality verdict."""
 
     blueprint: CourseSkillBlueprint
+    requested_output_language: str
+    artifact_language_resolution: ArtifactLanguageResolution
+    artifact_language_declaration_state: ArtifactLanguageDeclarationState
+    artifact_language_contract_digest: str
+    artifact_language_declaration_digest: str
     artifact_references: list[CompiledArtifactReference]
     semantic_map_digest: str
     curriculum_digest: str
@@ -346,6 +366,23 @@ def _quality_gate(
         or not isinstance(trial_entries, list)
     ):
         raise ProcessingError("Canonical Review packet has incomplete behavior evidence")
+    assert isinstance(payload, dict)
+    language_state = canonical_artifact_language_state(
+        workspace,
+        expected_author_task_id=course_record.producer_task_id,
+    )
+    if (
+        review_task.scope.get("artifact_language_contract_digest") != language_state.contract_digest
+        or review_task.scope.get("artifact_language_declaration_digest")
+        != language_state.declaration_digest
+        or payload.get("artifact_language_contract")
+        != language_state.contract.model_dump(mode="json")
+        or payload.get("artifact_language_contract_digest") != language_state.contract_digest
+        or payload.get("artifact_language_declaration")
+        != language_state.declaration.model_dump(mode="json")
+        or payload.get("artifact_language_declaration_digest") != language_state.declaration_digest
+    ):
+        raise ProcessingError("Canonical Review targets stale artifact-language state")
     target_relative = Path(str(target_packet.get("path", "")))
     if target_relative.is_absolute() or ".." in target_relative.parts:
         raise ProcessingError("Canonical Review target path is unsafe")
@@ -588,6 +625,13 @@ def assemble_workspace_blueprint(workspace: Workspace) -> WorkspaceBlueprintProj
     )
     _validate_selected_visual_assets(workspace, assets)
     course = _canonical_json(workspace, "course")
+    course_record = workspace.canonical_record("course")
+    if course_record is None:
+        raise ProcessingError("Compilation requires canonical course")
+    language_state = canonical_artifact_language_state(
+        workspace,
+        expected_author_task_id=course_record.producer_task_id,
+    )
     delivery_record = workspace.canonical_record("delivery-selection")
     try:
         delivery_selection = (
@@ -688,6 +732,11 @@ def assemble_workspace_blueprint(workspace: Workspace) -> WorkspaceBlueprintProj
     assert assets_record is not None
     return WorkspaceBlueprintProjection(
         blueprint=blueprint,
+        requested_output_language=language_state.contract.requested_output_language,
+        artifact_language_resolution=language_state.contract.resolution,
+        artifact_language_declaration_state=language_state.declaration.declaration_state,
+        artifact_language_contract_digest=language_state.contract_digest,
+        artifact_language_declaration_digest=language_state.declaration_digest,
         artifact_references=artifact_references,
         semantic_map_digest=semantic_record.digest,
         curriculum_digest=curriculum_record.digest,
@@ -717,6 +766,12 @@ def compile_workspace_blueprint(
         build_id=build_id,
         workspace_snapshot_digest=workspace.workspace_snapshot_digest(),
         name=blueprint.name,
+        requested_output_language=projection.requested_output_language,
+        artifact_language=blueprint.artifact_language,
+        artifact_language_resolution=projection.artifact_language_resolution,
+        artifact_language_declaration_state=projection.artifact_language_declaration_state,
+        artifact_language_contract_digest=projection.artifact_language_contract_digest,
+        artifact_language_declaration_digest=projection.artifact_language_declaration_digest,
         semantic_map_digest=projection.semantic_map_digest,
         curriculum_digest=projection.curriculum_digest,
         curriculum_options_digest=projection.curriculum_options_digest,
@@ -798,6 +853,10 @@ def build_workspace_skill(
     return WorkspaceBuildResult(
         build_id=receipt.build_id,
         name=blueprint.name,
+        requested_output_language=receipt.requested_output_language,
+        artifact_language=receipt.artifact_language,
+        artifact_language_resolution=receipt.artifact_language_resolution,
+        artifact_language_declaration_state=receipt.artifact_language_declaration_state,
         generated_path=generated,
         installed_path=installed,
         installation_status=status,

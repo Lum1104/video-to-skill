@@ -631,6 +631,7 @@ class JobManifest(StrictModel):
     inputs: list[str]
     workspace: Path
     configuration_hash: str
+    output_language: str = "source"
     sources: list[SourceDescriptor] = Field(default_factory=list)
     warnings: list[WarningRecord] = Field(default_factory=list)
     failed_sources: list[str] = Field(default_factory=list)

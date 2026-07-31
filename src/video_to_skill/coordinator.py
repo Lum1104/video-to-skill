@@ -13,6 +13,10 @@ from video_to_skill.analyze import (
     plan_analyze_tasks,
     submit_analyze_result,
 )
+from video_to_skill.artifact_language import (
+    ArtifactLanguageContract,
+    ensure_artifact_language_contract,
+)
 from video_to_skill.author import plan_author_task, submit_author_result
 from video_to_skill.compiler import (
     WorkspaceBuildResult,
@@ -69,6 +73,8 @@ def _run_configuration(
     project_root: Path | None,
     skill_root: Path | None,
     run_official_validation: bool,
+    settings: Settings,
+    output_language_override: str | None,
 ) -> dict[str, object]:
     path = workspace.analysis_dir / "run-config.json"
     if path.exists():
@@ -83,6 +89,28 @@ def _run_configuration(
             raise ProcessingError("Resume output differs from the workspace run configuration")
         if project is not None and project != bool(existing["project"]):
             raise ProcessingError("Resume installation scope differs from the workspace")
+        persisted_contract, persisted_digest = ensure_artifact_language_contract(
+            workspace,
+            output_language_override,
+            verify_source_resolution=True,
+        )
+        embedded_contract = existing.get("artifact_language_contract")
+        embedded_digest = existing.get("artifact_language_contract_digest")
+        if embedded_contract is None and embedded_digest is None:
+            existing["artifact_language_contract"] = persisted_contract.model_dump(mode="json")
+            existing["artifact_language_contract_digest"] = persisted_digest
+            atomic_write_json(path, existing)
+        else:
+            try:
+                validated_embedded = ArtifactLanguageContract.model_validate(embedded_contract)
+            except PydanticValidationError as exc:
+                raise ProcessingError(
+                    f"Invalid persisted artifact-language contract: {exc}"
+                ) from exc
+            if validated_embedded != persisted_contract or embedded_digest != persisted_digest:
+                raise ProcessingError(
+                    "Run configuration artifact-language contract failed its digest check"
+                )
         return existing
     if host is None:
         raise ProcessingError("A new orchestration run requires --host")
@@ -90,6 +118,15 @@ def _run_configuration(
         output.expanduser().resolve()
         if output is not None
         else (Path.cwd() / "generated-skills" / "pending-course").resolve()
+    )
+    manifest = workspace.load_manifest()
+    requested_output_language = output_language_override or manifest.output_language
+    if not requested_output_language:
+        requested_output_language = settings.output_language
+    artifact_contract, artifact_contract_digest = ensure_artifact_language_contract(
+        workspace,
+        requested_output_language,
+        verify_source_resolution=True,
     )
     configuration: dict[str, object] = {
         "host": host.value,
@@ -99,6 +136,8 @@ def _run_configuration(
         "project_root": str((project_root or Path.cwd()).resolve()),
         "skill_root": str(skill_root.resolve()) if skill_root is not None else None,
         "run_official_validation": run_official_validation,
+        "artifact_language_contract": artifact_contract.model_dump(mode="json"),
+        "artifact_language_contract_digest": artifact_contract_digest,
     }
     atomic_write_json(path, configuration)
     return configuration
@@ -569,6 +608,7 @@ def advance_run(
     sources: list[str],
     workspace_path: Path,
     settings: Settings,
+    output_language_override: str | None = None,
     host: SkillHost | None,
     output: Path | None = None,
     project: bool | None = None,
@@ -596,6 +636,8 @@ def advance_run(
         project_root=project_root,
         skill_root=skill_root,
         run_official_validation=run_official_validation,
+        settings=settings,
+        output_language_override=output_language_override,
     )
     run = workspace.create_analysis_run()
     for _transition in range(100):
@@ -719,6 +761,8 @@ def advance_run(
             "reviewed_snapshot_digest",
             "target_build_id",
             "target_content_digest",
+            "artifact_language_contract_digest",
+            "artifact_language_declaration_digest",
         )
         expected_review_dependencies = sorted(
             {

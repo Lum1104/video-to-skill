@@ -238,6 +238,9 @@ def test_run_and_submit_complete_without_main_agent_data_forwarding(
     assert Path(str(complete.completion["generated_path"])).is_dir()
     assert Path(str(complete.completion["installed_path"])).is_dir()
     assert complete.completion["instructional_affordance_coverage"]["provided"] == 5
+    assert complete.completion["requested_output_language"] == "source"
+    assert complete.completion["artifact_language"] == "English"
+    assert complete.completion["artifact_language_declaration_state"] == "agent-declared"
     resumed = _resume(workspace, settings)
     assert resumed.status == "complete"
     assert resumed.completion is not None
@@ -450,6 +453,38 @@ def test_run_reclaims_expired_task_lease(tmp_path: Path) -> None:
     assert resumed_action.task_id == first_action.task_id
     assert resumed_action.already_leased is False
     assert workspace.get_work_item(first_action.task_id).attempt_count == first_attempts + 1
+
+
+def test_run_persists_output_language_and_rejects_conflicting_resume(
+    tmp_path: Path,
+) -> None:
+    workspace, _analyze_task = _analyzed_workspace(tmp_path)
+    settings = Settings(cache_root=tmp_path)
+    first = advance_run(
+        sources=[],
+        workspace_path=workspace.root,
+        settings=settings,
+        output_language_override="ZH_hans",
+        host=SkillHost.CODEX,
+        output=tmp_path / "generated" / "course",
+        skill_root=tmp_path / "skills",
+        run_official_validation=False,
+    )
+
+    run_config = json.loads(
+        (workspace.analysis_dir / "run-config.json").read_text(encoding="utf-8")
+    )
+    assert run_config["artifact_language_contract"]["requested_output_language"] == "zh-Hans"
+    resumed = _resume(workspace, Settings(cache_root=tmp_path, output_language="French"))
+    assert resumed.actions[0].task_id == first.actions[0].task_id
+    with pytest.raises(ProcessingError, match="differs from the persisted"):
+        advance_run(
+            sources=[],
+            workspace_path=workspace.root,
+            settings=settings,
+            output_language_override="French",
+            host=None,
+        )
 
 
 def test_run_resumes_pre_checkpoint_author_task_without_replanning(tmp_path: Path) -> None:
