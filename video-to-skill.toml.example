@@ -32,5 +32,6 @@ max_workers = 2
 command_timeout_seconds = 7200
 
 # Authentication can instead be provided through the corresponding environment vars.
+# Configure one source only. Browser cookies are snapshotted once per run and reused.
 # cookies_from_browser = "chrome"
 # cookies_file = "/secure/path/cookies.txt"

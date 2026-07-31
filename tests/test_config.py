@@ -36,3 +36,23 @@ def test_invalid_configuration_is_actionable(
     config.write_text("[video_to_skill\n", encoding="utf-8")
     with pytest.raises(Exception, match="Cannot read configuration"):
         load_settings(config)
+
+
+def test_cookie_sources_are_mutually_exclusive(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="either cookies_from_browser or cookies_file"):
+        Settings(
+            cookies_from_browser="chrome",
+            cookies_file=tmp_path / "cookies.txt",
+        )
+
+
+def test_configuration_hash_hides_cookie_location_but_tracks_auth_mode(
+    tmp_path: Path,
+) -> None:
+    public = Settings()
+    browser = Settings(cookies_from_browser="chrome")
+    cookie_file = Settings(cookies_file=tmp_path / "cookies.txt")
+
+    assert public.configuration_hash != browser.configuration_hash
+    assert public.configuration_hash != cookie_file.configuration_hash
+    assert str(tmp_path) not in cookie_file.configuration_hash

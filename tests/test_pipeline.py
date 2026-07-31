@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from video_to_skill import authentication as authentication_module
 from video_to_skill import pipeline as pipeline_module
 from video_to_skill.config import Settings
 from video_to_skill.models import (
@@ -74,6 +75,40 @@ Then we run the workflow and inspect the expected result.
             caption_paths=[caption],
             content_hash="fixture-hash",
         )
+
+
+class AuthenticatedFixtureAdapter(FixtureAdapter):
+    def __init__(self) -> None:
+        self.cookie_paths: list[Path] = []
+
+    def accepts(self, locator: str) -> bool:
+        return locator == "https://youtu.be/private"
+
+    def inspect(self, locator: str, settings: Settings) -> list[SourceDescriptor]:
+        self._record_cookie(settings)
+        return super().inspect(locator, settings)
+
+    def materialize(
+        self,
+        source: SourceDescriptor,
+        destination: Path,
+        settings: Settings,
+        *,
+        need_media: bool,
+    ) -> MaterializedSource:
+        self._record_cookie(settings)
+        return super().materialize(
+            source,
+            destination,
+            settings,
+            need_media=need_media,
+        )
+
+    def _record_cookie(self, settings: Settings) -> None:
+        assert settings.cookies_from_browser is None
+        assert settings.cookies_file is not None
+        assert settings.cookies_file.is_file()
+        self.cookie_paths.append(settings.cookies_file)
 
 
 class NoCaptionAdapter(FixtureAdapter):
@@ -245,6 +280,53 @@ def test_end_to_end_transcript_profile(tmp_path: Path) -> None:
     )
     assert workspace_again.root == workspace.root
     assert manifest_again.state.value == "complete"
+
+
+def test_extract_reuses_one_browser_cookie_snapshot_for_all_stages(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exports = 0
+
+    monkeypatch.setattr(
+        authentication_module,
+        "require_program",
+        lambda _program: "yt-dlp",
+    )
+
+    def fake_export(
+        args: list[str],
+        **_kwargs: object,
+    ) -> object:
+        nonlocal exports
+        exports += 1
+        cookie_path = Path(args[args.index("--cookies") + 1])
+        cookie_path.write_text(
+            "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tFALSE\t0\tname\tvalue\n",
+            encoding="utf-8",
+        )
+        return object()
+
+    monkeypatch.setattr(authentication_module, "run_command", fake_export)
+    adapter = AuthenticatedFixtureAdapter()
+
+    extract_sources(
+        ["https://youtu.be/private"],
+        Settings(
+            cache_root=tmp_path,
+            cookies_from_browser="chrome",
+            visual_profile="transcript",
+            asr_provider="none",
+            max_workers=1,
+        ),
+        workspace_path=tmp_path / "workspace",
+        registry=SourceRegistry([adapter]),
+    )
+
+    assert exports == 1
+    assert len(adapter.cookie_paths) == 2
+    assert len(set(adapter.cookie_paths)) == 2
+    assert all(not path.exists() for path in adapter.cookie_paths)
 
 
 def test_partial_inspection_is_persisted_and_disclaimed_in_coverage(tmp_path: Path) -> None:

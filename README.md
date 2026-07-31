@@ -63,6 +63,8 @@ See [Ambitious AI Startup Playbook](https://github.com/Lum1104/ambitious-ai-star
 
 The runtime is isolated from your project. Its fingerprint covers the Python minor version, absolute source location, dependency manifest, and installation-relevant engine sources. Matching healthy runtimes are reused; a damaged runtime is rebuilt once under a process lock instead of entering a repair loop. Local ASR, OCR, and speaker separation are installed only when the selected evidence route requires them, which can trigger additional package or model downloads.
 
+When browser authentication is enabled, the engine decrypts browser cookies once, creates private per-worker temporary snapshots, and removes them when the command exits. A supplied `cookies.txt` file is snapshotted rather than modified in place.
+
 ## Privacy, access, and copyright
 
 - Raw media, subtitles, frames, cookies, credentials, transcripts, and the evidence database stay in the private workspace and are excluded from generated Skills.

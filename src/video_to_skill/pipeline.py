@@ -7,6 +7,10 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+from video_to_skill.authentication import (
+    browser_cookie_session,
+    cookie_settings_for_worker,
+)
 from video_to_skill.config import Settings
 from video_to_skill.errors import DependencyError, ProcessingError, VideoToSkillError
 from video_to_skill.models import (
@@ -74,7 +78,11 @@ def inspect_inputs_with_completeness(
 ) -> InspectionBatch:
     if not inputs:
         raise ProcessingError("At least one video URL or local media path is required")
-    return (registry or SourceRegistry()).inspect_with_completeness(inputs, settings)
+    with browser_cookie_session(settings, inputs) as authenticated:
+        return (registry or SourceRegistry()).inspect_with_completeness(
+            inputs,
+            authenticated,
+        )
 
 
 def _materialized_from_cache(
@@ -394,7 +402,7 @@ def _missing_local_inspection(source: SourceDescriptor) -> InspectionCompletenes
     )
 
 
-def extract_sources(
+def _extract_sources_authenticated(
     inputs: list[str],
     settings: Settings,
     *,
@@ -463,7 +471,7 @@ def extract_sources(
                 _process_source,
                 source,
                 workspace,
-                settings,
+                cookie_settings_for_worker(settings, source.id),
                 registry,
                 progress,
             ): source
@@ -510,3 +518,26 @@ def extract_sources(
     state = JobState.PARTIAL if failures or inspection_incomplete else JobState.COMPLETE
     manifest = workspace.set_job_state(state, failed_sources=list(failures))
     return workspace, manifest
+
+
+def extract_sources(
+    inputs: list[str],
+    settings: Settings,
+    *,
+    workspace_path: Path | None = None,
+    registry: SourceRegistry | None = None,
+    progress: ProgressCallback | None = None,
+    refresh: bool = False,
+) -> tuple[Workspace, JobManifest]:
+    """Extract all sources while reusing one browser-cookie snapshot."""
+
+    root = workspace_path or default_workspace_path(inputs, settings)
+    with browser_cookie_session(settings, inputs) as authenticated:
+        return _extract_sources_authenticated(
+            inputs,
+            authenticated,
+            workspace_path=root,
+            registry=registry,
+            progress=progress,
+            refresh=refresh,
+        )

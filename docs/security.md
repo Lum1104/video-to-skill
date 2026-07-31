@@ -23,7 +23,14 @@ FFmpeg and yt-dlp process adversarial external content. Keep them patched and ru
 
 ## Credentials
 
-Platform cookies and provider keys are opt-in. Prefer environment variables and a dedicated browser profile. Do not pass workspaces or debug logs to third parties before reviewing them.
+Platform cookies and provider keys are opt-in. Prefer environment variables and
+a dedicated browser profile. Browser cookies are decrypted once per engine
+invocation into an ephemeral jar; concurrent download workers receive isolated
+copies so yt-dlp cannot race while updating the file. Those jars are never part
+of the evidence workspace or generated Skill and are removed when the
+authentication session closes. A user-provided cookie file is snapshotted for
+the run and never modified in place. Do not pass cookies, workspaces, or debug
+logs to third parties before reviewing them.
 
 Native host vision avoids sending frames to an additional provider, but it does not make the content trusted. The agent records concise observations and evidence links rather than private reasoning, copied instructions, or unrestricted OCR dumps.
 

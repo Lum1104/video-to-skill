@@ -22,6 +22,10 @@ For a playlist, collection, or course, enumerate and process every accessible it
 
 Ask only when a material boundary cannot be inferred safely: private or paid content needs new credentials, local/private media would be uploaded to a hosted service, a new billed dependency is required, the resolved scope is unexpectedly large, or a conflicting same-name Skill already contains different material. Continue through partial source failures and report their impact.
 
+For a source that needs login, negotiate authentication once for the whole run. Offer: use a named browser/profile, use a local Netscape `cookies.txt` file, or continue with public items only. Never ask for an account password. If the user voluntarily supplies cookie material, treat it as a runtime secret: do not quote it back, persist it in the evidence workspace, include it in logs or manifests, or place it in the generated Skill.
+
+When browser authentication is authorized, set `VIDEO_TO_SKILL_COOKIES_FROM_BROWSER` only for the engine invocation. The engine creates one private temporary cookie snapshot, reuses it for source inspection and every concurrent download, and removes it when the command exits. A macOS keychain prompt may appear once; repeated prompts during one engine invocation are an authentication-session failure, not a reason to keep asking the user.
+
 The user interacts with two layers:
 
 1. `video-to-skill` is the generator and evidence compiler.

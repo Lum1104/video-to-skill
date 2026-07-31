@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from platformdirs import user_cache_path, user_config_path
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 from video_to_skill.errors import ConfigurationError
 from video_to_skill.utils import stable_hash
@@ -17,6 +17,8 @@ from video_to_skill.utils import stable_hash
 
 class Settings(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    _authentication_cache_key: str | None = PrivateAttr(default=None)
+    _cookie_session_root: Path | None = PrivateAttr(default=None)
 
     cache_root: Path = Field(default_factory=lambda: user_cache_path("video-to-skill") / "jobs")
     ffmpeg: str = "ffmpeg"
@@ -48,9 +50,29 @@ class Settings(BaseModel):
     max_workers: int = Field(default=2, ge=1, le=8)
     command_timeout_seconds: int = Field(default=2 * 60 * 60, ge=10)
 
+    @model_validator(mode="after")
+    def one_cookie_source(self) -> Settings:
+        if self.cookies_from_browser and self.cookies_file:
+            raise ValueError("Configure either cookies_from_browser or cookies_file, not both")
+        return self
+
+    @property
+    def authentication_cache_key(self) -> str:
+        if self._authentication_cache_key is not None:
+            return self._authentication_cache_key
+        if self.cookies_from_browser:
+            return f"browser:{self.cookies_from_browser}"
+        if self.cookies_file:
+            return f"cookie-file:{self.cookies_file.expanduser().resolve()}"
+        return "public"
+
     @property
     def configuration_hash(self) -> str:
-        payload = self.model_dump(mode="json", exclude={"cache_root"})
+        payload = self.model_dump(
+            mode="json",
+            exclude={"cache_root", "cookies_from_browser", "cookies_file"},
+        )
+        payload["authentication"] = self.authentication_cache_key
         return stable_hash(payload, length=20)
 
 

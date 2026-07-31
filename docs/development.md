@@ -319,7 +319,19 @@ Platform authentication is opt-in:
 export VIDEO_TO_SKILL_COOKIES_FROM_BROWSER=chrome
 ```
 
-Use a dedicated browser profile or cookie file with the minimum access required. Never commit or distribute cookies, workspaces, debug logs, or downloaded media.
+When browser authentication is configured, the engine invokes yt-dlp once to
+create a private temporary Netscape cookie jar. Source inspection and every
+concurrent materialization then use private per-worker copies through
+`--cookies`; they do not reopen the browser cookie database or race while
+yt-dlp updates its jar. The temporary directory is user-private on Windows and
+additionally uses mode `0700` with `0600` cookie files on POSIX. The jars are
+overwritten and removed when the command exits.
+
+As an alternative, point `VIDEO_TO_SKILL_COOKIES_FILE` at an existing Netscape
+`cookies.txt` file. Configure only one cookie source. Use a dedicated browser
+profile or cookie file with the minimum access required. Never commit or
+distribute cookies, workspaces, debug logs, or downloaded media, and never place
+cookie text in a generated Skill.
 
 ### Native and hosted vision
 
