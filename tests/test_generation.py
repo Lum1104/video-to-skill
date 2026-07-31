@@ -27,18 +27,17 @@ from video_to_skill.validation import validate_skill
 
 def test_generator_skill_owns_the_complete_user_workflow() -> None:
     generator = (Path(__file__).parents[1] / "SKILL.md").read_text(encoding="utf-8")
-    assert "One invocation owns the complete workflow" in generator
-    assert "process every accessible item by default" in generator
-    assert "Do not create a second generic video tutor Skill" in generator
-    assert "four behaviors into artifact quotas" in generator
-    assert "Build the canonical semantic map" in generator
-    assert "Use a thematic course as the default primary design" in generator
-    assert "empty-invocation contract" in generator
-    assert "blueprint-schema --workspace WORKSPACE --output AUTHORING_JSON" in generator
-    assert "`blueprint_schema`" in generator
-    assert "Preserve the seed's `sources` and `coverage_ledger` exactly" in generator
-    assert "build-skill BLUEPRINT_JSON --host claude" in generator
-    assert "build-skill BLUEPRINT_JSON --host codex" in generator
+    assert "Own the complete workflow" in generator
+    assert "Process every accessible playlist or course item by default" in generator
+    assert "invoke a second tutor Skill" in generator
+    assert "not artifact quotas" in generator
+    assert "Analyze → Author → Review" in generator
+    assert "instructional-affordance ledger" in generator
+    assert "run SOURCES... --workspace WORKSPACE --host codex" in generator
+    assert "run --workspace WORKSPACE" in generator
+    assert "ENGINE submit WORKSPACE TASK_ID" in generator
+    assert "blueprint-schema" not in generator
+    assert "build-skill" not in generator
 
 
 def _blueprint() -> CourseSkillBlueprint:
