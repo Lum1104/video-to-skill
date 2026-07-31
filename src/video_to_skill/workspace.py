@@ -791,6 +791,17 @@ class Workspace:
                 raise ProcessingError(f"Task cannot be failed from its current state: {task_id}")
         return self.get_work_item(task_id)
 
+    def work_result_producer(self, task_id: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT producer_json FROM work_results WHERE task_id=?",
+                (task_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        value = json.loads(str(row["producer_json"]))
+        return cast(dict[str, Any], value)
+
     def publish_canonical_record(
         self,
         *,

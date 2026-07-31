@@ -378,3 +378,62 @@ class AuthorResult(OrchestrationModel):
         if not core_claim_ids <= set(claim_ids):
             raise ValueError("core principles must reference submitted claims")
         return self
+
+
+ReviewCategory = Literal[
+    "semantic-retention",
+    "instructional-affordance",
+    "grounding",
+    "disclosure",
+    "runtime-behavior",
+    "safety",
+    "scope",
+]
+ReviewSeverity = Literal["info", "warning", "error"]
+ReviewVerdict = Literal["pass", "fail"]
+
+
+class ReviewFinding(OrchestrationModel):
+    id: str = Field(min_length=1, max_length=160)
+    category: ReviewCategory
+    severity: ReviewSeverity
+    target_kind: str = Field(min_length=1, max_length=120)
+    target_id: str = Field(min_length=1, max_length=200)
+    semantic_unit_ids: list[str] = Field(default_factory=list)
+    summary: str = Field(min_length=1, max_length=1200)
+    required_change: str | None = Field(default=None, max_length=1200)
+
+    @model_validator(mode="after")
+    def error_requires_change(self) -> ReviewFinding:
+        if self.severity == "error" and self.required_change is None:
+            raise ValueError("blocking review findings require a concrete change")
+        return self
+
+
+class BehaviorCheck(OrchestrationModel):
+    id: str = Field(min_length=1, max_length=160)
+    scenario: str = Field(min_length=1, max_length=800)
+    passed: bool
+    summary: str = Field(min_length=1, max_length=1200)
+
+
+class ReviewResult(OrchestrationModel):
+    schema_version: Literal[1] = 1
+    task_id: str
+    lease_token: str = Field(min_length=20)
+    snapshot_digest: str
+    reviewed_snapshot_digest: str
+    producer: ObservationProducer
+    verdict: ReviewVerdict
+    findings: list[ReviewFinding] = Field(default_factory=list)
+    behavior_checks: list[BehaviorCheck] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def coherent_verdict(self) -> ReviewResult:
+        has_errors = any(finding.severity == "error" for finding in self.findings)
+        failed_behavior = any(not check.passed for check in self.behavior_checks)
+        if self.verdict == "pass" and (has_errors or failed_behavior):
+            raise ValueError("passing reviews cannot retain errors or failed behavior checks")
+        if self.verdict == "fail" and not (has_errors or failed_behavior):
+            raise ValueError("failing reviews require an error or failed behavior check")
+        return self
