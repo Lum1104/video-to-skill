@@ -636,14 +636,6 @@ def advance_run(
                 "Completed delivery decision did not resolve generated Skill conflicts"
             )
         completion_path = build_directory / "completion.json"
-        if completion_path.exists():
-            completion = _load_json(completion_path)
-            assert isinstance(completion, dict)
-            return RunEnvelope(
-                status="complete",
-                workspace=workspace.root,
-                completion=completion,
-            )
         result = build_workspace_skill(
             workspace,
             host=SkillHost(str(configuration["host"])),

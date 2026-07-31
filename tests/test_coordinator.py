@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -108,7 +109,51 @@ def test_run_and_submit_complete_without_main_agent_data_forwarding(
     assert Path(str(complete.completion["installed_path"])).is_dir()
     assert complete.completion["instructional_affordance_coverage"]["provided"] == 5
     resumed = _resume(workspace, settings)
-    assert resumed == complete
+    assert resumed.status == "complete"
+    assert resumed.completion is not None
+    assert resumed.completion["build_id"] == complete.completion["build_id"]
+    assert resumed.completion["generated_path"] == complete.completion["generated_path"]
+    assert resumed.completion["installed_path"] == complete.completion["installed_path"]
+    assert resumed.completion["installation_status"] == "unchanged"
+
+
+def test_run_revalidates_cached_completion_and_recovers_missing_artifacts(
+    tmp_path: Path,
+) -> None:
+    workspace, settings, _output, _skill_root = _reviewed_workspace(tmp_path)
+    complete = _resume(workspace, settings)
+    assert complete.completion is not None
+    generated = Path(str(complete.completion["generated_path"]))
+    installed = Path(str(complete.completion["installed_path"]))
+    validation_report = Path(str(complete.completion["validation_report_path"]))
+    completion_path = (
+        workspace.root / "builds" / str(complete.completion["build_id"]) / "completion.json"
+    )
+
+    shutil.rmtree(generated)
+    shutil.rmtree(installed)
+    validation_report.unlink()
+    atomic_write_json(completion_path, {"generated_path": "/stale/generated/path"})
+
+    recovered = _resume(workspace, settings)
+
+    assert recovered.status == "complete"
+    assert recovered.completion is not None
+    assert recovered.completion["generated_path"] == str(generated)
+    assert recovered.completion["installed_path"] == str(installed)
+    assert generated.is_dir()
+    assert installed.is_dir()
+    assert validation_report.is_file()
+    assert json.loads(completion_path.read_text(encoding="utf-8")) == recovered.completion
+
+    (installed / "unexpected.txt").write_text("drift", encoding="utf-8")
+    drift = _resume(workspace, settings)
+    assert drift.status == "actions-required"
+    [action] = drift.actions
+    assert action.role == "decision"
+    task = workspace.get_work_item(action.task_id)
+    packet = json.loads((workspace.root / task.packet_path).read_text(encoding="utf-8"))
+    assert any("installed Skill" in conflict for conflict in packet["payload"]["conflicts"])
 
 
 def test_run_recovers_from_generated_and_installed_name_conflicts(
