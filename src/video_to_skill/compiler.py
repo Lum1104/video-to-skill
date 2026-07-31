@@ -279,11 +279,26 @@ def build_workspace_skill(
     run_official_validation: bool = True,
 ) -> WorkspaceBuildResult:
     blueprint, receipt, build_directory = compile_workspace_blueprint(workspace)
-    generated = render_course_skill_package(
-        blueprint,
-        output,
-        workspace_root=workspace.root,
-    )
+    generated = output.expanduser().resolve()
+    if generated.exists():
+        try:
+            manifest = json.loads(
+                (generated / "build-manifest.json").read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ProcessingError(
+                f"Existing generated output is not this resumable build: {generated}"
+            ) from exc
+        if manifest.get("build_id") != receipt.build_id:
+            raise ProcessingError(
+                f"Existing generated output belongs to a different build: {generated}"
+            )
+    else:
+        generated = render_course_skill_package(
+            blueprint,
+            generated,
+            workspace_root=workspace.root,
+        )
     report = validate_skill(
         generated,
         run_official=run_official_validation,

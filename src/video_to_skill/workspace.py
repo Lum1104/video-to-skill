@@ -552,6 +552,43 @@ class Workspace:
             ]
         return self._row_to_work_item(row, dependencies)
 
+    def list_work_items(
+        self,
+        run_id: str,
+        *,
+        role: WorkRole | None = None,
+        state: WorkState | None = None,
+    ) -> list[WorkItem]:
+        clauses = ["run_id=?"]
+        parameters: list[object] = [run_id]
+        if role is not None:
+            clauses.append("role=?")
+            parameters.append(role.value)
+        if state is not None:
+            clauses.append("state=?")
+            parameters.append(state.value)
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM work_items WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY created_at, id",
+                parameters,
+            ).fetchall()
+            result: list[WorkItem] = []
+            for row in rows:
+                dependencies = [
+                    str(item["dependency_id"])
+                    for item in connection.execute(
+                        """
+                        SELECT dependency_id FROM work_item_dependencies
+                        WHERE task_id=? ORDER BY dependency_id
+                        """,
+                        (row["id"],),
+                    ).fetchall()
+                ]
+                result.append(self._row_to_work_item(row, dependencies))
+        return result
+
     def ensure_work_item(
         self,
         *,

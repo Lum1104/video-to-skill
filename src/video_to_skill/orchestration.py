@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -437,3 +437,50 @@ class ReviewResult(OrchestrationModel):
         if self.verdict == "fail" and not (has_errors or failed_behavior):
             raise ValueError("failing reviews require an error or failed behavior check")
         return self
+
+
+ActionKind = Literal["dispatch-agent", "ask-user"]
+RunStatus = Literal["actions-required", "complete"]
+
+
+class RunAction(OrchestrationModel):
+    kind: ActionKind
+    task_id: str
+    task_path: Path
+    role: str
+    persona_hint: str | None = None
+    parallel_group: str | None = None
+    already_leased: bool = False
+    prompt: str | None = None
+    options: list[dict[str, str]] = Field(default_factory=list)
+
+
+class RunEnvelope(OrchestrationModel):
+    status: RunStatus
+    workspace: Path
+    actions: list[RunAction] = Field(default_factory=list)
+    completion: dict[str, object] | None = None
+
+    @model_validator(mode="after")
+    def coherent_status(self) -> RunEnvelope:
+        if self.status == "actions-required":
+            if not self.actions or self.completion is not None:
+                raise ValueError("actions-required needs actions and no completion")
+        elif self.actions or self.completion is None:
+            raise ValueError("complete needs a completion and no actions")
+        return self
+
+
+class DecisionResult(OrchestrationModel):
+    schema_version: Literal[1] = 1
+    task_id: str
+    lease_token: str = Field(min_length=20)
+    snapshot_digest: str
+    producer: ObservationProducer
+    selected_path_id: str = Field(min_length=1, max_length=160)
+
+
+class SubmissionReceipt(OrchestrationModel):
+    task_id: str
+    status: Literal["complete"] = "complete"
+    result_digest: str

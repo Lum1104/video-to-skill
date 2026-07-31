@@ -48,7 +48,6 @@ MAX_ASSET_OUTPUT_BYTES = 20 * 1024 * 1024
 MAX_ASSET_DIMENSION = 4096
 MAX_ASSET_PIXELS = 16_000_000
 MAX_WORKSPACE_LEDGER_ENTRIES = 10_000
-MAX_BLUEPRINT_AUTHORING_JSON_BYTES = 8 * 1024 * 1024
 
 SkillMode = Literal["learn", "practice", "apply", "reference"]
 ArtifactDisclosure = Literal["normal", "after-attempt"]
@@ -1100,51 +1099,6 @@ def blueprint_seed_from_workspace(workspace: Workspace) -> dict[str, object]:
     }
 
 
-def blueprint_authoring_payload(workspace: Workspace | None = None) -> dict[str, object]:
-    """Emit the strict schema and optional workspace-derived full-inventory seed."""
-
-    return {
-        "schema_version": 2,
-        "blueprint_schema": CourseSkillBlueprint.model_json_schema(mode="validation"),
-        "blueprint_seed": (
-            blueprint_seed_from_workspace(workspace) if workspace is not None else None
-        ),
-        "authoring_contract": {
-            "seed_is_complete": False,
-            "default_curriculum": "thematic",
-            "notes": [
-                "Keep the preseeded sources and coverage_ledger unchanged.",
-                (
-                    "Build a high-recall semantic map before curriculum artifacts; account "
-                    "for every material unit."
-                ),
-                (
-                    "Treat learn, practice, apply, and reference as capabilities, not "
-                    "artifact quotas."
-                ),
-                (
-                    "Give every artifact an independent loading reason and link it to "
-                    "semantic units and grounded claims."
-                ),
-                "Do not copy transcripts or raw media into the shareable Skill.",
-                "build-skill --workspace revalidates the ledger before rendering or installing.",
-            ],
-        },
-    }
-
-
-def encode_blueprint_authoring_payload(payload: dict[str, object]) -> str:
-    """Serialize authoring data with a hard output bound and no silent truncation."""
-
-    encoded = json.dumps(payload, ensure_ascii=False, indent=2)
-    if len(encoded.encode("utf-8")) > MAX_BLUEPRINT_AUTHORING_JSON_BYTES:
-        raise ProcessingError(
-            "Blueprint schema and workspace seed exceed the 8 MiB authoring output bound; "
-            "split the course into explicitly scoped skills."
-        )
-    return encoded
-
-
 def _summarize_values(values: set[str]) -> str:
     ordered = sorted(values)
     rendered = ", ".join(ordered[:8])
@@ -1159,8 +1113,8 @@ def validate_blueprint_against_workspace(
 
     expected_ledger = coverage_ledger_from_workspace(workspace)
     regeneration = (
-        f"Regenerate the authoring seed with `video-to-skill blueprint-schema --workspace "
-        f"{workspace.root}` and preserve its sources and coverage_ledger."
+        f"Resume `video-to-skill run --workspace {workspace.root}` so the blueprint is "
+        "recompiled from current canonical workspace state."
     )
     if blueprint.coverage_ledger is None:
         raise ProcessingError(

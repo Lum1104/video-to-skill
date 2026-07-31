@@ -84,6 +84,7 @@ def plan_review_task(
     *,
     author_task: WorkItem,
     repair_cycle: int = 0,
+    additional_dependencies: list[str] | None = None,
 ) -> WorkItem:
     if author_task.role != WorkRole.AUTHOR or author_task.state != WorkState.COMPLETE:
         raise ProcessingError("Review requires a completed Author task")
@@ -115,7 +116,7 @@ def plan_review_task(
         persona_hint=REVIEW_PERSONA,
         packet=packet,
         result_schema=ReviewResult.model_json_schema(mode="validation"),
-        dependencies=[author_task.id],
+        dependencies=[author_task.id, *(additional_dependencies or [])],
         snapshot_digest=run.snapshot_digest,
     )
 
