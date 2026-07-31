@@ -1,11 +1,13 @@
 ---
 name: video-to-skill
-description: "Turn a video, tutorial, playlist, or course into an installed, evidence-grounded course Skill that can teach, give practice and feedback, apply the demonstrated methods, and answer reference questions. Use when the user provides video sources and wants reusable learning or operational capability."
+description: "Turn a video, tutorial, playlist, or course into an installed, evidence-grounded course Skill that can teach, give practice and feedback, apply demonstrated methods, and answer reference questions. Use when the user provides video sources and wants reusable learning or operational capability."
 ---
+
 <!-- argument-hint: <video-url-or-local-path>... [skill-name] -->
+
 # Video-to-Skill
 
-Convert demonstrated capability, not a transcript summary. One invocation owns the complete workflow from accessible source discovery through installation of a course-specific Skill.
+Convert demonstrated capability, not a transcript summary. Own the complete workflow from accessible source discovery through installation of one course-specific Skill.
 
 ## User contract
 
@@ -16,44 +18,21 @@ A normal invocation is:
 $video-to-skill <URL>     # Codex
 ```
 
-Treat the supplied URL or local path as authorization to perform all reversible local processing needed for the result. Do not ask the user to run internal CLI commands, choose keyframe parameters, supervise intermediate stages, or invoke a second tutor Skill.
+Treat supplied URLs or local paths as authorization for reversible local processing. Process every accessible playlist or course item by default, resume cached work after interruption, and keep the private evidence workspace separate from the portable Skill.
 
-For a playlist, collection, or course, enumerate and process every accessible item by default. Download the captions, metadata, audio, and analysis-quality video needed for transcription and multimodal investigation. Prefer a bounded working copy over archival maximum quality. Resume interrupted work and reuse cached evidence.
+Ask only when a material boundary cannot be inferred safely: credentials are needed, local or private media would leave the machine, a billed dependency is required, scope is unexpectedly large, the user must choose between materially different curricula, or an installation name conflicts with different content.
 
-Ask only when a material boundary cannot be inferred safely: private or paid content needs new credentials, local/private media would be uploaded to a hosted service, a new billed dependency is required, the resolved scope is unexpectedly large, or a conflicting same-name Skill already contains different material. Continue through partial source failures and report their impact.
+Never ask the user to run internal commands, supervise extraction, select frame parameters, copy task payloads, or invoke a second tutor Skill. Never request an account password.
 
-For a source that needs login, negotiate authentication once for the whole run. Offer: use a named browser/profile, use a local Netscape `cookies.txt` file, or continue with public items only. Never ask for an account password. If the user voluntarily supplies cookie material, treat it as a runtime secret: do not quote it back, persist it in the evidence workspace, include it in logs or manifests, or place it in the generated Skill.
+Resolve the complete expected source set before treating acquisition as complete. Preserve playlist order and explicit complete, partial, failed, skipped, inaccessible, or retired states. Continue through isolated source failures when useful material remains, never silently omit an expected item, and report how missing material limits the generated Skill.
 
-When browser authentication is authorized, set `VIDEO_TO_SKILL_COOKIES_FROM_BROWSER` only for the engine invocation. The engine creates one private temporary cookie snapshot, reuses it for source inspection and every concurrent download, and removes it when the command exits. A macOS keychain prompt may appear once; repeated prompts during one engine invocation are an authentication-session failure, not a reason to keep asking the user.
+The engine is model-agnostic and never calls an LLM. The host main agent dispatches native workers for semantic, multimodal, pedagogical, and critical judgment; deterministic code owns acquisition, bounded packets, task state, validation, compilation, rendering, and installation.
 
-The user interacts with two layers:
+This workspace-centered release supports new conversions and deterministic resume. Update or fold-in of new evidence into an existing generated Skill is not implemented. Never present regeneration as a safe update, overwrite an existing different Skill, or discard human edits; retain the new workspace or staged output and state that update remains unsupported.
 
-1. `video-to-skill` is the generator and evidence compiler.
-2. The generated course-specific Skill is the teacher and practitioner. It must understand learning, practice, application, and reference intents itself, while the evidence determines the relative depth of each behavior.
+## Start the engine
 
-Do not create a second generic video tutor Skill for the MVP.
-
-## Modes
-
-### Full conversion
-
-Default when the user supplies new sources. Inspect, acquire, transcribe, investigate, close material evidence gaps, synthesize, render, critique, validate, and install.
-
-### Analyze only
-
-Use only when the user explicitly asks to inspect or analyze without creating a Skill. Stop after the capability map, coverage report, conflicts, and material gaps.
-
-### Generate from workspace
-
-When given an existing evidence workspace without new media, verify its inventory and gaps, resolve only material gaps, then synthesize, validate, and install.
-
-### Update or fold-in
-
-When given an existing generated Skill plus new evidence, extract the new inputs into a separate linked workspace, preserve supported and user-authored material, merge at the capability and provenance level, and validate the staged result. The no-clobber installer can install a fresh name or confirm identical content; if different content already exists under that name, retain the staged update and report the conflict instead of replacing the installed Skill. Never delete the original as an update strategy.
-
-## 1. Start the bundled internal engine
-
-Resolve the directory containing this `SKILL.md` to an absolute path named `SKILL_DIR`. Do not infer it from the conversation's current working directory. Standard Agent Skills installers copy the source-form Skill, while the Python package installer creates a compact runtime-bound bundle. Both forms provide the same launcher:
+Resolve the directory containing this `SKILL.md` to an absolute `SKILL_DIR`. Do not infer it from the conversation working directory.
 
 ```text
 video-to-skill/
@@ -61,182 +40,156 @@ video-to-skill/
 ├── scripts/
 │   ├── video-to-skill
 │   └── video-to-skill.cmd
-├── pyproject.toml + src/ + scripts/video_to_skill.py   # source form
-└── runtime.json + scripts/engine.py                    # compact bundle form
+├── pyproject.toml + src/ + scripts/video_to_skill.py
+└── runtime.json + scripts/engine.py
 ```
 
-On POSIX hosts, bind the absolute launcher and verify it:
+On POSIX, bind and verify the absolute launcher:
 
 ```bash
 V2S_ENGINE="$SKILL_DIR/scripts/video-to-skill"
 "$V2S_ENGINE" --help
 ```
 
-On Windows hosts, use `scripts\video-to-skill.cmd` relative to `SKILL_DIR`. In source form, the first launcher call automatically creates a fingerprinted private runtime in the user's platform data directory and installs the local engine into it; later calls reuse it. The fingerprint covers the Python minor version, project metadata, bootstrap engine, launchers, and installable source files. Before reuse, the launcher runs a bounded core import probe. If that probe detects a damaged runtime, the launcher removes and rebuilds that one runtime once; it never enters an automatic repair loop. In compact bundle form, `runtime.json` records the already-bound Python environment. The launcher owns both paths.
+On Windows, use `scripts\video-to-skill.cmd`. The launcher owns first-use bootstrap, its private Python runtime, bounded repair, and optional capability installation. Do not activate an environment, invoke a package manager, or use `eval`.
 
-Every Bash snippet below uses `"$V2S_ENGINE"` as shorthand for that resolved absolute launcher. Substitute the actual absolute path in each process call rather than relying on a shell variable surviving between calls. Pass the launcher and every source or option as separate arguments; never concatenate source text into executable shell syntax or use `eval`.
+If the launcher is missing, report that the installed generator Skill is incomplete. If bootstrap reports a missing supported Python, network failure, or a compact bundle whose recorded runtime no longer exists, report that exact condition and request repair or reinstallation. Do not improvise a replacement environment or claim extraction occurred.
 
-Do not activate an environment, run a package manager yourself, or ask the user to run an internal command. The source launcher owns first-use bootstrap and repair; invoke it normally and let it report a missing supported Python or network failure. If the launcher itself is missing, report that the installed Skill is incomplete. If a compact bundle's recorded Python environment was removed, report that the bundle must be repaired or reinstalled. Do not pretend extraction occurred.
+Choose a durable workspace outside the generated output and installed Skill. Use the current host without asking when it is known.
 
-## 2. Resolve the complete source set
+## Run the durable workflow
 
-Run:
-
-```bash
-"$V2S_ENGINE" doctor
-"$V2S_ENGINE" inspect SOURCES...
-```
-
-Record the resolved item count, playlist order, duration, caption languages, unavailable items, expected ASR route, and likely visual route. Inspection is not a confirmation gate when the scope is ordinary and processing stays local.
-
-The source-form launcher keeps heavy local providers out of first-use setup. After inspection determines the evidence route, invoke only the capabilities that route needs:
+Start a new conversion:
 
 ```bash
-"$V2S_ENGINE" ensure-capability asr
-"$V2S_ENGINE" ensure-capability ocr
+"$V2S_ENGINE" run SOURCES... --workspace WORKSPACE --host codex
+"$V2S_ENGINE" run SOURCES... --workspace WORKSPACE --host claude
 ```
 
-Run `ensure-capability asr` only when one or more accessible items lack adequate captions and local transcription is required. Run `ensure-capability ocr` only when the chosen coding, UI, slide, diagram, or physical-procedure route needs machine-readable on-screen text; native multimodal viewing does not itself require OCR. Run `ensure-capability diarization` only when speaker separation is materially necessary. Each command is an internal, idempotent launcher operation: it installs the selected extra from this local source-form Skill into the same private runtime, verifies it with a bounded import probe, and suppresses package-manager details. It may download the selected provider's third-party dependencies, so do not install all capabilities speculatively. Never ask the user to run these commands or run `pip`.
-
-Infer the dominant source type per semantic section:
-
-| Type | Evidence priority | Investigation |
-|---|---|---|
-| Coding | Spoken intent, legible code state, edit and run results | Before/edit/after frames around changes, commands, errors, and fixes |
-| Software/UI | Labels, values, inputs, navigation, saved result | State-transition windows around consequential interactions |
-| Slides/lecture | Speech, slide text, diagrams, examples | Slide changes, OCR, and dense frames only for evolving diagrams |
-| Physical procedure | Object state, hand/tool action, before/after condition | Ordered state changes and safety-relevant omissions |
-| Mixed | Section-specific combination | Route each section independently |
-
-Do not turn those four behaviors into artifact quotas. Record a strong, medium, light, or unsupported capability level for learning, practice, application, and reference. A source may support all four user intents without needing four directories or four separate files.
-
-## 3. Extract or resume evidence
-
-Choose a workspace outside the shareable Skill package and run:
+Add `--project` only when the user requested project-local installation. Add `--output` only when the user supplied a portable output path. Resume without retransmitting sources or configuration:
 
 ```bash
-"$V2S_ENGINE" extract SOURCES... --workspace WORKSPACE
+"$V2S_ENGINE" run --workspace WORKSPACE
 ```
 
-Reuse the same workspace after interruption. Do not recreate it because one item failed. The workspace may contain media, subtitles, frames, databases, and agent observations; none of those raw artifacts belong in the shareable package.
+`run` performs every available deterministic transition and emits one JSON envelope.
 
-A workspace's input list is immutable. Resume it only with the same inputs. When an update introduces new or changed sources, create a separate linked workspace and merge the resulting capability records and provenance into the staged Skill; do not append the new inputs to the old workspace.
+### `actions-required`
 
-For each resolved course item, record complete, partial, failed, or skipped status. Do not silently omit inaccessible videos. A partial course can still produce a Skill when its coverage limits are explicit.
+Dispatch every independent action in the returned parallel group when the host supports workers.
 
-For an existing workspace, begin with:
+For a `dispatch-agent` action, use its exact `persona_hint`, absolute `task_path`, `role`, and task ID. Do not read or copy its packet through the main-agent conversation.
 
-```bash
-"$V2S_ENGINE" query WORKSPACE --inventory
-"$V2S_ENGINE" gaps WORKSPACE --format json
+Give the worker only:
+
+```text
+Use the assigned expert persona.
+Open TASK_PATH/task.json, packet.json, result-schema.json, and lease.json.
+Perform the bounded task from workspace evidence.
+Write the strict result to TASK_PATH/output/result.json.
+Run ENGINE submit WORKSPACE TASK_ID TASK_PATH/output/result.json yourself.
+Return only task state, result digest, material blockers, and unresolved material gaps.
 ```
 
-Treat the workspace as a queryable evidence corpus. Never load a long transcript wholesale.
+The worker may use bounded `context`, `contact-sheet`, `frames`, `query`, and `gaps` commands when the task packet permits them. It must never write SQLite directly, inspect unrelated workspace material, return private chain-of-thought, or send large semantic results and drafts through the main agent.
 
-## 4. Orchestrate expert investigation
+For an `ask-user` action, ask the supplied prompt with its supplied options. Write the selected option to the task's strict decision result, submit it, and do not reopen settled implementation details.
 
-When the host supports subagents, delegate bounded work with explicit expert personas and the strongest available multimodal/reasoning model:
+After all dispatched workers finish, call `run --workspace WORKSPACE` again. Repeat until `complete` or an ordinary command failure.
 
-- A senior multimodal evidence investigator for coding, UI, slides, or physical procedures, matched to each source type.
-- A principal learning-science and curriculum architect to turn the evidence graph into adaptive lessons and mastery checks.
-- A senior Agent Skill critic to audit grounding, progressive disclosure, safety, and host usability independently of the authoring pass.
+### `complete`
 
-Parallelize independent sources or sections. Give each investigator only its inventory row, synchronized context packet, contact sheet, open questions, and evidence budget. Require structured claims with evidence IDs, timestamps, confidence, and uncertainty; never request private chain-of-thought. The main agent owns cross-source terminology, conflicts, provenance, and the final installation.
+Report the installed Skill name and path, invocation, workspace path and retention, processed and failed source counts, source and semantic coverage, instructional-affordance coverage, critic repair count, build ID, and validation results.
 
-For one short source, one investigator plus an independent critic is enough. Do not create agents merely to restate deterministic CLI output.
+Make partial, inaccessible, skipped, retired, and failed sources visible in the completion summary. Distinguish source-acquisition coverage from semantic coverage and state any capability limits caused by missing evidence.
 
-## 5. Run the multimodal evidence loop
+End with one or two concrete next actions using the installed name:
 
-Set a bounded investigation budget that scales with semantic sections, source duration, information density, and visual activity. Fixed pass, window, and frame limits are safety valves rather than quality targets. Stop when material gaps close or remain explicitly partial; never claim completeness merely because the default budget was exhausted.
-
-For each source or semantic section:
-
-1. Retrieve the inventory and bounded context:
-
-```bash
-"$V2S_ENGINE" query WORKSPACE --source ID --section N
-"$V2S_ENGINE" context WORKSPACE --source ID --section N --format json
+```text
+/<course-skill> start                         # Claude Code
+$<course-skill> help me apply this to my work # Codex
 ```
 
-2. Generate a coarse chronological contact sheet:
+Do not claim completion from a worker message. Only the engine's `complete` envelope proves that canonical state compiled, validated, and installed.
 
-```bash
-"$V2S_ENGINE" contact-sheet WORKSPACE --source ID --section N
-```
+## Failure and recovery
 
-Open the resulting image with Claude Code or Codex's native multimodal file viewer. Do not infer visual content from filenames or OCR alone.
+Keep the workspace after success or failure. Never delete it merely to recover from an interrupted source, worker, review, validation, rendering, or installation stage.
 
-3. If a consequential action, edit, animation, or state change remains unclear, extract only the relevant dense window:
+Resume the same workspace after interruption. Reuse its immutable configuration, source snapshot, task directories, accepted canonical records, and completed work. Do not retransmit sources, choose a new output path, or create a replacement workspace to bypass a rejected task or conflict.
 
-```bash
-"$V2S_ENGINE" frames WORKSPACE --source ID --from SECONDS --to SECONDS --fps FLOAT
-```
+When a submission is rejected, preserve the task output and report the exact schema, lease, digest, evidence-scope, or snapshot error. Correct or redispatch only the affected durable task. Do not copy its large packet or result through the main-agent conversation.
 
-Start around 0.5 fps for slides and 1-2 fps for coding, UI, or physical actions. Identify the minimum before/action/after evidence.
+When a source fails, continue the remaining accessible sources and let the coverage ledger carry the loss. When all useful sources are inaccessible, stop after persisting the acquisition state and explain what authorization or source change is required.
 
-4. Store compact observations:
+When validation or compilation fails, retain the workspace and any safe staging artifact, report the failing gate, and resume after repair. When generated or installed content conflicts with the requested name, use the coordinator's durable `ask-user` naming decision. Never overwrite different content.
 
-```bash
-"$V2S_ENGINE" annotate WORKSPACE OBSERVATIONS_JSON
-```
+## Worker roles
 
-Each observation contains one falsifiable claim, `source_id`, start/end times, type, frame and transcript IDs, numeric confidence, observed/inferred/contradicted status, uncertainty, and producer identity.
+The logical workflow is `Analyze → Author → Review`. These are reasoning boundaries, not public commands or user-facing modes.
 
-5. Recompute gaps:
+### Analyze
 
-```bash
-"$V2S_ENGINE" gaps WORKSPACE --source ID --format json
-```
+Use a senior evidence and semantic-analysis expert. Combine high-recall extraction, terminology normalization, relation linking, materiality review, disposition accounting, conflict capture, and capability-ceiling analysis in one bounded role.
 
-Prioritize missing evidence for procedure steps, verification conditions, safety warnings, exact code or UI details, central decision rules, and source conflicts. Ignore decorative or redundant visual gaps.
+Preserve questions, claims, reasons, examples, analogies, definitions, distinctions, qualifications, counterpoints, predictions, recommendations, warnings, value judgments, and open questions. Preserve relations that answer, support, explain, exemplify, qualify, contrast, depend on, update, contradict, raise, or leave another unit unresolved.
 
-Use native host multimodal inspection before any hosted vision provider. Keep hosted vision disabled unless native viewing is unavailable or an authorized scale requirement justifies the privacy and usage cost.
+Use speech-first packets for interviews and talking heads. Inspect slides, code, UI, diagrams, or physical state only when visual evidence is material. For long courses, accept section-group tasks and then perform a dependent integration Analyze task without deleting source-specific semantic units.
 
-### Evidence rules
+The engine supplies the visual evidence index: first frame, scene-change frames, periodic fallback frames, perceptual-hash deduplication, OCR and type hints, plus bounded dense windows requested during investigation. Analyze supplies the semantic decision: propose at most 24 non-duplicate teaching candidates, each as one frame, one normalized crop, or an ordered two-to-four-frame sequence, only when it materially improves teaching or verification. Analyze never edits pixels or supplies an arbitrary image path; the engine validates the evidence IDs and deterministically materializes sanitized PNG candidates.
 
-- Speech can establish stated intent or explanation.
-- A visible-state claim needs visual evidence.
-- An action or transition normally needs temporally ordered before and after evidence.
-- A successful procedure needs the demonstrated action and an observable result.
-- Exact commands, labels, values, and code remain uncertain when not legible.
+Every semantic unit needs a stable ID, source and time range, kind, compact summary, materiality, disposition, modality, evidence IDs, observed-versus-inferred status, confidence, and uncertainty. Merged, context-only, and omitted material needs an explicit reason.
+
+### Author
+
+Use a principal learning-science and Agent Skill author. Read canonical semantic records from the task packet, design a thematic default and justified alternate paths, and write Markdown drafts directly inside the task output directory.
+
+Treat Learn, Practice, Apply, and Reference as evidence-bounded capability levels, not artifact quotas. Never exceed the Analyze capability ceiling.
+
+Complete the instructional-affordance ledger independently from semantic coverage. Account for learning objectives, misconceptions, retrieval and transfer prompts, focused exercises, success criteria, scored rubrics, progressive hints, retry, capstone synthesis, operational playbooks, expected states, validation, recovery, quick reference, and decision rules.
+
+Mark each affordance `provided`, `unsupported`, or `not-applicable` with a rationale. Strong capability claims require the complete corresponding surface; weaker or unsupported claims remain honest. Multiple affordances may live in one independently useful artifact.
+
+Give every artifact a stable ID, user job, supported behaviors, normal or after-attempt disclosure, independent loading reason, semantic-unit links, affordance links, destination path, draft path, and digest. Keep solutions and answer-bearing rubrics separate and after-attempt.
+
+Select only from the verified visual candidates in the Author packet. Retain a visual only when a specific artifact needs it, link the PNG from every `used_by` artifact, and bind it to claims that preserve the same visual or temporal evidence. Leave decorative, redundant, illegible, private, or text-recoverable candidates unused.
+
+### Review
+
+Use a fresh senior Agent Skill critic who is independent of the Author producer. Review the actual canonical drafts and records, not an author-supplied summary.
+
+Audit source-meaning retention and instructional-affordance retention separately, then grounding, uncertainty, disclosure, empty invocation, runtime behavior, safety, scope, source failures, and shareability. Inspect every selected teaching visual for necessity, legibility, context, ordering, privacy, evidence grounding, and on-demand loading.
+
+A failed Review completes its execution task but creates a new immutable Author revision and a fresh independent Review. Allow at most three repair cycles. Never weaken a capability claim merely to hide an affordance the evidence supports and the product needs.
+
+## Evidence rules
+
+- Speech establishes stated intent or explanation.
+- A visible-state claim requires visual evidence.
+- An action or transition normally requires ordered before and after evidence.
+- A successful procedure requires the action and an observable result.
+- Exact code, commands, labels, or values remain uncertain when illegible.
 - Two probes that add no evidence are a stopping signal, not permission to guess.
+- Low-confidence exact details never become authoritative instructions.
+- Source-acquisition coverage and semantic coverage remain separate.
+- Every material semantic unit receives a disposition.
+- Every included core or supporting unit appears in a grounded artifact.
 
-Use high confidence for independently corroborated evidence, medium for one clear appropriate modality, and low for ambiguous or incomplete evidence. Never turn low-confidence exact details into authoritative steps.
+Use native host multimodal inspection before any hosted vision provider. Keep hosted vision disabled unless native viewing is unavailable or the user authorized the privacy and cost boundary.
 
-## 6. Build the canonical semantic map
+## Authentication and secrets
 
-Before designing a curriculum, perform a high-recall pass that preserves:
+When a source needs login, negotiate authentication once for the complete run. Offer a named browser/profile, a local Netscape `cookies.txt`, or public items only. Set `VIDEO_TO_SKILL_COOKIES_FROM_BROWSER` only for the engine invocation and never request an account password.
 
-- questions, claims, reasons, examples, analogies, definitions, distinctions;
-- qualifications, counterpoints, predictions, recommendations, warnings;
-- value judgments and open questions; and
-- the relationships that answer, support, explain, exemplify, qualify, contrast, depend on, update, contradict, raise, or leave another unit unresolved.
+When browser authentication is authorized, let the engine decrypt browser cookies once, create a private temporary snapshot, and reuse isolated copies for source inspection and concurrent workers. A supplied cookie file is snapshotted rather than modified in place. The engine removes its temporary snapshots when the authentication session exits.
 
-Each semantic unit retains a stable ID, source ID, start and end time, speaker when known, kind, compact summary and detail, core/supporting/contextual/incidental materiality, included/merged/context-only/omitted disposition, modalities, evidence IDs, observed-versus-inferred status, confidence, and uncertainty. A merged, context-only, or omitted unit needs a reason; a merged unit identifies its retained target.
+On macOS, a browser keychain prompt may appear once. Repeated prompts during one engine invocation indicate a failed authentication session; stop and report the failure instead of repeatedly asking the user to approve access.
 
-Use four separate passes: high-recall extraction, terminology normalization and linking, materiality review, then curriculum design. Normalize only when equivalence is supported. Deduplicate presentation in curriculum views, never by deleting original semantic units.
+Treat cookies, headers, tokens, expiring URLs, and browser snapshots as runtime secrets. Never quote them back, place them in task packets or logs, persist them in the workspace, or include them in the generated Skill.
 
-Report source-acquisition coverage separately from semantic coverage. Every material semantic unit must have a disposition. Every included core or supporting unit must appear in a grounded course artifact.
+## Generated Skill contract
 
-## 7. Design the curriculum
-
-Use a thematic course as the default primary design. Set no fixed chapter count; split by semantic independence and learning value.
-
-After the semantic map is complete and before artifact authoring, propose two or three materially different designs when the source justifies them:
-
-1. source-faithful companion;
-2. thematic course, recommended by default; and
-3. application-first operating system.
-
-Ask the user to choose the learning experience, not a chapter count. Preserve the semantic map regardless of the choice. Alternate paths may reference the same canonical content without duplicating it.
-
-Create an artifact only when users may request it independently, it is rarely needed, it must be withheld, it is large enough to benefit from progressive disclosure, it represents a distinct workflow, or it uses a machine-readable format. Give every artifact a stable ID, supported behaviors, an explicit `normal` or `after-attempt` disclosure policy, use condition, independent loading reason, semantic-unit links, and grounded claims. If no independent loading reason exists, merge it with the nearest artifact.
-
-## 8. Generate the course-specific Skill
-
-Derive a lowercase hyphenated name under 64 characters unless the user supplied one. The shareable package and raw workspace must be separate directory trees.
-
-The course Skill must contain:
+The portable package and raw workspace must be separate trees. Every generated course Skill contains five fixed root records and at least one authored Markdown artifact. A representative evidence-justified package can contain:
 
 ```text
 <course-skill>/
@@ -244,103 +197,59 @@ The course Skill must contain:
 ├── source-map.md
 ├── sources.md
 ├── provenance.json
-└── build-manifest.json
+├── build-manifest.json
+├── chapters/
+│   └── <topic>.md
+├── exercises/
+│   └── <exercise>.md
+├── solutions/
+│   └── <exercise>.md
+├── playbooks/
+│   └── <workflow>.md
+├── reference/
+│   └── <decision-aid>.md
+├── learning-path.md
+├── glossary.md
+├── patterns.md
+├── cheatsheet.md
+└── assets/
+    └── <indispensable-image>.png
 ```
 
-Add content, learning paths, application guides, exercises, separate solutions, references, or indispensable teaching assets only when the evidence and independent loading boundaries justify them. Never include raw video, audio, subtitles, complete transcripts, databases, cookies, caches, secrets, or decorative frame collections.
+The five fixed root records are unconditional; the remaining entries illustrate supported artifact shapes rather than a directory quota. Use `chapters/` for independently loadable teaching units, `exercises/` for practice, `solutions/` for after-attempt answers and answer-bearing rubrics, `playbooks/` for operational application, `reference/` and the allowed root reference files for fast lookup, and `assets/` only for indispensable evidence-grounded PNGs. Generated Skill instructions must tell the runtime agent to open only the visual linked by the currently relevant artifact and never preload the asset directory. A capable source should normally produce several substantial artifacts across the behaviors it genuinely supports, while a compact source may justify fewer.
 
-Generate the strict machine-readable authoring contract outside the evidence workspace before writing a blueprint:
+Do not manufacture symmetrical directories, split files that always load together, or omit useful material merely to keep the package small. Every included artifact needs evidence links, covered affordances, and an independent loading reason. Never include raw video, audio, complete subtitles, transcripts, databases, cookies, caches, or decorative frame collections.
 
-```bash
-"$V2S_ENGINE" blueprint-schema --workspace WORKSPACE --output AUTHORING_JSON
-```
+### Content quality floor
 
-Read `AUTHORING_JSON` as an authoring envelope. Use its `blueprint_schema` to validate field shapes and copy `blueprint_seed` into a separate `BLUEPRINT_JSON`. Preserve the seed's `sources` and `coverage_ledger` exactly; complete only the semantic fields, artifacts, claims, principles, and limitations. Do not pass the authoring envelope itself to `build-skill`.
+Generate a reusable capability product, not a transcript summary or a collection of thin index files. Preserve named frameworks, actionable principles, demonstrated techniques, source reasoning, examples, qualifications, counterpoints, warnings, failure modes, decision rules, and material open questions when the evidence contains them.
 
-The resulting V2 `CourseSkillBlueprint` separates structured sources, workspace-bound acquisition coverage, semantic units and relations, capability levels, curriculum paths, interaction behavior, claims, justified artifacts, and core principles. It does not require one artifact per behavior. Exercises that have solutions keep those solutions separate and unindexed. When `build-skill` receives `--workspace`, it rejects omitted, invented, retired, inaccessible, or failed course entries and any coverage upgrade that disagrees with the persisted workspace.
+Make every independently loaded teaching artifact useful on its own. Give it a clear user job, the necessary source-grounded explanation, a concrete example when supported, and an appropriate retrieval or transfer prompt. Do not repeat the same shallow summary across `SKILL.md`, chapters, reference files, and playbooks.
 
-Assets are optional and minimal. Each selected image source must be a regular non-symlink file inside the declared workspace, be linked from a Markdown artifact, and have a visual or temporal provenance claim for that artifact. Give it a safe `assets/<name>.png` destination. The renderer rejects path escapes and unsafe sizes or formats, then decodes and re-encodes the image as metadata-free PNG; it never copies a raw frame byte-for-byte.
+For practice capability, include focused tasks, success criteria, progressive hints, retry, and a scored rubric at the depth supported by the source. Keep answers and answer-bearing rubrics separate and `after-attempt`.
 
-### Resident `SKILL.md`
+For application capability, include assumptions, decision points, operational steps, expected states, observable validation, and recovery guidance when the source supports them. Label generator-created adaptations, exercises, and conceptual workflows as inference rather than pretending the source demonstrated them.
 
-Mark generated course Skills with:
+For reference capability, prioritize compact decision rules, trade-offs, thresholds, defaults, tells, smells, and source pointers over a glossary-only surface. A glossary defines terms; a reference aid helps the user decide or act.
+
+Strong capability claims require their full instructional-affordance surface. Medium and light claims may be smaller but must remain useful. Mark unsupported or not-applicable affordances honestly instead of lowering a capability claim to hide missing product work.
+
+Mark generated Skills with:
 
 ```html
 <!-- video-to-skill:course-skill:v2 -->
 ```
 
-Keep the resident file concise and operational. It is a routing and teaching workflow, not a course summary. Include:
+Keep the resident `SKILL.md` concise and operational. On empty invocation it gives a course-specific welcome of no more than two short sentences, offers `start`, loads no supporting file, inspects no project, runs no command, creates no file, and waits.
 
-1. Scope and operating contract.
-2. An empty-invocation contract with a course-specific welcome of no more than two short sentences that offers `start`, loads no supporting file, inspects no project, runs no command, creates no file, and waits.
-3. One to three course-specific starter questions, used only for missing initial context.
-4. Adaptive learning, practice, application, and reference behavior without exposing a mode-selection menu to users.
-5. Evidence, inference, outside-knowledge, language, and honest uncertainty rules.
-6. The evidence-derived capability profile and a small set of evidence-linked core principles.
-7. The recommended thematic path, alternate paths, additional justified material, coverage limits, and pointers to the source map, sources, provenance, and build manifest.
+After the user begins, ask only missing course-specific context, using no more than three starter questions in one turn and at most one next-step question per later turn. Skip intake when the user already supplied enough context or asked a precise question.
 
-Treat chapters as teaching material rather than response scripts. Default to one useful cognitive move, one grounded example when useful, and one transfer or retrieval question. Do not dump a chapter or announce a formal lesson unless asked. After the initial context packet, ask at most one next-step question per turn.
+During use, adapt naturally across learning, practice, application, and reference without presenting a mode menu. Teach one useful cognitive move at a time, avoid dumping whole chapters unless asked, withhold solutions until an attempt or explicit request, and load only the smallest artifact needed.
 
-Use source-grounded material first. Mark teaching or application inference naturally. Use outside or current knowledge when the request calls for it while keeping it distinct from the source; ask permission only for material external actions, private data, paid access, or an explicit source-only boundary.
+Use source-grounded material first, label generator-created exercises or adaptations as inference, distinguish outside or current knowledge, answer in the user's language, and preserve honest uncertainty.
 
-Use one canonical artifact language per build and respond in the user's language unless requested otherwise.
+Keep learner progress in the active conversation or host memory, never in the portable package. Keep failed and partial sources visible in `sources.md`, consequential claims traceable through `provenance.json`, and private local paths out of every shareable file.
 
-Keep learner progress in the active conversation or host memory, not in the shareable Skill package.
+The compiler derives the strict blueprint from canonical workspace state, reads artifact bodies by verified relative path and digest, renders outside the workspace, validates structure and behavior, and installs without overwriting different same-name content.
 
-### Supporting artifacts
-
-Artifacts follow semantic and loading boundaries rather than video or behavior quotas. They may contain a core idea, source reasoning, examples, qualifications, misconceptions, diagnostic prompts, transfer prompts, and deepening prompts, but the runtime selects what is useful instead of emitting the template.
-
-Exercises and solutions are separate. Label exercises, hints, rubrics, and conceptual application workflows as generator-created when the source did not demonstrate them. Mark solutions and answer-bearing rubrics `after-attempt`; do not rely on their directory name or index them where the consuming agent might load them before an attempt.
-
-### Provenance
-
-`provenance.json` uses schema version 1. Every consequential claim declares:
-
-- stable ID, rendered file, kind, and compact derivative summary;
-- `inferred` boolean and high/medium/low confidence;
-- one or more evidence windows with `source_id`, numeric start/end, `modalities`, and `evidence_ids`.
-
-Use modality values `speech`, `visual`, `ocr`, `metadata`, and `temporal`. The legacy singular `modality` remains readable, but new output uses the `modalities` list.
-
-`sources.md` records each source's title, creator, platform, canonical URL when available, complete/partial/failed/skipped coverage, limitations, and timestamped claim map. Never expose private local paths.
-
-## 9. Critique, build, validate, and install
-
-Run an independent critic pass over the blueprint. Check what important source meaning was lost, not only whether retained claims are grounded. Verify that every material semantic unit is accounted for; artifact boundaries have independent loading reasons; the thematic and alternate paths fit the source; capability levels are honest; empty invocation is inviting and side-effect free; solutions are withheld; source failures and uncertainty remain visible; each consequential claim uses the right modality; and no raw workspace artifact is planned for the package.
-
-For a new full conversion, use the one internal build operation. It renders a new portable artifact, enforces workspace separation, validates the package and code fences, installs it into the active host, and returns the invocation:
-
-```bash
-"$V2S_ENGINE" build-skill BLUEPRINT_JSON --host claude --workspace WORKSPACE --output STAGED_SKILL
-"$V2S_ENGINE" build-skill BLUEPRINT_JSON --host codex --workspace WORKSPACE --output STAGED_SKILL
-```
-
-Choose the current host without asking when it is known. Omit `--output` only when the default `./generated-skills/<name>` does not already exist. Add `--project` only when the user requested project-local installation; user scope is the default.
-
-If build or validation fails, the command reports the error and retains any rendered artifact for inspection without installing it. Repair the blueprint, choose a fresh output path for the next attempt, and rerun the build. Use at most three repair cycles. Never claim success while errors remain.
-
-For update/fold-in, keep the staged semantic-merge workflow. Validate the updated staging directory. Use the installer only for a fresh target name or an idempotent identical install:
-
-```bash
-"$V2S_ENGINE" validate STAGED_SKILL --check-code
-"$V2S_ENGINE" install-generated STAGED_SKILL --host claude
-"$V2S_ENGINE" install-generated STAGED_SKILL --host codex
-```
-
-The build operation also writes `source-map.md`, V2 `provenance.json`, and `build-manifest.json`. The manifest records a stable build ID, optional parent build ID, generator version, artifact language, selected curriculum, source, workspace, and semantic-map digests, plus the generated hash and stable artifact ID of every managed file.
-
-The build operation and installer own discovery of the Claude Code or Codex Skill root, conflict detection, staging, validation, and atomic installation. They never overwrite different same-name content. Regeneration compares previous generated hashes, current possibly human-edited files, and a new staged build; only unchanged generated files are safe to replace. Preserve unmanaged files and stage human-edited conflicts. For an actual update conflict, return the validated staged artifact and exact conflict instead of claiming the installed version changed.
-
-## Completion report
-
-Return the installed Skill name and path, invocation form, workspace path and retention state, processed/partial/failed source counts, source-acquisition and semantic-coverage results, selected curriculum, files created, unresolved evidence gaps, critic repairs, build ID, and final structural, semantic, and behavior validation results.
-
-Show the next action as:
-
-```text
-/<course-skill> 从第一课开始教我          # Claude Code
-$<course-skill> 帮我应用到当前项目        # Codex
-```
-
-Never make the user run an extraction, keyframe, annotation, validation, or installation command themselves.
+Keep the workspace by default. `clean` remains an explicit user action.

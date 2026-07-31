@@ -42,6 +42,8 @@ Successful refreshed inspection tombstones a source missing from the latest inve
 
 Baseline visual events are the scene and periodic candidates produced by deterministic extraction. A successful visual refresh replaces only that source's baseline origin. Dense frames requested by the host are stored with investigation origin and survive baseline refreshes or later visual-stage failures; an existing visual ID cannot silently change origin.
 
+Teaching-asset selection is a separate publication pipeline. Analyze proposes an evidence-grounded frame, normalized crop, or ordered two-to-four-frame sequence; deterministic code validates the frame IDs, decodes and composes the image, removes metadata, emits PNG, and records its digest. Author selects only from those immutable candidates and must link each selection from its consuming artifacts, while Review audits necessity, legibility, context, privacy, and on-demand loading. The generated Skill receives only selected sanitized images, never the baseline or dense-frame collections.
+
 `coverage.json` schema version 2 aggregates the persisted inspection reports into a course-completeness proof, count totals, disclaimers, active source coverage, retired-source tombstones, and warnings. Completeness remains unproven when the expected count is unknown or any expected entry is inaccessible or failed.
 
 Media and frames are private, reproducible cache artifacts. `clean` removes those files but not the database, captions, manifests, or generated skill.

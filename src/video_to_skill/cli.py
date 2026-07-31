@@ -17,19 +17,13 @@ from video_to_skill.agentic import (
     ingest_annotations,
 )
 from video_to_skill.config import Settings, load_settings
+from video_to_skill.coordinator import advance_run, submit_workspace_result
 from video_to_skill.doctor import diagnostics_ok, run_diagnostics
 from video_to_skill.errors import ProcessingError, VideoToSkillError
 from video_to_skill.evaluation import (
     evaluate_workspace,
     load_labels,
     render_evaluation_report,
-)
-from video_to_skill.generation import (
-    blueprint_authoring_payload,
-    blueprint_from_json,
-    encode_blueprint_authoring_payload,
-    render_course_skill_package,
-    validate_blueprint_against_workspace,
 )
 from video_to_skill.installation import (
     SkillHost,
@@ -58,7 +52,7 @@ from video_to_skill.query import (
 )
 from video_to_skill.sources import describe_source
 from video_to_skill.transcript import load_transcriber
-from video_to_skill.utils import atomic_write_text, format_timestamp
+from video_to_skill.utils import format_timestamp
 from video_to_skill.validation import render_validation_report, validate_skill
 from video_to_skill.workspace import Workspace
 
@@ -641,6 +635,94 @@ def gaps(
         typer.echo(_render_gaps(visible), nl=False)
 
 
+@app.command("run")
+def run_workflow(
+    workspace: Annotated[
+        Path,
+        typer.Option("--workspace", help="Durable evidence and orchestration workspace."),
+    ],
+    sources: Annotated[
+        list[str] | None,
+        typer.Argument(help="URLs or local media paths; omit when resuming a workspace."),
+    ] = None,
+    host: Annotated[
+        SkillHost | None,
+        typer.Option(
+            "--host",
+            case_sensitive=False,
+            help="Install for claude or codex; required only for a new run.",
+        ),
+    ] = None,
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", help="Portable generated Skill path."),
+    ] = None,
+    project: Annotated[
+        bool | None,
+        typer.Option(
+            "--project/--user",
+            help="Installation scope; omit on resume to reuse the workspace setting.",
+        ),
+    ] = None,
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+    language: Annotated[str | None, typer.Option("--language")] = None,
+    visual_profile: Annotated[
+        str | None,
+        typer.Option("--visual-profile", help="adaptive, always, or transcript"),
+    ] = None,
+    max_workers: Annotated[int | None, typer.Option("--max-workers")] = None,
+    refresh: Annotated[bool, typer.Option("--refresh", help="Re-inspect source metadata.")] = False,
+    skip_official: Annotated[
+        bool,
+        typer.Option("--skip-official", help="Do not call skills-ref during final validation."),
+    ] = False,
+) -> None:
+    """Advance deterministic work until agent action is required or the Skill is complete."""
+
+    try:
+        settings = _settings(
+            config,
+            language=language,
+            visual_profile=visual_profile,
+            max_workers=max_workers,
+        )
+        envelope = advance_run(
+            sources=list(sources or []),
+            workspace_path=workspace,
+            settings=settings,
+            host=host,
+            output=output,
+            project=project,
+            refresh=refresh,
+            run_official_validation=not skip_official,
+            progress=lambda message: typer.echo(message, err=True),
+        )
+    except (VideoToSkillError, ValueError) as exc:
+        typer.echo(f"ERROR: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    typer.echo(envelope.model_dump_json(indent=2))
+
+
+@app.command("submit")
+def submit_work_result(
+    workspace: Annotated[Path, typer.Argument(help="Durable orchestration workspace.")],
+    task_id: Annotated[str, typer.Argument(help="Task identity returned by run.")],
+    result_file: Annotated[
+        Path,
+        typer.Argument(help="Role-specific JSON result inside the task output directory."),
+    ],
+) -> None:
+    """Validate and atomically persist one worker or user-decision result."""
+
+    try:
+        evidence = Workspace.open(workspace)
+        receipt = submit_workspace_result(evidence, task_id, result_file)
+    except (VideoToSkillError, ValueError) as exc:
+        typer.echo(f"ERROR: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    typer.echo(receipt.model_dump_json(indent=2))
+
+
 @app.command()
 def validate(
     skill_directory: Annotated[Path, typer.Argument(help="Generated skill folder.")],
@@ -796,177 +878,6 @@ def install_generated(
         raise typer.Exit(2) from exc
     scope = "project" if project else "user"
     typer.echo(f"{status.capitalize()}: {path} ({host.value}, {scope})")
-
-
-@app.command("blueprint-schema")
-def blueprint_schema(
-    workspace: Annotated[
-        Path | None,
-        typer.Option(
-            "--workspace",
-            help=(
-                "Persisted evidence workspace whose full sanitized source and inspection "
-                "ledger should be preseeded."
-            ),
-        ),
-    ] = None,
-    output: Annotated[
-        Path | None,
-        typer.Option(
-            "--output",
-            help="Write the bounded JSON authoring contract atomically instead of stdout.",
-        ),
-    ] = None,
-) -> None:
-    """Emit the strict blueprint schema and an optional workspace-derived authoring seed."""
-
-    try:
-        evidence = Workspace.open(workspace) if workspace is not None else None
-        encoded = encode_blueprint_authoring_payload(blueprint_authoring_payload(evidence))
-        if output is None:
-            typer.echo(encoded)
-            return
-        target = output.expanduser().resolve()
-        if target.exists():
-            raise ProcessingError(
-                f"Blueprint authoring output already exists: {target}. Choose a new path."
-            )
-        atomic_write_text(target, encoded + "\n")
-    except VideoToSkillError as exc:
-        typer.echo(f"ERROR: {exc}", err=True)
-        raise typer.Exit(2) from exc
-    typer.echo(f"Blueprint authoring contract: {target}")
-
-
-@app.command("build-skill")
-def build_skill(
-    blueprint: Annotated[
-        Path,
-        typer.Argument(
-            help=(
-                "CourseSkillBlueprint JSON authored from `blueprint-schema`; when "
-                "--workspace is set, preserve its preseeded source ledger exactly."
-            )
-        ),
-    ],
-    host: Annotated[
-        SkillHost,
-        typer.Option(
-            "--host",
-            case_sensitive=False,
-            help="Validate and install for claude or codex.",
-        ),
-    ],
-    output: Annotated[
-        Path | None,
-        typer.Option(
-            "--output",
-            help="Portable artifact path; defaults to ./generated-skills/<name>.",
-        ),
-    ] = None,
-    workspace: Annotated[
-        Path | None,
-        typer.Option(
-            "--workspace",
-            help=(
-                "Persisted evidence workspace used to verify every active, retired, "
-                "inaccessible, and failed course entry before rendering."
-            ),
-        ),
-    ] = None,
-    project: Annotated[
-        bool,
-        typer.Option(
-            "--project",
-            help="Install into the current project instead of the user Skill directory.",
-        ),
-    ] = False,
-    skip_official: Annotated[
-        bool,
-        typer.Option("--skip-official", help="Do not call skills-ref if installed."),
-    ] = False,
-    as_json: Annotated[bool, typer.Option("--json", help="Emit the completion record.")] = False,
-) -> None:
-    """Verify the full-course blueprint, then render, validate, and safely install it."""
-
-    generated: Path | None = None
-    evidence_workspace: Workspace | None = None
-    ignored_unverified_ledger = False
-    try:
-        specification = blueprint_from_json(blueprint)
-        if workspace is not None:
-            evidence_workspace = Workspace.open(workspace)
-            validate_blueprint_against_workspace(specification, evidence_workspace)
-        elif specification.coverage_ledger is not None:
-            specification = specification.model_copy(update={"coverage_ledger": None})
-            ignored_unverified_ledger = True
-        destination = output or Path.cwd() / "generated-skills" / specification.name
-        generated = render_course_skill_package(
-            specification,
-            destination,
-            workspace_root=evidence_workspace.root if evidence_workspace is not None else None,
-        )
-        report = validate_skill(
-            generated,
-            run_official=not skip_official,
-            check_code=True,
-        )
-        if not report.valid:
-            raise ProcessingError(render_validation_report(report))
-        root = host_skill_root(host, project=project)
-        installed, status = install_generated_skill(generated, root)
-    except VideoToSkillError as exc:
-        retained = f"\nGenerated artifact retained at: {generated}" if generated else ""
-        typer.echo(f"ERROR: {exc}{retained}", err=True)
-        raise typer.Exit(2) from exc
-
-    payload = {
-        "name": specification.name,
-        "generated_path": str(generated),
-        "installed_path": str(installed),
-        "installation_status": status,
-        "host": host.value,
-        "scope": "project" if project else "user",
-        "valid": True,
-        "workspace_verified": evidence_workspace is not None,
-        "course_coverage": (
-            specification.coverage_ledger.state
-            if evidence_workspace is not None and specification.coverage_ledger is not None
-            else "unverified"
-        ),
-        "warnings": (
-            []
-            if evidence_workspace is not None
-            else [
-                (
-                    "No --workspace was supplied; the unverified blueprint coverage ledger "
-                    "was omitted from the package."
-                    if ignored_unverified_ledger
-                    else (
-                        "No --workspace was supplied; full-course source and inspection "
-                        "coverage was not independently verified."
-                    )
-                )
-            ]
-        ),
-    }
-    if as_json:
-        typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
-    else:
-        typer.echo(
-            f"Built and {status}: {specification.name}\n"
-            f"Portable artifact: {generated}\n"
-            f"Installed Skill: {installed}\n"
-            + (
-                f"Coverage verification: {specification.coverage_ledger.state}\n"
-                if evidence_workspace is not None and specification.coverage_ledger is not None
-                else (
-                    "Coverage verification: NOT PERFORMED; rebuild with --workspace "
-                    "before claiming full-course coverage.\n"
-                )
-            )
-            + f"Invoke with {'/' if host == SkillHost.CLAUDE else '$'}{specification.name}"
-        )
 
 
 def run() -> None:
