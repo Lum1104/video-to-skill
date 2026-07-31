@@ -959,11 +959,7 @@ class Workspace:
         output_specs = list(canonical_outputs)
         for _kind, _record_id, source_path in output_specs:
             source = source_path.resolve()
-            if (
-                not source.is_file()
-                or source.is_symlink()
-                or not is_within(source, task_output)
-            ):
+            if not source.is_file() or source.is_symlink() or not is_within(source, task_output):
                 raise ProcessingError(
                     "Canonical outputs must be regular files in the task output directory"
                 )
@@ -1004,7 +1000,9 @@ class Workspace:
                         (kind, record_id),
                     ).fetchone()
                     revision = int(head["revision"]) + 1 if head is not None else 1
-                    suffix = source_path.suffix if source_path.suffix in {".json", ".md"} else ".data"
+                    suffix = (
+                        source_path.suffix if source_path.suffix in {".json", ".md"} else ".data"
+                    )
                     destination = (
                         self.analysis_dir
                         / "records"

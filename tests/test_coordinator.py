@@ -50,9 +50,7 @@ def test_run_and_submit_complete_without_main_agent_data_forwarding(
     assert author_action.role == "author"
     assert "transcript" not in author_envelope.model_dump_json()
     author_task = workspace.get_work_item(author_action.task_id)
-    lease = json.loads(
-        (author_action.task_path / "lease.json").read_text(encoding="utf-8")
-    )
+    lease = json.loads((author_action.task_path / "lease.json").read_text(encoding="utf-8"))
     draft = author_action.task_path / "output" / "course.md"
     draft.write_text(
         "# Evidence-Updated Conviction\n\nUse retrieval, practice, application, and reference.\n",
@@ -76,9 +74,7 @@ def test_run_and_submit_complete_without_main_agent_data_forwarding(
     [review_action] = review_envelope.actions
     assert review_action.role == "review"
     review_task = workspace.get_work_item(review_action.task_id)
-    review_lease = json.loads(
-        (review_action.task_path / "lease.json").read_text(encoding="utf-8")
-    )
+    review_lease = json.loads((review_action.task_path / "lease.json").read_text(encoding="utf-8"))
     review_result = _review_result(
         task_id=review_task.id,
         lease_token=str(review_lease["lease_token"]),

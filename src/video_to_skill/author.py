@@ -70,8 +70,7 @@ def plan_author_task(
             "and after-attempt. Do not exceed Analyze capability ceilings."
         ),
         "canonical_records": {
-            kind: {"path": path, "digest": digest}
-            for kind, (path, digest) in records.items()
+            kind: {"path": path, "digest": digest} for kind, (path, digest) in records.items()
         },
         "affordance_catalog": AFFORDANCE_CATALOG,
     }
@@ -140,9 +139,7 @@ def _validate_author_result(
     }
     for mode, level in levels.items():
         if _LEVEL_RANK[level] > _LEVEL_RANK[ceilings[mode]]:
-            raise ProcessingError(
-                f"Author {mode} capability exceeds the Analyze evidence ceiling"
-            )
+            raise ProcessingError(f"Author {mode} capability exceeds the Analyze evidence ceiling")
     represented: set[str] = set()
     task_output = (workspace.tasks_dir / task.id / "output").resolve()
     for artifact in result.artifacts:
@@ -150,19 +147,14 @@ def _validate_author_result(
             raise ProcessingError(f"Artifact {artifact.id} references unknown semantic units")
         represented.update(artifact.semantic_unit_ids)
         draft = (task_output / artifact.draft_path).resolve()
-        if (
-            not draft.is_file()
-            or draft.is_symlink()
-            or not draft.is_relative_to(task_output)
-        ):
+        if not draft.is_file() or draft.is_symlink() or not draft.is_relative_to(task_output):
             raise ProcessingError(f"Artifact {artifact.id} draft is outside its task output")
         if hash_file(draft) != artifact.draft_sha256:
             raise ProcessingError(f"Artifact {artifact.id} draft digest does not match")
     required_units = {
         unit.id
         for unit in units
-        if unit.materiality in {"core", "supporting"}
-        and unit.disposition == "included"
+        if unit.materiality in {"core", "supporting"} and unit.disposition == "included"
     }
     if missing := required_units - represented:
         raise ProcessingError(
@@ -192,18 +184,14 @@ def _validate_author_result(
         }
         for evidence in claim.evidence:
             if evidence.source_id not in allowed_evidence_by_source:
-                raise ProcessingError(
-                    f"Claim {claim.id} evidence references an unrelated source"
-                )
+                raise ProcessingError(f"Claim {claim.id} evidence references an unrelated source")
             if not set(evidence.evidence_ids) <= allowed_evidence_by_source[evidence.source_id]:
                 raise ProcessingError(
                     f"Claim {claim.id} references evidence outside its semantic units"
                 )
             source = sources[evidence.source_id]
             if source.duration is not None and evidence.end > source.duration:
-                raise ProcessingError(
-                    f"Claim {claim.id} evidence extends beyond source duration"
-                )
+                raise ProcessingError(f"Claim {claim.id} evidence extends beyond source duration")
 
 
 def submit_author_result(
@@ -236,9 +224,7 @@ def submit_author_result(
             "scope": result.scope,
             "artifact_language": result.artifact_language,
             "prerequisites": result.prerequisites,
-            "core_principles": [
-                item.model_dump(mode="json") for item in result.core_principles
-            ],
+            "core_principles": [item.model_dump(mode="json") for item in result.core_principles],
             "limitations": result.limitations,
             "curriculum_decision_required": result.curriculum_decision_required,
             "curriculum_decision_summary": result.curriculum_decision_summary,
@@ -274,9 +260,7 @@ def submit_author_result(
         ("assets", "default", assets_path),
     ]
     for artifact in result.artifacts:
-        canonical_outputs.append(
-            ("artifact-draft", artifact.id, output / artifact.draft_path)
-        )
+        canonical_outputs.append(("artifact-draft", artifact.id, output / artifact.draft_path))
     accepted, _records = workspace.accept_work_result(
         task_id=task_id,
         lease_token=result.lease_token,

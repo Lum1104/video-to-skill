@@ -202,10 +202,7 @@ def test_long_course_analyze_tasks_are_bounded_section_groups(tmp_path: Path) ->
 
     assert len(tasks) == 4
     assert all(task.scope["kind"] == "section-group" for task in tasks)
-    assert max(
-        len(task.scope["source_sections"]["source"])
-        for task in tasks
-    ) <= 8
+    assert max(len(task.scope["source_sections"]["source"]) for task in tasks) <= 8
 
 
 def test_analyze_integration_reuses_only_shard_evidence(tmp_path: Path) -> None:
@@ -236,9 +233,9 @@ def test_analyze_integration_reuses_only_shard_evidence(tmp_path: Path) -> None:
         completed.append(submit_analyze_result(workspace, task.id, result_path))
 
     integration = plan_analyze_integration_task(workspace, run, completed)
-    packet = json.loads(
-        (workspace.root / integration.packet_path).read_text(encoding="utf-8")
-    )["payload"]
+    packet = json.loads((workspace.root / integration.packet_path).read_text(encoding="utf-8"))[
+        "payload"
+    ]
 
     assert set(packet["allowed_evidence_ids"]) == expected_evidence_ids
     assert set(packet["allowed_evidence_by_source"]["source"]) == expected_evidence_ids

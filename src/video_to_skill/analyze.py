@@ -30,11 +30,7 @@ ANALYZE_PERSONA = (
 
 def _section_packet(workspace: Workspace, source_id: str, ordinal: int) -> dict[str, Any]:
     section = next(
-        (
-            item
-            for item in workspace.semantic_segments(source_id)
-            if item.ordinal == ordinal
-        ),
+        (item for item in workspace.semantic_segments(source_id) if item.ordinal == ordinal),
         None,
     )
     if section is None:
@@ -150,9 +146,7 @@ def plan_analyze_tasks(workspace: Workspace, run: AnalysisRun) -> list[WorkItem]
                 "Use only evidence IDs in allowed_evidence_ids and record uncertainty."
             ),
             "sources": [
-                source.model_dump(mode="json")
-                for source in sources
-                if source.id in source_sections
+                source.model_dump(mode="json") for source in sources if source.id in source_sections
             ],
             "sections": section_packets,
             "allowed_evidence_ids": allowed_evidence_ids,
@@ -220,19 +214,11 @@ def plan_analyze_integration_task(
                 }
             )
             for source_id in sorted(
-                {
-                    unit.source_id
-                    for result in shard_results
-                    for unit in result.semantic_units
-                }
+                {unit.source_id for result in shard_results for unit in result.semantic_units}
             )
         },
         "required_semantic_unit_ids": sorted(
-            {
-                unit.id
-                for result in shard_results
-                for unit in result.semantic_units
-            }
+            {unit.id for result in shard_results for unit in result.semantic_units}
         ),
     }
     return workspace.ensure_work_item(
@@ -279,10 +265,7 @@ def _validate_analyze_evidence(
         .get("allowed_evidence_by_source", {})
         .items()
     }
-    scoped_sources = {
-        source_id
-        for source_id in task.scope.get("source_sections", {})
-    }
+    scoped_sources = {source_id for source_id in task.scope.get("source_sections", {})}
     known_sources = {source.id: source for source in workspace.list_sources()}
     if not scoped_sources:
         scoped_sources = set(known_sources)
@@ -291,24 +274,19 @@ def _validate_analyze_evidence(
             raise ProcessingError(
                 f"Semantic unit {unit.id} references source outside its Analyze task"
             )
-        if (
-            not set(unit.evidence_ids) <= allowed
-            or not set(unit.evidence_ids) <= allowed_by_source.get(unit.source_id, set())
-        ):
+        if not set(unit.evidence_ids) <= allowed or not set(
+            unit.evidence_ids
+        ) <= allowed_by_source.get(unit.source_id, set()):
             raise ProcessingError(
                 f"Semantic unit {unit.id} references evidence outside its Analyze packet"
             )
         source = known_sources[unit.source_id]
         if source.duration is not None and unit.end > source.duration:
-            raise ProcessingError(
-                f"Semantic unit {unit.id} extends beyond source duration"
-            )
+            raise ProcessingError(f"Semantic unit {unit.id} extends beyond source duration")
     expected_integrated = bool(task.scope.get("integrated"))
     if result.integrated != expected_integrated:
         raise ProcessingError("Analyze result integration flag disagrees with its task")
-    if set(result.coverage.source_ids) != {
-        unit.source_id for unit in result.semantic_units
-    }:
+    if set(result.coverage.source_ids) != {unit.source_id for unit in result.semantic_units}:
         raise ProcessingError("Semantic coverage source IDs disagree with submitted units")
     required_unit_ids = set(packet["payload"].get("required_semantic_unit_ids", []))
     submitted_unit_ids = {unit.id for unit in result.semantic_units}
@@ -319,18 +297,10 @@ def _validate_analyze_evidence(
         )
     counts = {
         "core_units": sum(unit.materiality == "core" for unit in result.semantic_units),
-        "supporting_units": sum(
-            unit.materiality == "supporting" for unit in result.semantic_units
-        ),
-        "contextual_units": sum(
-            unit.materiality == "contextual" for unit in result.semantic_units
-        ),
-        "incidental_units": sum(
-            unit.materiality == "incidental" for unit in result.semantic_units
-        ),
-        "included_units": sum(
-            unit.disposition == "included" for unit in result.semantic_units
-        ),
+        "supporting_units": sum(unit.materiality == "supporting" for unit in result.semantic_units),
+        "contextual_units": sum(unit.materiality == "contextual" for unit in result.semantic_units),
+        "incidental_units": sum(unit.materiality == "incidental" for unit in result.semantic_units),
+        "included_units": sum(unit.disposition == "included" for unit in result.semantic_units),
         "merged_units": sum(unit.disposition == "merged" for unit in result.semantic_units),
         "context_only_units": sum(
             unit.disposition == "context-only" for unit in result.semantic_units
@@ -356,14 +326,10 @@ def _validate_merge_graph(units: list[SemanticUnit]) -> None:
             visited.add(current.id)
             assert current.merged_into is not None
             if current.merged_into not in by_id:
-                raise ProcessingError(
-                    f"Semantic unit {current.id} merges into an unknown unit"
-                )
+                raise ProcessingError(f"Semantic unit {current.id} merges into an unknown unit")
             current = by_id[current.merged_into]
         if current.disposition != "included":
-            raise ProcessingError(
-                f"Semantic unit {unit.id} must merge into an included unit"
-            )
+            raise ProcessingError(f"Semantic unit {unit.id} must merge into an included unit")
 
 
 def submit_analyze_result(

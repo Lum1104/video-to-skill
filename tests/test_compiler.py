@@ -119,9 +119,7 @@ def _compiled_workspace(tmp_path: Path, *, review_passes: bool = True) -> Worksp
         )
         canonical_outputs.append(("artifact-draft", artifact.id, draft))
     records = {
-        "semantic-map": [
-            item.model_dump(mode="json") for item in blueprint.semantic_units
-        ],
+        "semantic-map": [item.model_dump(mode="json") for item in blueprint.semantic_units],
         "semantic-relations": [
             item.model_dump(mode="json") for item in blueprint.semantic_relations
         ],
@@ -133,20 +131,14 @@ def _compiled_workspace(tmp_path: Path, *, review_passes: bool = True) -> Worksp
             "scope": blueprint.scope,
             "artifact_language": blueprint.artifact_language,
             "prerequisites": blueprint.prerequisites,
-            "core_principles": [
-                item.model_dump(mode="json") for item in blueprint.core_principles
-            ],
+            "core_principles": [item.model_dump(mode="json") for item in blueprint.core_principles],
             "limitations": blueprint.limitations,
         },
         "curriculum": blueprint.curriculum.model_dump(mode="json"),
         "interaction": blueprint.interaction.model_dump(mode="json"),
         "capability-profile": blueprint.capability_profile.model_dump(mode="json"),
-        "artifact-plan": [
-            item.model_dump(mode="json") for item in artifact_specs
-        ],
-        "instructional-affordances": [
-            item.model_dump(mode="json") for item in affordances
-        ],
+        "artifact-plan": [item.model_dump(mode="json") for item in artifact_specs],
+        "instructional-affordances": [item.model_dump(mode="json") for item in affordances],
         "claims": [item.model_dump(mode="json") for item in blueprint.claims],
         "assets": [],
     }
@@ -206,7 +198,9 @@ def test_compiler_uses_digest_references_in_workspace_receipt(tmp_path: Path) ->
     receipt_text = (build_directory / "blueprint.json").read_text(encoding="utf-8")
     assert receipt.build_id in receipt_text
     assert "Observe both the action and its result" not in receipt_text
-    assert all(reference.draft_path.is_relative_to(Path("analysis")) for reference in receipt.artifacts)
+    assert all(
+        reference.draft_path.is_relative_to(Path("analysis")) for reference in receipt.artifacts
+    )
 
 
 def test_workspace_build_renders_validates_and_installs(tmp_path: Path) -> None:

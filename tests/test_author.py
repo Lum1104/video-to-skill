@@ -263,8 +263,10 @@ def test_author_task_persists_affordance_ledger_and_draft(tmp_path: Path) -> Non
     assert workspace.canonical_record("instructional-affordances") is not None
     canonical_draft = workspace.canonical_record("artifact-draft", "artifact-course")
     assert canonical_draft is not None
-    assert (workspace.root / canonical_draft.path).read_text(encoding="utf-8").startswith(
-        "# Evidence-Updated Conviction"
+    assert (
+        (workspace.root / canonical_draft.path)
+        .read_text(encoding="utf-8")
+        .startswith("# Evidence-Updated Conviction")
     )
 
 

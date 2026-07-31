@@ -106,9 +106,7 @@ class AnalyzeResult(OrchestrationModel):
             if not set(conflict.semantic_unit_ids) <= known:
                 raise ValueError("semantic conflicts reference unknown semantic units")
         material = [
-            unit
-            for unit in self.semantic_units
-            if unit.materiality in {"core", "supporting"}
+            unit for unit in self.semantic_units if unit.materiality in {"core", "supporting"}
         ]
         if self.coverage.material_units_accounted_for and any(
             unit.disposition not in {"included", "merged", "context-only", "omitted"}
@@ -178,9 +176,7 @@ REQUIRED_AFFORDANCES: dict[
 ] = {
     "learn": {
         "strong": frozenset(AFFORDANCE_CATALOG["learn"]),
-        "medium": frozenset(
-            {"learning-objectives", "retrieval-prompts", "transfer-prompts"}
-        ),
+        "medium": frozenset({"learning-objectives", "retrieval-prompts", "transfer-prompts"}),
         "light": frozenset({"retrieval-prompts"}),
         "unsupported": frozenset(),
     },
@@ -194,9 +190,7 @@ REQUIRED_AFFORDANCES: dict[
     },
     "apply": {
         "strong": frozenset(AFFORDANCE_CATALOG["apply"]),
-        "medium": frozenset(
-            {"operational-playbook", "expected-state", "validation"}
-        ),
+        "medium": frozenset({"operational-playbook", "expected-state", "validation"}),
         "light": frozenset({"operational-playbook"}),
         "unsupported": frozenset(),
     },
@@ -224,9 +218,7 @@ class InstructionalAffordance(OrchestrationModel):
             raise ValueError("instructional affordance kind does not belong to its mode")
         if self.status == "provided":
             if not self.artifact_ids or not self.semantic_unit_ids:
-                raise ValueError(
-                    "provided affordances require artifact and semantic-unit links"
-                )
+                raise ValueError("provided affordances require artifact and semantic-unit links")
         elif self.artifact_ids:
             raise ValueError("unsupported affordances cannot reference artifacts")
         return self
@@ -264,10 +256,7 @@ class ArtifactDraftSpec(OrchestrationModel):
         elif (
             len(path.parts) > 4
             or path.parts[0] in {"assets", "."}
-            or any(
-                not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", part)
-                for part in path.parts
-            )
+            or any(not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", part) for part in path.parts)
         ):
             raise ValueError("artifact collection path is unsafe or too deeply nested")
         return path.as_posix()
@@ -332,9 +321,7 @@ class AuthorResult(OrchestrationModel):
         known_affordances = set(affordance_ids)
         ledger_keys = [(item.mode, item.kind) for item in self.affordance_ledger]
         expected_keys = {
-            (mode, kind)
-            for mode, kinds in AFFORDANCE_CATALOG.items()
-            for kind in kinds
+            (mode, kind) for mode, kinds in AFFORDANCE_CATALOG.items() for kind in kinds
         }
         if set(ledger_keys) != expected_keys or len(ledger_keys) != len(expected_keys):
             raise ValueError(
@@ -350,9 +337,7 @@ class AuthorResult(OrchestrationModel):
             if not set(path.artifact_ids) <= known_artifacts:
                 raise ValueError("curriculum path references unknown artifacts")
             withheld = {
-                artifact.id
-                for artifact in self.artifacts
-                if artifact.disclosure == "after-attempt"
+                artifact.id for artifact in self.artifacts if artifact.disclosure == "after-attempt"
             }
             if set(path.artifact_ids) & withheld:
                 raise ValueError("curriculum paths cannot index after-attempt artifacts")
@@ -384,12 +369,8 @@ class AuthorResult(OrchestrationModel):
                 )
             if level == "unsupported" and provided:
                 raise ValueError(f"unsupported {mode} capability cannot provide affordances")
-        if self.curriculum_decision_required != (
-            self.curriculum_decision_summary is not None
-        ):
-            raise ValueError(
-                "material curriculum decisions require a concise decision summary"
-            )
+        if self.curriculum_decision_required != (self.curriculum_decision_summary is not None):
+            raise ValueError("material curriculum decisions require a concise decision summary")
         claim_ids = [claim.id for claim in self.claims]
         if len(claim_ids) != len(set(claim_ids)):
             raise ValueError("claim ids must be unique")

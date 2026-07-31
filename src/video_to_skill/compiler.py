@@ -208,28 +208,20 @@ def compile_workspace_blueprint(
             description=course["description"],
             scope=course["scope"],
             artifact_language=course["artifact_language"],
-            interaction=CourseInteraction.model_validate(
-                _canonical_json(workspace, "interaction")
-            ),
+            interaction=CourseInteraction.model_validate(_canonical_json(workspace, "interaction")),
             capability_profile=CapabilityProfile.model_validate(
                 _canonical_json(workspace, "capability-profile")
             ),
-            curriculum=CurriculumDesign.model_validate(
-                _canonical_json(workspace, "curriculum")
-            ),
+            curriculum=CurriculumDesign.model_validate(_canonical_json(workspace, "curriculum")),
             prerequisites=course.get("prerequisites", []),
             core_principles=[
-                CorePrinciple.model_validate(item)
-                for item in course.get("core_principles", [])
+                CorePrinciple.model_validate(item) for item in course.get("core_principles", [])
             ],
             semantic_units=semantic_units,
             semantic_relations=semantic_relations,
             artifacts=rendered_artifacts,
             assets=assets,
-            sources=[
-                CourseSkillSource.model_validate(item)
-                for item in raw_sources
-            ],
+            sources=[CourseSkillSource.model_validate(item) for item in raw_sources],
             coverage_ledger=CourseCoverageLedger.model_validate(seed["coverage_ledger"]),
             claims=claims,
             limitations=list(dict.fromkeys([*seed_limitations, *course_limitations])),
@@ -282,9 +274,7 @@ def build_workspace_skill(
     generated = output.expanduser().resolve()
     if generated.exists():
         try:
-            manifest = json.loads(
-                (generated / "build-manifest.json").read_text(encoding="utf-8")
-            )
+            manifest = json.loads((generated / "build-manifest.json").read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise ProcessingError(
                 f"Existing generated output is not this resumable build: {generated}"
@@ -323,9 +313,7 @@ def build_workspace_skill(
         host=host,
         scope="project" if project else "user",
         course_coverage=(
-            blueprint.coverage_ledger.state
-            if blueprint.coverage_ledger is not None
-            else "unproven"
+            blueprint.coverage_ledger.state if blueprint.coverage_ledger is not None else "unproven"
         ),
         validation_report_path=validation_path,
     )

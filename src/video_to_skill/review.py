@@ -158,9 +158,8 @@ def submit_review_result(
         raise ProcessingError("Review cannot identify the canonical Author producer")
     reviewer = result.producer.model_dump(mode="json")
     same_name = reviewer.get("name") == author_producer.get("name")
-    same_run = (
-        reviewer.get("run_id") is not None
-        and reviewer.get("run_id") == author_producer.get("run_id")
+    same_run = reviewer.get("run_id") is not None and reviewer.get("run_id") == author_producer.get(
+        "run_id"
     )
     if same_name or same_run:
         raise ProcessingError("Review producer must be independent of the Author producer")
@@ -173,18 +172,14 @@ def submit_review_result(
             "verdict": result.verdict,
             "reviewed_snapshot_digest": result.reviewed_snapshot_digest,
             "repair_cycle": task.scope["repair_cycle"],
-            "findings": [
-                finding.model_dump(mode="json") for finding in result.findings
-            ],
+            "findings": [finding.model_dump(mode="json") for finding in result.findings],
         },
     )
     atomic_write_json(
         behavior_path,
         {
             "passed": all(check.passed for check in result.behavior_checks),
-            "checks": [
-                check.model_dump(mode="json") for check in result.behavior_checks
-            ],
+            "checks": [check.model_dump(mode="json") for check in result.behavior_checks],
         },
     )
     accepted, _canonical = workspace.accept_work_result(

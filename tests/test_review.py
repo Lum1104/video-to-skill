@@ -86,7 +86,9 @@ def _review_result(
             id="empty-invocation",
             scenario="Invoke the generated Skill without a request.",
             passed=verdict == "pass",
-            summary="The Skill waits without side effects." if verdict == "pass" else "It loads files.",
+            summary="The Skill waits without side effects."
+            if verdict == "pass"
+            else "It loads files.",
         )
     ]
     if verdict == "fail":

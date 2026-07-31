@@ -65,9 +65,7 @@ def _run_configuration(
         raw_configuration = _load_json(path)
         if not isinstance(raw_configuration, dict):
             raise ProcessingError("Workspace run configuration must be a JSON object")
-        existing: dict[str, object] = {
-            str(key): item for key, item in raw_configuration.items()
-        }
+        existing: dict[str, object] = {str(key): item for key, item in raw_configuration.items()}
         configured_host = SkillHost(str(existing["host"]))
         if host is not None and host != configured_host:
             raise ProcessingError("Resume host differs from the workspace run configuration")
@@ -135,11 +133,7 @@ def _actions_required(workspace: Workspace, items: list[WorkItem]) -> RunEnvelop
             "Required workspace tasks failed: "
             + ", ".join(f"{item.id} ({item.failure_reason})" for item in failed)
         )
-    dispatchable = [
-        item
-        for item in items
-        if item.state in {WorkState.PENDING, WorkState.LEASED}
-    ]
+    dispatchable = [item for item in items if item.state in {WorkState.PENDING, WorkState.LEASED}]
     if not dispatchable:
         raise ProcessingError("Coordinator reached an incomplete stage without dispatchable tasks")
     return RunEnvelope(
@@ -172,8 +166,7 @@ def _plan_decision_task(
     course = _load_json(workspace.root / course_record.path)
     assert isinstance(course, dict)
     prompt = str(
-        course.get("curriculum_decision_summary")
-        or "Choose the primary learning experience."
+        course.get("curriculum_decision_summary") or "Choose the primary learning experience."
     )
     return workspace.ensure_work_item(
         run_id=run.id,
@@ -223,9 +216,7 @@ def submit_decision_result(
     )
     if result.selected_path_id not in {path.id for path in curriculum.paths}:
         raise ProcessingError("User selected an unknown curriculum path")
-    selected = curriculum.model_copy(
-        update={"selected_path_id": result.selected_path_id}
-    )
+    selected = curriculum.model_copy(update={"selected_path_id": result.selected_path_id})
     output = workspace.tasks_dir / task.id / "output" / "curriculum.json"
     atomic_write_json(output, selected)
     accepted, _records = workspace.accept_work_result(
@@ -291,18 +282,11 @@ def _completion_payload(
     affordance_record = workspace.canonical_record("instructional-affordances")
     if semantic_record is None or affordance_record is None:
         raise ProcessingError("Completion requires canonical coverage records")
-    semantic_coverage = _load_json(
-        workspace.root / semantic_record.path
-    )
-    affordances = _load_json(
-        workspace.root / affordance_record.path
-    )
+    semantic_coverage = _load_json(workspace.root / semantic_record.path)
+    affordances = _load_json(workspace.root / affordance_record.path)
     assert isinstance(affordances, list)
     affordance_summary = {
-        status: sum(
-            isinstance(item, dict) and item.get("status") == status
-            for item in affordances
-        )
+        status: sum(isinstance(item, dict) and item.get("status") == status for item in affordances)
         for status in ("provided", "unsupported", "not-applicable")
     }
     prefix = "/" if result.host == SkillHost.CLAUDE else "$"
@@ -359,16 +343,10 @@ def advance_run(
         if not analyze_tasks:
             plan_analyze_tasks(workspace, run)
             continue
-        incomplete_analyze = [
-            item for item in analyze_tasks if item.state != WorkState.COMPLETE
-        ]
+        incomplete_analyze = [item for item in analyze_tasks if item.state != WorkState.COMPLETE]
         if incomplete_analyze:
             return _actions_required(workspace, incomplete_analyze)
-        integrated = [
-            item
-            for item in analyze_tasks
-            if item.scope.get("integrated") is True
-        ]
+        integrated = [item for item in analyze_tasks if item.scope.get("integrated") is True]
         if not integrated:
             plan_analyze_integration_task(workspace, run, analyze_tasks)
             continue
@@ -378,9 +356,7 @@ def advance_run(
         if not author_tasks:
             plan_author_task(workspace, run, analyze_task=analyze_task)
             continue
-        incomplete_authors = [
-            item for item in author_tasks if item.state != WorkState.COMPLETE
-        ]
+        incomplete_authors = [item for item in author_tasks if item.state != WorkState.COMPLETE]
         if incomplete_authors:
             return _actions_required(workspace, incomplete_authors)
         author_task = author_tasks[-1]
@@ -458,9 +434,7 @@ def advance_run(
         if bool(configuration["output_is_default"]):
             configured_output = configured_output.with_name(blueprint.name)
         configured_skill_root = (
-            Path(str(configuration["skill_root"]))
-            if configuration.get("skill_root")
-            else None
+            Path(str(configuration["skill_root"])) if configuration.get("skill_root") else None
         )
         result = build_workspace_skill(
             workspace,
