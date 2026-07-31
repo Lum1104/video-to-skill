@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 from test_author import _analyzed_workspace, _author_result, _plan_course_author_task
 from test_generation import _blueprint
+from test_review import _complete_behavior_trials, _review_result
 
 from video_to_skill.author import submit_author_result
 from video_to_skill.compiler import (
@@ -25,9 +26,7 @@ from video_to_skill.models import (
 from video_to_skill.orchestration import (
     AFFORDANCE_CATALOG,
     ArtifactDraftSpec,
-    BehaviorCheck,
     InstructionalAffordance,
-    ReviewResult,
 )
 from video_to_skill.review import plan_review_task, submit_review_result
 from video_to_skill.utils import atomic_write_json, hash_file
@@ -161,36 +160,25 @@ def _compiled_workspace(tmp_path: Path, *, review_passes: bool = True) -> Worksp
         ).model_dump(mode="json"),
         canonical_outputs=canonical_outputs,
     )
-    review = workspace.ensure_work_item(
-        run_id=run.id,
-        role=WorkRole.REVIEW,
-        scope={"kind": "independent-review"},
-        persona_hint="Senior independent Skill critic.",
-        packet={},
-        result_schema={"type": "object"},
-        dependencies=[author.id],
-        snapshot_digest=run.snapshot_digest,
+    trials = _complete_behavior_trials(workspace, run, author)
+    review = plan_review_task(
+        workspace,
+        run,
+        author_task=author,
+        behavior_trial_tasks=trials,
     )
     review_lease = workspace.lease_work_item(review.id, owner="codex")
     review_result = review_lease.output_directory / "result.json"
-    atomic_write_json(review_result, {"producer": "review-worker"})
-    critic = review_lease.output_directory / "critic.json"
-    behavior = review_lease.output_directory / "behavior.json"
-    atomic_write_json(critic, {"verdict": "pass" if review_passes else "fail", "findings": []})
-    atomic_write_json(behavior, {"passed": review_passes, "checks": []})
-    workspace.accept_work_result(
-        task_id=review.id,
-        lease_token=review_lease.token,
-        result_path=review_result,
-        producer=ObservationProducer(
-            name="review-worker",
-            run_id="review-run",
-        ).model_dump(mode="json"),
-        canonical_outputs=[
-            ("critic-report", "default", critic),
-            ("behavior-report", "default", behavior),
-        ],
+    atomic_write_json(
+        review_result,
+        _review_result(
+            workspace,
+            review,
+            review_lease.token,
+            verdict="pass" if review_passes else "fail",
+        ),
     )
+    submit_review_result(workspace, review.id, review_result)
     return workspace
 
 
@@ -232,6 +220,119 @@ def test_compiler_refuses_failed_review(tmp_path: Path) -> None:
         compile_workspace_blueprint(workspace)
 
 
+def test_compiler_refuses_forged_passing_heads_after_failed_review(tmp_path: Path) -> None:
+    workspace = _compiled_workspace(tmp_path, review_passes=False)
+    critic_record = workspace.canonical_record("critic-report")
+    behavior_record = workspace.canonical_record("behavior-report")
+    assert critic_record is not None
+    assert behavior_record is not None
+
+    critic = json.loads((workspace.root / critic_record.path).read_text(encoding="utf-8"))
+    behavior = json.loads((workspace.root / behavior_record.path).read_text(encoding="utf-8"))
+    critic["verdict"] = "pass"
+    critic["findings"] = []
+    behavior["passed"] = True
+    for check in behavior["checks"]:
+        if check["applicability"] == "required":
+            check["passed"] = True
+
+    forged_critic = workspace.analysis_dir / "forged-critic-report.json"
+    forged_behavior = workspace.analysis_dir / "forged-behavior-report.json"
+    atomic_write_json(forged_critic, critic)
+    atomic_write_json(forged_behavior, behavior)
+    workspace.publish_canonical_record(
+        kind="critic-report",
+        record_id="default",
+        source_path=forged_critic,
+        producer_task_id=critic_record.producer_task_id,
+        snapshot_digest=critic_record.snapshot_digest,
+    )
+    workspace.publish_canonical_record(
+        kind="behavior-report",
+        record_id="default",
+        source_path=forged_behavior,
+        producer_task_id=behavior_record.producer_task_id,
+        snapshot_digest=behavior_record.snapshot_digest,
+    )
+
+    with pytest.raises(
+        ProcessingError,
+        match="Canonical Review heads differ from the accepted ReviewResult",
+    ):
+        compile_workspace_blueprint(workspace)
+
+
+def test_compiler_refuses_canonical_snapshot_drift_after_review(tmp_path: Path) -> None:
+    workspace = _compiled_workspace(tmp_path)
+    interaction_record = workspace.canonical_record("interaction")
+    assert interaction_record is not None
+    interaction_path = workspace.root / interaction_record.path
+    republished = workspace.analysis_dir / "republished-interaction.json"
+    republished.write_bytes(interaction_path.read_bytes())
+    workspace.publish_canonical_record(
+        kind="interaction",
+        record_id="default",
+        source_path=republished,
+        producer_task_id=interaction_record.producer_task_id,
+        snapshot_digest=interaction_record.snapshot_digest,
+    )
+
+    with pytest.raises(ProcessingError, match="stale catalog or Skill preview"):
+        compile_workspace_blueprint(workspace)
+
+
+def test_compiler_refuses_legacy_passed_boolean_behavior_report(tmp_path: Path) -> None:
+    workspace = _compiled_workspace(tmp_path)
+    current = workspace.canonical_record("behavior-report")
+    assert current is not None
+    legacy_path = workspace.analysis_dir / "legacy-behavior-report.json"
+    atomic_write_json(legacy_path, {"passed": True, "checks": []})
+    workspace.publish_canonical_record(
+        kind="behavior-report",
+        record_id="default",
+        source_path=legacy_path,
+        producer_task_id=current.producer_task_id,
+        snapshot_digest=current.snapshot_digest,
+    )
+
+    with pytest.raises(ProcessingError, match="Legacy behavior reports"):
+        compile_workspace_blueprint(workspace)
+
+
+def test_build_refuses_preseeded_output_with_matching_build_id(tmp_path: Path) -> None:
+    workspace = _compiled_workspace(tmp_path)
+    _blueprint_value, receipt, _build_directory = compile_workspace_blueprint(workspace)
+    output = tmp_path / "generated" / "transition-course"
+    output.mkdir(parents=True)
+    atomic_write_json(output / "build-manifest.json", {"build_id": receipt.build_id})
+
+    with pytest.raises(ProcessingError, match="missing required generated Skill files"):
+        build_workspace_skill(
+            workspace,
+            host=SkillHost.CODEX,
+            output=output,
+            skill_root=tmp_path / "skills",
+            run_official_validation=False,
+        )
+
+
+def test_build_refuses_symlinked_output_root(tmp_path: Path) -> None:
+    workspace = _compiled_workspace(tmp_path)
+    real_output_root = tmp_path / "real-output"
+    real_output_root.mkdir()
+    linked_output_root = tmp_path / "linked-output"
+    linked_output_root.symlink_to(real_output_root, target_is_directory=True)
+
+    with pytest.raises(ProcessingError, match="symlinked path components"):
+        build_workspace_skill(
+            workspace,
+            host=SkillHost.CODEX,
+            output=linked_output_root / "transition-course",
+            skill_root=tmp_path / "skills",
+            run_official_validation=False,
+        )
+
+
 def test_compiler_binds_selected_visual_to_integrated_candidate(tmp_path: Path) -> None:
     workspace, analyze_task = _analyzed_workspace(tmp_path, with_visual=True)
     run = workspace.create_analysis_run(analyze_task.snapshot_digest)
@@ -252,25 +353,15 @@ def test_compiler_binds_selected_visual_to_integrated_candidate(tmp_path: Path) 
     atomic_write_json(author_result_path, author_result)
     accepted_author = submit_author_result(workspace, author_task.id, author_result_path)
 
-    review_task = plan_review_task(workspace, run, author_task=accepted_author)
-    review_lease = workspace.lease_work_item(review_task.id, owner="codex")
-    review_result = ReviewResult(
-        task_id=review_task.id,
-        lease_token=review_lease.token,
-        snapshot_digest=review_task.snapshot_digest,
-        reviewed_snapshot_digest=str(review_task.scope["reviewed_snapshot_digest"]),
-        producer=ObservationProducer(name="review-worker", run_id="review-run"),
-        verdict="pass",
-        findings=[],
-        behavior_checks=[
-            BehaviorCheck(
-                id="visual-on-demand",
-                scenario="Use the artifact that links the teaching visual.",
-                passed=True,
-                summary="The artifact links one grounded PNG on demand.",
-            )
-        ],
+    trials = _complete_behavior_trials(workspace, run, accepted_author)
+    review_task = plan_review_task(
+        workspace,
+        run,
+        author_task=accepted_author,
+        behavior_trial_tasks=trials,
     )
+    review_lease = workspace.lease_work_item(review_task.id, owner="codex")
+    review_result = _review_result(workspace, review_task, review_lease.token)
     review_result_path = review_lease.output_directory / "result.json"
     atomic_write_json(review_result_path, review_result)
     submit_review_result(workspace, review_task.id, review_result_path)

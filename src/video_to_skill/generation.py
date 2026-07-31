@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from video_to_skill.workspace import Workspace
 
 COURSE_SKILL_MARKER = "<!-- video-to-skill:course-skill:v2 -->"
+COURSE_SKILL_RENDERER_CONTRACT_VERSION = 1
 _SKILL_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _MARKDOWN_TARGET_RE = re.compile(r"!?\[[^\]]*]\(([^)]+)\)")
 _ROOT_ARTIFACTS = {
@@ -1852,7 +1853,10 @@ def _public_blueprint_payload(blueprint: CourseSkillBlueprint) -> dict[str, obje
 
 
 def _build_id(blueprint: CourseSkillBlueprint) -> str:
-    payload = _public_blueprint_payload(blueprint)
+    payload = {
+        "renderer_contract_version": COURSE_SKILL_RENDERER_CONTRACT_VERSION,
+        "blueprint": _public_blueprint_payload(blueprint),
+    }
     encoded = json.dumps(
         payload,
         ensure_ascii=False,
@@ -1905,6 +1909,7 @@ def build_manifest_payload(
         "generator": {
             "name": "video-to-skill",
             "version": __version__,
+            "renderer_contract_version": COURSE_SKILL_RENDERER_CONTRACT_VERSION,
         },
         "artifact_language": blueprint.artifact_language,
         "curriculum": {
@@ -1930,23 +1935,29 @@ def _overlaps(left: Path, right: Path) -> bool:
     return left == right or left.is_relative_to(right) or right.is_relative_to(left)
 
 
-def render_course_skill_package(
+def _lexical_path_without_symlinks(path: Path, *, label: str) -> Path:
+    lexical = Path(os.path.abspath(os.fspath(path.expanduser())))
+    for component in [lexical, *lexical.parents]:
+        if component.is_symlink():
+            raise ProcessingError(f"{label} cannot contain symlinked path components")
+    return lexical
+
+
+def _render_course_skill_package(
     blueprint: CourseSkillBlueprint,
     destination: Path,
     *,
     workspace_root: Path | None = None,
+    allow_workspace_overlap: bool = False,
 ) -> Path:
-    """Create a new shareable course skill atomically.
-
-    The destination must not already exist. Updates should be rendered to a new
-    sibling staging path and installed only after validation.
-    """
-
-    target = destination.expanduser().resolve()
+    target = _lexical_path_without_symlinks(destination, label="Skill destination")
     workspace: Path | None = None
     if workspace_root is not None:
-        workspace = workspace_root.expanduser().resolve()
-        if _overlaps(target, workspace):
+        workspace = _lexical_path_without_symlinks(
+            workspace_root,
+            label="Evidence workspace",
+        )
+        if not allow_workspace_overlap and _overlaps(target, workspace):
             raise ProcessingError(
                 "The shareable skill and evidence workspace must be separate directories"
             )
@@ -1996,6 +2007,53 @@ def render_course_skill_package(
         shutil.rmtree(staging, ignore_errors=True)
         raise
     return target
+
+
+def render_course_skill_package(
+    blueprint: CourseSkillBlueprint,
+    destination: Path,
+    *,
+    workspace_root: Path | None = None,
+) -> Path:
+    """Create a new shareable course skill atomically.
+
+    The destination must not already exist. Updates should be rendered to a new
+    sibling staging path and installed only after validation.
+    """
+
+    return _render_course_skill_package(
+        blueprint,
+        destination,
+        workspace_root=workspace_root,
+    )
+
+
+def render_course_skill_review_target(
+    blueprint: CourseSkillBlueprint,
+    destination: Path,
+    *,
+    workspace_root: Path,
+) -> Path:
+    """Render the real package bytes into the one private, allowlisted review area."""
+
+    workspace = _lexical_path_without_symlinks(
+        workspace_root,
+        label="Behavior review workspace",
+    )
+    target = _lexical_path_without_symlinks(
+        destination,
+        label="Behavior review target",
+    )
+    allowed_root = workspace / "analysis" / "behavior-targets"
+    _lexical_path_without_symlinks(allowed_root, label="Behavior review target root")
+    if target == allowed_root or not target.is_relative_to(allowed_root):
+        raise ProcessingError("Behavior review targets must stay under analysis/behavior-targets")
+    return _render_course_skill_package(
+        blueprint,
+        target,
+        workspace_root=workspace,
+        allow_workspace_overlap=True,
+    )
 
 
 def blueprint_from_json(path: Path) -> CourseSkillBlueprint:

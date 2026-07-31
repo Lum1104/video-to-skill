@@ -945,7 +945,11 @@ Check:
 
 ### Host-neutral behavior validation
 
-Use realistic prompts in a fresh context:
+The engine owns a deterministic, versioned scenario catalog. Reviewers do not invent or omit scenarios. Render the canonical Author state first as an immutable private preview containing the actual `SKILL.md`, supporting artifacts, provenance, sources, assets, and build manifest. Hash every preview file and bind all behavior evidence to that content digest.
+
+Run each applicable scenario in a separate host-dispatched fresh context. The engine binds every leased trial and judge task to a distinct `execution_context_id` and rejects mismatched results. This binding proves task and lease separation, not operating-system, process, filesystem, or model-context isolation; the host remains responsible for dispatching genuinely independent contexts and applying any required sandbox or read-only mount. A trial packet contains only the immutable preview and one prompt, never the expected answer or Author summary. Its raw result records the exact bounded user/assistant exchange, generated-Skill files read, and observed side effects without grading itself. A subsequent independent Review worker receives the code-owned expectations plus immutable trial paths and digests, judges every catalog entry exactly once, and records explicit not-applicable cases selected from canonical semantic state.
+
+The required interaction scenarios use these realistic prompts:
 
 ```text
 $skill
@@ -1005,6 +1009,8 @@ Build manifest         PASS
 ```
 
 Deterministic validation owns structural and semantic checks. Independent behavior tests use a fresh context and save raw reports in the workspace, not in the installed Skill.
+
+Behavior reports use the current catalog schema and bind the catalog version and digest, reviewed Author snapshot, rendered target build and content digests, scenario identity, prompt, expected behavior, applicability, raw trial task and result digests, cited turn indices, and verdict. The compiler reconstructs the catalog and rehashes the preview and every raw trial; it never authorizes compilation from a bare `passed` boolean. Legacy reports remain immutable but require fresh trials and a new Review before compilation.
 
 ## Workspace compilation contract
 

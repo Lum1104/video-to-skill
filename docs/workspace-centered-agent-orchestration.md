@@ -203,15 +203,21 @@ Review must use a producer identity independent of the Author producer.
 
 The review snapshot includes semantic records, curriculum options, selected curriculum, final artifact-bound curriculum, interaction, capability profile, artifact plan, instructional-affordance ledger, claims, assets, every canonical draft digest, the visual-candidate manifest, and selected image digests.
 
-Review audits semantic retention and instructional-affordance retention separately, followed by grounding, disclosure, runtime behavior, safety, scope, and shareability. For every selected visual, Review checks necessity, legibility, retained context, temporal ordering, privacy, claim grounding, and whether the generated Skill opens it only on demand.
+Review behavior validation has two task shapes under the existing Review role. First, the engine assembles canonical Author state without consulting a quality verdict, renders the actual portable package bytes into an allowlisted private `analysis/behavior-targets/` directory, and hashes the complete file tree. It materializes a code-owned catalog containing the seven unconditional interaction scenarios plus deterministic content-pressure scenarios whose applicability comes from the canonical semantic map and affordance ledger.
 
-A pass requires no blocking findings and no failed behavior checks. A fail requires a blocking finding or failed behavior check.
+Each applicable catalog entry becomes one `behavior-trial` task with a distinct task identity and host-dispatched context. The engine issues a distinct `execution_context_id` with every trial and judge lease and rejects results that do not echo the binding. This establishes task and lease separation but cannot prove operating-system, process, filesystem, or model-context isolation; the host must dispatch genuinely independent contexts and enforce any required sandbox or read-only boundary. The trial packet exposes only the immutable target and its single prompt; it does not expose rubrics, expected answers, semantic records, or Author summaries. Its accepted raw result has exactly one user turn and one assistant turn, verified generated-Skill file accesses, and any observed side effects. Trial results have no verdict.
+
+After all applicable trials complete exactly once, an `independent-review` task audits semantic retention and instructional-affordance retention separately, followed by grounding, disclosure, runtime behavior, safety, scope, and shareability. It judges the raw trials against the full versioned catalog, accounts explicitly for not-applicable pressure cases, and inspects the actual rendered target. For every selected visual, Review checks necessity, legibility, retained context, temporal ordering, privacy, claim grounding, and whether the generated Skill opens it only on demand.
+
+A pass requires no blocking findings and no failed applicable behavior checks. A fail requires a blocking finding or failed behavior check. Both canonical reports name the same Review task and bind the Author snapshot, catalog digest, target build ID, and target content digest. The behavior report also binds every applicable check to one immutable raw trial result.
 
 A failed Review creates a complete Author revision task pinned to the same curriculum option and selection digests, followed by a new independent Review. The coordinator permits at most three repair cycles and never reopens the settled curriculum choice.
 
 ## Deterministic compilation
 
 Compilation begins only after canonical critic and behavior reports pass.
+
+The compiler parses the typed v2 reports, reconstructs the current catalog, verifies exact-once scenario accounting, rehashes the private target and every cited raw trial, checks that critic and behavior heads came from the same latest independent Review, and finally requires rendered delivery bytes to match the evaluated target. A legacy `{passed, checks}` report is retained but cannot satisfy this gate; resume creates new catalog-v2 trials and Review records without mutating legacy history.
 
 The compiler:
 

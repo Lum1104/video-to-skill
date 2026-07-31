@@ -9,12 +9,19 @@ import pytest
 from test_author import _analyzed_workspace, _author_result, _curriculum_result
 from test_review import _review_result
 
+from video_to_skill.behavior import snapshot_behavior_target
 from video_to_skill.config import Settings
 from video_to_skill.coordinator import advance_run, submit_workspace_result
 from video_to_skill.errors import ProcessingError
 from video_to_skill.installation import SkillHost
 from video_to_skill.models import ObservationProducer
-from video_to_skill.orchestration import DecisionResult, RunEnvelope
+from video_to_skill.orchestration import (
+    BehaviorArtifactAccess,
+    BehaviorTrialResult,
+    BehaviorTurn,
+    DecisionResult,
+    RunEnvelope,
+)
 from video_to_skill.utils import atomic_write_json
 from video_to_skill.work import WorkRole
 from video_to_skill.workspace import Workspace
@@ -30,6 +37,68 @@ def _resume(
         settings=settings,
         host=None,
     )
+
+
+def _submit_trial_envelope(
+    workspace: Workspace,
+    envelope: RunEnvelope,
+    *,
+    run_prefix: str,
+) -> None:
+    assert envelope.actions
+    for index, action in enumerate(envelope.actions):
+        task = workspace.get_work_item(action.task_id)
+        assert task.scope["kind"] == "behavior-trial"
+        lease = json.loads((action.task_path / "lease.json").read_text(encoding="utf-8"))
+        packet = json.loads((workspace.root / task.packet_path).read_text(encoding="utf-8"))[
+            "payload"
+        ]
+        target = snapshot_behavior_target(
+            workspace.root / packet["evaluation_target"]["path"],
+            expected_build_id=packet["evaluation_target"]["build_id"],
+        )
+        result_path = action.task_path / "output" / "result.json"
+        atomic_write_json(
+            result_path,
+            BehaviorTrialResult(
+                task_id=task.id,
+                lease_token=str(lease["lease_token"]),
+                execution_context_id=str(lease["execution_context_id"]),
+                snapshot_digest=task.snapshot_digest,
+                producer=ObservationProducer(
+                    name=f"{run_prefix}-worker-{index}",
+                    run_id=f"{run_prefix}-run-{index}",
+                ),
+                scenario_id=str(task.scope["scenario_id"]),
+                scenario_digest=str(task.scope["scenario_digest"]),
+                target_content_digest=target.content_digest,
+                turns=[
+                    BehaviorTurn(role="user", content=packet["scenario"]["prompt"]),
+                    BehaviorTurn(role="assistant", content="A bounded grounded response."),
+                ],
+                artifact_accesses=[
+                    BehaviorArtifactAccess(
+                        path="SKILL.md",
+                        sha256=str(target.files["SKILL.md"]["sha256"]),
+                        reason="The host loaded the resident Skill instructions.",
+                    )
+                ],
+            ),
+        )
+        submit_workspace_result(workspace, task.id, result_path)
+
+
+def _submit_review_envelope(workspace: Workspace, envelope: RunEnvelope) -> None:
+    [action] = envelope.actions
+    task = workspace.get_work_item(action.task_id)
+    assert task.scope["kind"] == "independent-review"
+    lease = json.loads((action.task_path / "lease.json").read_text(encoding="utf-8"))
+    result_path = action.task_path / "output" / "result.json"
+    atomic_write_json(
+        result_path,
+        _review_result(workspace, task, str(lease["lease_token"])),
+    )
+    submit_workspace_result(workspace, task.id, result_path)
 
 
 def _reviewed_workspace(
@@ -92,16 +161,59 @@ def _reviewed_workspace(
     )
     assert author_receipt.status == "complete"
 
+    trial_envelope = _resume(workspace, settings)
+    assert all(action.role == "review" for action in trial_envelope.actions)
+    for index, trial_action in enumerate(trial_envelope.actions):
+        trial_task = workspace.get_work_item(trial_action.task_id)
+        trial_lease = json.loads(
+            (trial_action.task_path / "lease.json").read_text(encoding="utf-8")
+        )
+        packet = json.loads((workspace.root / trial_task.packet_path).read_text(encoding="utf-8"))[
+            "payload"
+        ]
+        target = snapshot_behavior_target(
+            workspace.root / packet["evaluation_target"]["path"],
+            expected_build_id=packet["evaluation_target"]["build_id"],
+        )
+        trial_result_path = trial_action.task_path / "output" / "result.json"
+        atomic_write_json(
+            trial_result_path,
+            BehaviorTrialResult(
+                task_id=trial_task.id,
+                lease_token=str(trial_lease["lease_token"]),
+                execution_context_id=str(trial_lease["execution_context_id"]),
+                snapshot_digest=trial_task.snapshot_digest,
+                producer=ObservationProducer(
+                    name=f"trial-worker-{index}",
+                    run_id=f"trial-run-{index}",
+                ),
+                scenario_id=str(trial_task.scope["scenario_id"]),
+                scenario_digest=str(trial_task.scope["scenario_digest"]),
+                target_content_digest=target.content_digest,
+                turns=[
+                    BehaviorTurn(role="user", content=packet["scenario"]["prompt"]),
+                    BehaviorTurn(role="assistant", content="A bounded grounded response."),
+                ],
+                artifact_accesses=[
+                    BehaviorArtifactAccess(
+                        path="SKILL.md",
+                        sha256=str(target.files["SKILL.md"]["sha256"]),
+                        reason="The host loaded the resident Skill instructions.",
+                    )
+                ],
+            ),
+        )
+        submit_workspace_result(workspace, trial_task.id, trial_result_path)
+
     review_envelope = _resume(workspace, settings)
     [review_action] = review_envelope.actions
     assert review_action.role == "review"
     review_task = workspace.get_work_item(review_action.task_id)
     review_lease = json.loads((review_action.task_path / "lease.json").read_text(encoding="utf-8"))
     review_result = _review_result(
-        task_id=review_task.id,
-        lease_token=str(review_lease["lease_token"]),
-        snapshot_digest=review_task.snapshot_digest,
-        reviewed_snapshot_digest=str(review_task.scope["reviewed_snapshot_digest"]),
+        workspace,
+        review_task,
+        str(review_lease["lease_token"]),
     )
     review_result_path = review_action.task_path / "output" / "result.json"
     atomic_write_json(review_result_path, review_result)
@@ -290,6 +402,11 @@ def test_run_recovers_from_generated_and_installed_name_conflicts(
     atomic_write_json(result_path, result)
     submit_workspace_result(workspace, task.id, result_path)
 
+    fresh_trials = _resume(workspace, settings)
+    assert fresh_trials.status == "actions-required"
+    _submit_trial_envelope(workspace, fresh_trials, run_prefix="renamed-trial")
+    fresh_review = _resume(workspace, settings)
+    _submit_review_envelope(workspace, fresh_review)
     complete = _resume(workspace, settings)
 
     assert complete.status == "complete"

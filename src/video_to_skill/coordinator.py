@@ -41,7 +41,9 @@ from video_to_skill.pipeline import extract_sources
 from video_to_skill.review import (
     MAX_REPAIR_CYCLES,
     plan_author_repair_task,
+    plan_behavior_trial_tasks,
     plan_review_task,
+    submit_behavior_trial_result,
     submit_review_result,
 )
 from video_to_skill.utils import atomic_write_json, stable_hash
@@ -454,7 +456,10 @@ def submit_workspace_result(
         else:
             accepted = submit_author_result(workspace, task_id, resolved_result)
     elif item.role == WorkRole.REVIEW:
-        accepted = submit_review_result(workspace, task_id, resolved_result)
+        if item.scope.get("kind") == "behavior-trial":
+            accepted = submit_behavior_trial_result(workspace, task_id, resolved_result)
+        else:
+            accepted = submit_review_result(workspace, task_id, resolved_result)
     else:
         accepted = submit_decision_result(workspace, task_id, resolved_result)
     assert accepted.result_digest is not None
@@ -551,7 +556,10 @@ def _completion_payload(
         "failed_sources": len(manifest.failed_sources),
         "semantic_coverage": semantic_coverage,
         "instructional_affordance_coverage": affordance_summary,
-        "critic_repairs": max(0, len(review_tasks) - 1),
+        "critic_repairs": max(
+            (int(item.scope.get("repair_cycle", 0)) for item in review_tasks),
+            default=0,
+        ),
         "invocation": f"{prefix}{result.name}",
     }
 
@@ -692,17 +700,52 @@ def advance_run(
             course_author_tasks = bound_course_authors
             author_task = course_author_tasks[-1]
 
-        reviews = _matching_tasks(
-            workspace.list_work_items(run.id, role=WorkRole.REVIEW),
-            scope_key="author_task_id",
-            scope_value=author_task.id,
-        )
         repair_cycle = max(0, int(author_task.scope.get("revision", 1)) - 1)
+        behavior_trials = plan_behavior_trial_tasks(
+            workspace,
+            run,
+            author_task=author_task,
+            repair_cycle=repair_cycle,
+        )
+        incomplete_trials = [item for item in behavior_trials if item.state != WorkState.COMPLETE]
+        if incomplete_trials:
+            return _actions_required(workspace, incomplete_trials)
+        trial_contract = behavior_trials[0].scope
+        review_contract_keys = (
+            "contract_version",
+            "renderer_contract_version",
+            "catalog_version",
+            "catalog_digest",
+            "reviewed_snapshot_digest",
+            "target_build_id",
+            "target_content_digest",
+        )
+        expected_review_dependencies = sorted(
+            {
+                author_task.id,
+                *(item.id for item in behavior_trials),
+                *decision_dependency,
+            }
+        )
+        reviews = [
+            item
+            for item in _matching_tasks(
+                workspace.list_work_items(run.id, role=WorkRole.REVIEW),
+                scope_key="author_task_id",
+                scope_value=author_task.id,
+            )
+            if item.scope.get("kind") == "independent-review"
+            and item.scope.get("author_task_id") == author_task.id
+            and item.scope.get("repair_cycle") == repair_cycle
+            and all(item.scope.get(key) == trial_contract.get(key) for key in review_contract_keys)
+            and item.dependencies == expected_review_dependencies
+        ]
         if not reviews:
             plan_review_task(
                 workspace,
                 run,
                 author_task=author_task,
+                behavior_trial_tasks=behavior_trials,
                 repair_cycle=repair_cycle,
                 additional_dependencies=decision_dependency,
             )
@@ -790,7 +833,11 @@ def advance_run(
         completion = _completion_payload(
             workspace,
             result,
-            review_tasks=workspace.list_work_items(run.id, role=WorkRole.REVIEW),
+            review_tasks=[
+                item
+                for item in workspace.list_work_items(run.id, role=WorkRole.REVIEW)
+                if item.scope.get("kind") == "independent-review"
+            ],
         )
         atomic_write_json(completion_path, completion)
         return RunEnvelope(

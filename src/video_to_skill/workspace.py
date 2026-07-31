@@ -43,7 +43,7 @@ from video_to_skill.work import (
     WorkState,
 )
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 _AGENT_EVIDENCE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS agent_observations (
@@ -112,6 +112,7 @@ CREATE TABLE IF NOT EXISTS work_items (
     lease_token_hash TEXT,
     lease_owner TEXT,
     lease_expires_at TEXT,
+    execution_context_id TEXT,
     attempt_count INTEGER NOT NULL DEFAULT 0,
     result_path TEXT,
     result_digest TEXT,
@@ -357,6 +358,13 @@ class Workspace:
                 ON visual_events(source_id, origin, timestamp)
                 """
             )
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS work_item_execution_context
+                ON work_items(execution_context_id)
+                WHERE execution_context_id IS NOT NULL
+                """
+            )
 
     @staticmethod
     def _ensure_column(
@@ -410,6 +418,13 @@ class Workspace:
             )
         if version < 5:
             connection.executescript(_ORCHESTRATION_SCHEMA)
+        if version < 6:
+            self._ensure_column(
+                connection,
+                table="work_items",
+                column="execution_context_id",
+                declaration="TEXT",
+            )
         connection.execute(
             "UPDATE metadata SET value=? WHERE key='schema_version'",
             (str(SCHEMA_VERSION),),
@@ -522,6 +537,7 @@ class Workspace:
                 if row["lease_expires_at"]
                 else None
             ),
+            execution_context_id=cast(str | None, row["execution_context_id"]),
             attempt_count=int(row["attempt_count"]),
             result_path=Path(str(row["result_path"])) if row["result_path"] else None,
             result_digest=cast(str | None, row["result_digest"]),
@@ -706,7 +722,7 @@ class Workspace:
                 """
                 UPDATE work_items
                 SET state='pending', lease_token_hash=NULL, lease_owner=NULL,
-                    lease_expires_at=NULL, updated_at=?
+                    lease_expires_at=NULL, execution_context_id=NULL, updated_at=?
                 WHERE run_id=? AND state='leased' AND lease_expires_at <= ?
                 """,
                 (now, run_id, now),
@@ -758,6 +774,7 @@ class Workspace:
         if lease_seconds < 1:
             raise ProcessingError("Task lease duration must be positive")
         token = secrets.token_urlsafe(32)
+        execution_context_id = f"ctx-{secrets.token_urlsafe(24)}"
         token_hash = sha256(token.encode("utf-8")).hexdigest()
         now = datetime.now(UTC)
         expires = now + timedelta(seconds=lease_seconds)
@@ -791,10 +808,18 @@ class Workspace:
                 """
                 UPDATE work_items
                 SET state='leased', lease_token_hash=?, lease_owner=?,
-                    lease_expires_at=?, attempt_count=attempt_count + 1, updated_at=?
+                    lease_expires_at=?, execution_context_id=?,
+                    attempt_count=attempt_count + 1, updated_at=?
                 WHERE id=?
                 """,
-                (token_hash, owner, expires.isoformat(), now.isoformat(), task_id),
+                (
+                    token_hash,
+                    owner,
+                    expires.isoformat(),
+                    execution_context_id,
+                    now.isoformat(),
+                    task_id,
+                ),
             )
         task_directory = self.tasks_dir / task_id
         atomic_write_json(
@@ -802,6 +827,7 @@ class Workspace:
             {
                 "task_id": task_id,
                 "lease_token": token,
+                "execution_context_id": execution_context_id,
                 "owner": owner,
                 "expires_at": expires.isoformat(),
             },
@@ -809,6 +835,7 @@ class Workspace:
         return WorkLease(
             item=self.get_work_item(task_id),
             token=token,
+            execution_context_id=execution_context_id,
             output_directory=task_directory / "output",
         )
 
@@ -819,7 +846,8 @@ class Workspace:
                 """
                 UPDATE work_items
                 SET state='failed', failure_reason=?, lease_token_hash=NULL,
-                    lease_owner=NULL, lease_expires_at=NULL, updated_at=?
+                    lease_owner=NULL, lease_expires_at=NULL, execution_context_id=NULL,
+                    updated_at=?
                 WHERE id=? AND state IN ('pending', 'leased')
                 """,
                 (" ".join(reason.split())[:2000], now, task_id),
