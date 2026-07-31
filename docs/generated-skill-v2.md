@@ -53,36 +53,34 @@ workspace/
 ├── evidence.sqlite3
 ├── sources/
 │   └── <source-id>/
-│       ├── metadata.json
-│       ├── media.*
-│       ├── audio-16khz.wav
-│       ├── captions.*
+│       ├── [media and captions]
+│       ├── [audio-16khz.wav]
 │       ├── frames/
 │       ├── investigation-frames/
 │       └── contact-sheets/
-├── observations/
-│   └── observations.jsonl
 ├── analysis/
-│   ├── semantic-map.json
-│   ├── semantic-relations.json
-│   ├── capability-profile.json
-│   ├── gaps.json
-│   └── semantic-coverage.json
-├── design/
-│   ├── curriculum-options.json
-│   ├── selected-curriculum.json
-│   └── artifact-plan.json
+│   ├── run-config.json
+│   ├── artifact-language.json
+│   ├── tasks/<task-id>/
+│   ├── results/<task-id>.json
+│   ├── records/<kind-hash>/<record-id-hash>/r<revision>.*
+│   └── behavior-targets/<target-id>/
 ├── builds/
 │   └── <build-id>/
 │       ├── blueprint.json
 │       ├── critic-report.json
 │       ├── validation-report.json
-│       └── behavior-report.json
+│       ├── behavior-report.json
+│       └── completion.json
+├── editions/<edition-id>/
+│   ├── edition.json
+│   ├── analysis/
+│   └── builds/
 └── logs/
-    └── tool-runs.jsonl
+    └── [tool-runs.jsonl]
 ```
 
-The default lifecycle keeps this workspace. `clean` remains an explicit user action. Completion reports must show the workspace path and retention state.
+Observations, evidence gaps, work state, canonical heads, identities, and authoritative tool provenance live in SQLite; named files shown under `analysis/` are immutable task and record materializations. `logs/tool-runs.jsonl` exists only after an explicit sanitized export. The default lifecycle keeps this workspace. `clean` remains an explicit user action. Completion reports must show the workspace path and retention state.
 
 ### 2. Canonical semantic map
 
@@ -145,9 +143,11 @@ inspect sources
   → propose curriculum designs
   → select a primary curriculum
   → plan justified artifacts
-  → render a staged Skill
-  → run structural and semantic validation
-  → run independent behavior tests
+  → render an immutable private behavior target
+  → run isolated behavior trials
+  → run independent semantic, product, and behavior review
+  → compile delivery bytes identical to the reviewed target
+  → run structural, grounding, security, shareability, and code-fence validation
   → install without clobbering
 ```
 
@@ -166,8 +166,7 @@ Local workspace
   Keep complete analysis evidence.
 
 Installed Skill
-  Include semantic derivatives, provenance, selected teaching assets, and a
-  build receipt.
+  Include semantic derivatives, provenance, selected teaching assets, and a build receipt.
 
 Git repository
   Commit the Skill, not raw video or full analysis media.
@@ -195,7 +194,7 @@ Save reproducibility metadata for deterministic media operations in the raw work
 }
 ```
 
-SQLite is authoritative. The engine captures subprocesses at the shared runner boundary and uses the same operation recorder for ASR, OCR, vision, and deterministic image work. Stable logical IDs group immutable generation-numbered attempts, concurrent writers use WAL transactions, late completions cannot replace newer state, and cache reuse increments a counter. Typed ASR, OCR, and vision outputs reference workspace records with semantic digests that the export verifies against SQLite. `tool-runs WORKSPACE` creates deterministic ID-ordered JSONL under `logs/` in the raw workspace and accepts an existing target only when its bytes are identical. Records use workspace-relative paths and sanitized arguments; they never include raw stdout or stderr, arbitrary environment variables, credentials, expiring source URLs, or private absolute paths, and they are never copied into the portable Skill.
+SQLite is authoritative. The engine captures subprocesses at the shared runner boundary and uses the same operation recorder for ASR, OCR, vision, and retained investigation-frame operations. Stable logical IDs group immutable generation-numbered attempts, concurrent writers use WAL transactions, late completions cannot replace newer state, and cache reuse increments a counter. Typed ASR, OCR, and vision outputs reference workspace records with semantic digests that the export verifies against SQLite. `tool-runs WORKSPACE` creates deterministic ID-ordered JSONL under `logs/` in the raw workspace and accepts an existing target only when its bytes are identical. Records use workspace-relative paths and sanitized arguments; they never include raw stdout or stderr, arbitrary environment variables, credentials, expiring source URLs, or private absolute paths, and they are never copied into the portable Skill.
 
 ### Evidence retention levels
 
@@ -219,7 +218,7 @@ Do not include complete source video or audio, the evidence database, caches, ta
 
 #### Archival local bundle
 
-`evidence-bundle WORKSPACE --mode archival --confirm-private-archival --output FILE.v2sbundle` creates an explicitly private archive that may additionally include analysis-quality media, audio, all extracted frames and captions, broader canonical intermediates, and a consistent evidence-database snapshot. It still excludes cookies, credentials, authentication artifacts, caches, locks, temporary files, task leases, behavior targets, and rendered generated Skills; workspace and edition manifests are sanitized before packaging.
+`evidence-bundle WORKSPACE --mode archival --confirm-private-archival --output FILE.v2sbundle` creates an explicitly private archive that may additionally include analysis-quality media, audio, all retained frames, normalized transcript evidence, explicitly declared external local caption sidecars, broader canonical intermediates, and a synthesized evidence-only SQLite database. It still excludes cookies, credentials, authentication artifacts, caches, locks, temporary files, task leases, behavior targets, and rendered generated Skills; workspace and edition manifests are sanitized before packaging.
 
 Both bundle modes use sorted safe paths, fixed ZIP metadata, SHA-256 and byte sizes for every member, a content-derived identity, no symlinks or special files, self-verification, mode `0600`, and atomic create-only publication outside the source workspace. Existing output is accepted only when byte-for-byte identical, and `verify-evidence-bundle` checks identity, membership, sizes, and checksums without extraction. Bundle retention mode is independent of `analysis_depth`; an archival depth does not authorize archival export or transcript redistribution. An archival bundle is not a normal Skill dependency and is not committed to ordinary Git history.
 
@@ -871,7 +870,7 @@ Every package includes `build-manifest.json`:
 }
 ```
 
-The manifest never exposes a local workspace path. It gives later builds enough information to identify generated ownership and source lineage.
+The manifest never exposes a local workspace path. It records generated ownership and source lineage needed by a future update design, but it does not authorize updates by itself. `parent_build_id` remains `null` in the current workspace compiler.
 
 ## Future update safety
 
@@ -1062,6 +1061,7 @@ The implemented sequence is:
 3. A bounded curriculum-planning Author submission produces immutable options and ordered semantic-unit sequences, without artifact plans, claims, assets, or drafts.
 4. The coordinator persists the recommended selection automatically or emits a durable `ask-user` action when the learning experience materially differs.
 5. Only after selection, the full Author consumes the pinned option and selection digests and produces interaction, artifact-bound curriculum paths, artifact plans, instructional-affordance coverage, claims, assets, and immutable drafts.
-6. Review submissions independently audit semantic and product retention plus runtime behavior.
-7. Failed reviews create immutable Author repair tasks pinned to the same selected curriculum and fresh Reviews, with at most three cycles.
-8. Passing state compiles, renders outside the workspace, validates, installs without clobbering, and persists a completion record.
+6. The engine renders canonical Author state into an immutable private behavior target and dispatches each applicable catalog scenario as a separate behavior-trial Review task with a distinct execution-context binding.
+7. A different independent Review worker judges the raw trials and audits semantic retention, instructional-affordance retention, grounding, disclosure, safety, scope, and shareability against the actual target.
+8. Failed reviews create immutable Author repair tasks pinned to the same selected curriculum and fresh trials and Reviews, with at most three cycles.
+9. Passing state compiles delivery bytes that must match the reviewed target, validates, installs without clobbering, and persists a completion record.

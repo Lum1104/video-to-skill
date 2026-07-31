@@ -270,7 +270,7 @@ Secrets, cookies, authorization headers, expiring URLs, private chain-of-thought
 
 ## Deliberate exclusions
 
-The first implementation supports new Skill generation only.
+The current implementation supports new Skill generation, deterministic resume, and named downstream editions over immutable Analyze state. It does not update or fold new evidence into an existing generated Skill.
 
 The following are not compatibility targets in this implementation:
 
@@ -280,7 +280,7 @@ The following are not compatibility targets in this implementation:
 - a parallel MCP orchestration surface; and
 - direct engine access to model providers.
 
-These capabilities may be designed independently after the new-generation workflow is stable.
+These capabilities require separate designs and are not implied by the current edition, manifest, or no-clobber behavior.
 
 ## Acceptance criteria
 

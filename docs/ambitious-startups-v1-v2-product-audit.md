@@ -1,5 +1,9 @@
 # Ambitious Startups Skill: V1–V2 Product Audit
 
+## Historical status
+
+This is a point-in-time audit of two generated artifacts, not a description of the current generator. Its package measurements and product comparison remain useful, but its then-current generator gaps led to the implemented curriculum checkpoint, instructional-affordance ledger, isolated behavior validation, artifact-language contract, adaptive depth profiles, named editions, tool provenance, and evidence bundles documented elsewhere in this repository. Update and fold-in of an existing generated Skill remain deliberately deferred.
+
 ## Scope
 
 This audit compares only the generated Skill artifacts:
@@ -88,7 +92,7 @@ This is a meaningful improvement in host usability and progressive disclosure.
 
 ### 4. Current structural compatibility
 
-The V2 package passes the current validator with code checks:
+The V2 package passed the validator used for this audit with code checks:
 
 ```text
 VALID
@@ -96,7 +100,7 @@ Files checked: 9
 No issues found.
 ```
 
-The V1 package uses the legacy provenance schema and lacks V2 semantic units, so the current validator rejects it. This is a format and compatibility result, not evidence that V1's instructional content is inferior.
+The V1 package uses the legacy provenance schema and lacks V2 semantic units, so the validator used at audit time rejected it. This is a format and compatibility result, not evidence that V1's instructional content is inferior.
 
 ## Where V2 regresses
 
@@ -169,7 +173,7 @@ The V2 build manifest records:
 
 The package was synthesized as a new build rather than created through an update or fold-in operation over the V1 Skill. As a result, V2 protected source semantics but did not treat the generator-created instructional value in V1 as material that required preservation or an explicit replacement decision.
 
-This exposes a gap in the current quality model:
+At audit time, this exposed a gap in the quality model:
 
 > Semantic coverage is not instructional capability coverage.
 
@@ -184,7 +188,7 @@ The semantic ledger can prove that source meaning was retained while the product
 - retry mechanics;
 - capstone synthesis.
 
-The critic and validator currently have stronger defenses against source meaning loss than against instructional affordance loss.
+At the time of this audit, the critic and validator had stronger defenses against source meaning loss than against instructional affordance loss.
 
 ## Recommended target
 
@@ -208,9 +212,9 @@ Restore or regenerate the following product artifacts:
 5. scored rubrics, progressive hints, retry behavior, and an example structure;
 6. section-level retrieval or transfer prompts for the main course.
 
-## Generator implications
+## Generator implications recorded at audit time
 
-Future V2 criticism and validation should track two separate ledgers:
+This audit recommended that V2 criticism and validation track two separate ledgers; the current workspace-centered pipeline implements both:
 
 1. **Semantic coverage:** whether all material source meaning is included, merged, contextualized, or omitted with a defensible reason.
 2. **Instructional affordance coverage:** whether the generated Skill has enough independently useful teaching, practice, application, feedback, validation, recovery, and reference surfaces for its claimed capability levels.
