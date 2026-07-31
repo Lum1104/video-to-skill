@@ -20,6 +20,8 @@ from video_to_skill.models import (
     SourcePlatform,
     TranscriptOrigin,
     TranscriptSegment,
+    VisualEvent,
+    VisualOrigin,
 )
 from video_to_skill.orchestration import (
     AnalyzeResult,
@@ -191,6 +193,69 @@ def test_analyze_submission_rejects_tampered_task_packet(tmp_path: Path) -> None
     atomic_write_json(result_path, result)
 
     with pytest.raises(ProcessingError, match="packet failed its digest check"):
+        submit_analyze_result(workspace, task.id, result_path)
+
+
+def test_analyze_submission_accepts_bounded_investigation_frames(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    run = workspace.create_analysis_run()
+    [task] = plan_analyze_tasks(workspace, run)
+    lease = workspace.lease_work_item(task.id, owner="codex")
+    frame_path = workspace.source_directory("source") / "investigation-frames" / "frame.jpg"
+    frame_path.parent.mkdir()
+    frame_path.write_bytes(b"frame")
+    frame = VisualEvent(
+        id="investigation-frame",
+        source_id="source",
+        timestamp=30,
+        path=frame_path,
+        origin=VisualOrigin.INVESTIGATION,
+    )
+    workspace.upsert_visuals([frame])
+    result = _result(
+        task_id=task.id,
+        lease_token=lease.token,
+        snapshot_digest=task.snapshot_digest,
+        evidence_id=frame.id,
+    )
+    result_path = lease.output_directory / "result.json"
+    atomic_write_json(result_path, result)
+
+    accepted = submit_analyze_result(workspace, task.id, result_path)
+
+    assert accepted.state == WorkState.COMPLETE
+
+
+def test_analyze_submission_rejects_investigation_frames_outside_task_sections(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path, sections=25)
+    run = workspace.create_analysis_run()
+    [task, *_remaining] = plan_analyze_tasks(workspace, run)
+    lease = workspace.lease_work_item(task.id, owner="codex")
+    frame_path = workspace.source_directory("source") / "investigation-frames" / "frame.jpg"
+    frame_path.parent.mkdir()
+    frame_path.write_bytes(b"frame")
+    frame = VisualEvent(
+        id="out-of-scope-investigation-frame",
+        source_id="source",
+        timestamp=1_000,
+        path=frame_path,
+        origin=VisualOrigin.INVESTIGATION,
+    )
+    workspace.upsert_visuals([frame])
+    result = _result(
+        task_id=task.id,
+        lease_token=lease.token,
+        snapshot_digest=task.snapshot_digest,
+        evidence_id=frame.id,
+        integrated=False,
+        start=960,
+    )
+    result_path = lease.output_directory / "result.json"
+    atomic_write_json(result_path, result)
+
+    with pytest.raises(ProcessingError, match="outside its Analyze packet"):
         submit_analyze_result(workspace, task.id, result_path)
 
 

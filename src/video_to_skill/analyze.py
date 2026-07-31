@@ -11,8 +11,9 @@ from pydantic import ValidationError as PydanticValidationError
 
 from video_to_skill.errors import ProcessingError
 from video_to_skill.generation import SemanticUnit
+from video_to_skill.models import VisualEvent, VisualOrigin
 from video_to_skill.orchestration import AnalyzeResult
-from video_to_skill.utils import atomic_write_json, hash_file, stable_hash
+from video_to_skill.utils import atomic_write_json, hash_file, is_within, stable_hash
 from video_to_skill.work import AnalysisRun, WorkItem, WorkRole, WorkState
 from video_to_skill.workspace import Workspace
 
@@ -151,6 +152,11 @@ def plan_analyze_tasks(workspace: Workspace, run: AnalysisRun) -> list[WorkItem]
             "sections": section_packets,
             "allowed_evidence_ids": allowed_evidence_ids,
             "allowed_evidence_by_source": allowed_evidence_by_source,
+            "investigation_policy": {
+                "commands": ["context", "contact-sheet", "frames", "query", "gaps"],
+                "dynamic_visual_origin": VisualOrigin.INVESTIGATION.value,
+                "scope": "source-sections",
+            },
         }
         tasks.append(
             workspace.ensure_work_item(
@@ -246,6 +252,40 @@ def _load_analyze_result(path: Path) -> AnalyzeResult:
         raise ProcessingError(f"Could not read Analyze result: {exc}") from exc
 
 
+def _scoped_investigation_evidence(
+    workspace: Workspace,
+    task: WorkItem,
+) -> dict[str, dict[str, VisualEvent]]:
+    source_sections = task.scope.get("source_sections")
+    if not isinstance(source_sections, dict):
+        return {}
+    scoped: dict[str, dict[str, VisualEvent]] = {}
+    for raw_source_id, raw_ordinals in source_sections.items():
+        source_id = str(raw_source_id)
+        if not isinstance(raw_ordinals, list):
+            continue
+        ordinals = {int(ordinal) for ordinal in raw_ordinals}
+        intervals = [
+            (section.start, section.end)
+            for section in workspace.semantic_segments(source_id)
+            if section.ordinal in ordinals
+        ]
+        investigation_root = workspace.source_directory(source_id) / "investigation-frames"
+        for event in workspace.visuals(source_id, origin=VisualOrigin.INVESTIGATION):
+            raw_path = event.path.expanduser()
+            resolved_path = raw_path.resolve()
+            if (
+                not intervals
+                or not any(start <= event.timestamp <= end for start, end in intervals)
+                or not resolved_path.is_file()
+                or raw_path.is_symlink()
+                or not is_within(resolved_path, investigation_root)
+            ):
+                continue
+            scoped.setdefault(source_id, {})[event.id] = event
+    return scoped
+
+
 def _validate_analyze_evidence(
     workspace: Workspace,
     task: WorkItem,
@@ -265,6 +305,20 @@ def _validate_analyze_evidence(
         .get("allowed_evidence_by_source", {})
         .items()
     }
+    investigation_policy = packet["payload"].get("investigation_policy", {})
+    investigation_by_source = (
+        _scoped_investigation_evidence(workspace, task)
+        if investigation_policy.get("dynamic_visual_origin") == VisualOrigin.INVESTIGATION.value
+        and investigation_policy.get("scope") == "source-sections"
+        else {}
+    )
+    allowed.update(
+        evidence_id
+        for evidence_by_id in investigation_by_source.values()
+        for evidence_id in evidence_by_id
+    )
+    for source_id, evidence_by_id in investigation_by_source.items():
+        allowed_by_source.setdefault(source_id, set()).update(evidence_by_id)
     scoped_sources = {source_id for source_id in task.scope.get("source_sections", {})}
     known_sources = {source.id: source for source in workspace.list_sources()}
     if not scoped_sources:
