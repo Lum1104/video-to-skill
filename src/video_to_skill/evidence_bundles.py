@@ -25,7 +25,15 @@ from video_to_skill import __version__
 from video_to_skill.editions import load_edition_state_by_id
 from video_to_skill.errors import ProcessingError
 from video_to_skill.generation import CourseAsset
-from video_to_skill.models import SourceDescriptor, SourcePlatform
+from video_to_skill.models import (
+    AgentObservation,
+    EvidenceGap,
+    SemanticSegment,
+    SourceDescriptor,
+    SourcePlatform,
+    TranscriptSegment,
+    VisualEvent,
+)
 from video_to_skill.tool_runs import sanitize_value
 from video_to_skill.utils import stable_hash
 from video_to_skill.workspace import SCHEMA_VERSION, Workspace
@@ -102,13 +110,121 @@ _ARCHIVAL_EXACT_KINDS = {
     "workspace/manifest.json": "sanitized-workspace-manifest",
     "workspace/evidence.sqlite3": "private-evidence-database",
     "workspace/logs/tool-runs.jsonl": "sanitized-tool-runs",
-    "workspace/coverage.json": "private-workspace-record",
+    "workspace/coverage.json": "private-sanitized-evidence-record",
+    "workspace/observations/gaps.json": "private-sanitized-evidence-record",
+    "workspace/observations/observations.jsonl": "private-sanitized-evidence-record",
 }
 _ARCHIVAL_REQUIRED = frozenset(
     {
         "workspace/manifest.json",
         "workspace/evidence.sqlite3",
         "workspace/logs/tool-runs.jsonl",
+    }
+)
+_ARCHIVAL_DROP_KEYS = frozenset(
+    {
+        "execution_context_id",
+        "generated_path",
+        "installed_path",
+        "lease",
+        "lease_expires_at",
+        "lease_owner",
+        "lease_token",
+        "lease_token_hash",
+        "output",
+        "packet_path",
+        "project_root",
+        "result_path",
+        "skill_root",
+        "snapshot_digest",
+        "task_path",
+        "validation_report_path",
+        "workspace",
+    }
+)
+_ARCHIVAL_BUILD_FILES = frozenset(_BUILD_KINDS)
+_ARCHIVAL_IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp"})
+_ARCHIVAL_MEDIA_SUFFIXES = frozenset(
+    {
+        ".aac",
+        ".avi",
+        ".flac",
+        ".m4a",
+        ".m4v",
+        ".mkv",
+        ".mov",
+        ".mp3",
+        ".mp4",
+        ".ogg",
+        ".opus",
+        ".wav",
+        ".webm",
+    }
+)
+_ARCHIVAL_DB_COLUMNS = {
+    "archive_metadata": ("key", "value"),
+    "sources": ("id", "ordinal", "descriptor_json", "content_hash", "active"),
+    "transcript_segments": ("id", "source_id", "start", "end", "data_json"),
+    "visual_events": ("id", "source_id", "timestamp", "data_json"),
+    "semantic_segments": ("id", "source_id", "ordinal", "start", "end", "data_json"),
+    "agent_observations": ("id", "source_id", "start", "end", "data_json"),
+    "evidence_gaps": ("id", "source_id", "start", "end", "data_json"),
+    "canonical_records": ("kind", "record_id", "revision", "path", "digest", "created_at"),
+    "canonical_heads": ("kind", "record_id", "revision"),
+}
+_ARCHIVAL_DB_SCHEMA = """
+PRAGMA foreign_keys = ON;
+CREATE TABLE archive_metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE sources(
+    id TEXT PRIMARY KEY, ordinal INTEGER NOT NULL, descriptor_json TEXT NOT NULL,
+    content_hash TEXT, active INTEGER NOT NULL CHECK(active IN (0, 1))
+);
+CREATE TABLE transcript_segments(
+    id TEXT PRIMARY KEY, source_id TEXT NOT NULL, start REAL NOT NULL, end REAL NOT NULL,
+    data_json TEXT NOT NULL, FOREIGN KEY(source_id) REFERENCES sources(id) ON DELETE CASCADE
+);
+CREATE TABLE visual_events(
+    id TEXT PRIMARY KEY, source_id TEXT NOT NULL, timestamp REAL NOT NULL,
+    data_json TEXT NOT NULL, FOREIGN KEY(source_id) REFERENCES sources(id) ON DELETE CASCADE
+);
+CREATE TABLE semantic_segments(
+    id TEXT PRIMARY KEY, source_id TEXT NOT NULL, ordinal INTEGER NOT NULL,
+    start REAL NOT NULL, end REAL NOT NULL, data_json TEXT NOT NULL,
+    FOREIGN KEY(source_id) REFERENCES sources(id) ON DELETE CASCADE
+);
+CREATE TABLE agent_observations(
+    id TEXT PRIMARY KEY, source_id TEXT NOT NULL, start REAL NOT NULL, end REAL NOT NULL,
+    data_json TEXT NOT NULL, FOREIGN KEY(source_id) REFERENCES sources(id) ON DELETE CASCADE
+);
+CREATE TABLE evidence_gaps(
+    id TEXT PRIMARY KEY, source_id TEXT NOT NULL, start REAL NOT NULL, end REAL NOT NULL,
+    data_json TEXT NOT NULL, FOREIGN KEY(source_id) REFERENCES sources(id) ON DELETE CASCADE
+);
+CREATE TABLE canonical_records(
+    kind TEXT NOT NULL, record_id TEXT NOT NULL, revision INTEGER NOT NULL,
+    path TEXT NOT NULL, digest TEXT NOT NULL, created_at TEXT NOT NULL,
+    PRIMARY KEY(kind, record_id, revision)
+);
+CREATE TABLE canonical_heads(
+    kind TEXT NOT NULL, record_id TEXT NOT NULL, revision INTEGER NOT NULL,
+    PRIMARY KEY(kind, record_id),
+    FOREIGN KEY(kind, record_id, revision)
+        REFERENCES canonical_records(kind, record_id, revision) ON DELETE CASCADE
+);
+"""
+_ARCHIVAL_SOURCE_METADATA_KEYS = frozenset(
+    {
+        "captions",
+        "chapters",
+        "creator",
+        "duration",
+        "id",
+        "kind",
+        "language",
+        "playlist_index",
+        "playlist_title",
+        "platform",
+        "title",
     }
 )
 
@@ -756,14 +872,163 @@ def _sanitized_edition_state(workspace: Workspace) -> dict[str, Any] | None:
     }
 
 
+def _archival_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", value.casefold()).strip("_")
+
+
+def _archival_key_is_private(value: str) -> bool:
+    normalized = _archival_key(value)
+    if normalized in _ARCHIVAL_DROP_KEYS:
+        return True
+    return any(
+        marker in normalized
+        for marker in (
+            "access_token",
+            "api_key",
+            "authorization",
+            "cookie",
+            "credential",
+            "lease_",
+            "password",
+            "secret",
+            "session_token",
+            "snapshot_digest",
+        )
+    )
+
+
+def _archival_sanitize(value: object, workspace: Workspace) -> object:
+    """Sanitize untrusted archival JSON without retaining authority-bearing keys."""
+
+    if isinstance(value, dict):
+        result: dict[str, object] = {}
+        for raw_key, item in sorted(value.items(), key=lambda pair: str(pair[0])):
+            key = str(raw_key)
+            if _archival_key_is_private(key):
+                continue
+            sanitized_key = _sanitized_string(key, workspace)
+            if sanitized_key in result:
+                raise ProcessingError("Archival record keys collide after sanitization")
+            result[sanitized_key] = _archival_sanitize(item, workspace)
+        return result
+    if isinstance(value, (list, tuple)):
+        return [_archival_sanitize(item, workspace) for item in value]
+    if isinstance(value, str) and len(value) > 4_096:
+        return f"<omitted-oversized-text:{sha256(value.encode('utf-8')).hexdigest()}>"
+    return _sanitize_json(value, workspace)
+
+
+def _database_json(value: object, workspace: Workspace) -> str:
+    return json.dumps(
+        _archival_sanitize(value, workspace),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _canonical_path_allowed(workspace: Workspace, relative: Path) -> bool:
+    if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+        return False
+    base = Workspace.open(workspace.root)
+    roots = [base.analysis_dir / "records"]
+    if workspace.edition_dir is not None:
+        roots.append(workspace.edition_dir / "analysis" / "records")
+    lexical = Path(os.path.abspath(workspace.root / relative))
+    return any(lexical.is_relative_to(Path(os.path.abspath(root))) for root in roots)
+
+
+def _build_archival_database(workspace: Workspace, snapshot: Path) -> None:
+    base = Workspace.open(workspace.root)
+    try:
+        with base.connect() as source, sqlite3.connect(snapshot) as destination:
+            source.execute("BEGIN")
+            destination.execute("PRAGMA secure_delete = ON")
+            destination.executescript(_ARCHIVAL_DB_SCHEMA)
+            destination.execute(
+                "INSERT INTO archive_metadata(key, value) VALUES(?, ?)",
+                ("archive_schema_version", "1"),
+            )
+            for row in source.execute(
+                "SELECT id, ordinal, descriptor_json, content_hash, active "
+                "FROM sources ORDER BY ordinal, id"
+            ):
+                descriptor = SourceDescriptor.model_validate_json(str(row["descriptor_json"]))
+                destination.execute(
+                    "INSERT INTO sources VALUES(?, ?, ?, ?, ?)",
+                    (
+                        str(row["id"]),
+                        int(row["ordinal"]),
+                        _database_json(_source_metadata(descriptor, workspace), workspace),
+                        str(row["content_hash"]) if row["content_hash"] else None,
+                        int(row["active"]),
+                    ),
+                )
+            typed_tables: tuple[tuple[str, type[BaseModel], tuple[str, ...]], ...] = (
+                (
+                    "transcript_segments",
+                    TranscriptSegment,
+                    ("id", "source_id", "start", "end"),
+                ),
+                ("visual_events", VisualEvent, ("id", "source_id", "timestamp")),
+                (
+                    "semantic_segments",
+                    SemanticSegment,
+                    ("id", "source_id", "ordinal", "start", "end"),
+                ),
+                (
+                    "agent_observations",
+                    AgentObservation,
+                    ("id", "source_id", "start", "end"),
+                ),
+                ("evidence_gaps", EvidenceGap, ("id", "source_id", "start", "end")),
+            )
+            for table, model, scalar_columns in typed_tables:
+                placeholders = ", ".join("?" for _ in (*scalar_columns, "data_json"))
+                for row in source.execute(f"SELECT data_json FROM {table} ORDER BY data_json"):
+                    value = model.model_validate_json(str(row["data_json"]))
+                    canonical = _archival_sanitize(value.model_dump(mode="json"), workspace)
+                    if not isinstance(canonical, dict):
+                        raise ProcessingError("Canonical archival evidence must be an object")
+                    canonical_model = model.model_validate(canonical)
+                    canonical_dump = canonical_model.model_dump(mode="json")
+                    destination.execute(
+                        f"INSERT INTO {table} VALUES({placeholders})",
+                        (
+                            *(canonical_dump[column] for column in scalar_columns),
+                            _database_json(canonical_dump, workspace),
+                        ),
+                    )
+            retained_records: set[tuple[str, str, int]] = set()
+            for row in source.execute(
+                "SELECT kind, record_id, revision, path, digest, created_at "
+                "FROM canonical_records ORDER BY kind, record_id, revision"
+            ):
+                relative = Path(str(row["path"]))
+                if not _canonical_path_allowed(workspace, relative):
+                    continue
+                key = (str(row["kind"]), str(row["record_id"]), int(row["revision"]))
+                retained_records.add(key)
+                destination.execute(
+                    "INSERT INTO canonical_records VALUES(?, ?, ?, ?, ?, ?)",
+                    (*key, relative.as_posix(), str(row["digest"]), str(row["created_at"])),
+                )
+            for row in source.execute(
+                "SELECT kind, record_id, revision FROM canonical_heads ORDER BY kind, record_id"
+            ):
+                key = (str(row["kind"]), str(row["record_id"]), int(row["revision"]))
+                if key in retained_records:
+                    destination.execute("INSERT INTO canonical_heads VALUES(?, ?, ?)", key)
+            destination.commit()
+            destination.execute("VACUUM")
+            source.rollback()
+    except (sqlite3.Error, ValidationError) as exc:
+        raise ProcessingError(f"Could not build the archival evidence database: {exc}") from exc
+
+
 def _sqlite_snapshot_entry(workspace: Workspace, temporary_root: Path) -> _Entry:
     snapshot = temporary_root / "evidence.sqlite3"
-    source = Workspace.open(workspace.root)
-    try:
-        with source.connect() as connection, sqlite3.connect(snapshot) as destination:
-            connection.backup(destination)
-    except sqlite3.Error as exc:
-        raise ProcessingError(f"Could not snapshot the evidence database: {exc}") from exc
+    _build_archival_database(workspace, snapshot)
     return _source_entry(
         "workspace/evidence.sqlite3",
         kind="private-evidence-database",
@@ -772,7 +1037,79 @@ def _sqlite_snapshot_entry(workspace: Workspace, temporary_root: Path) -> _Entry
     )
 
 
-def _archival_tree(
+def _archival_source_entries(workspace: Workspace, entries: dict[str, _Entry]) -> None:
+    base = Workspace.open(workspace.root)
+    for descriptor in base.list_sources(include_inactive=True):
+        component = _safe_component(descriptor.id, prefix="source")
+        source_root = _lexical_child(base.sources_dir, descriptor.id)
+        materialization = base.materialization_record(descriptor.id)
+        if materialization is not None and materialization["media_path"]:
+            media = Path(os.path.abspath(str(materialization["media_path"])))
+            if media.is_relative_to(source_root):
+                suffix = media.suffix.casefold()
+                if suffix not in _ARCHIVAL_MEDIA_SUFFIXES:
+                    raise ProcessingError("Archival source media uses an unsupported file type")
+                _add_entry(
+                    entries,
+                    _source_entry(
+                        f"workspace/sources/{component}/media{suffix}",
+                        kind="private-source-media",
+                        source_root=source_root,
+                        source_path=media,
+                    ),
+                )
+        audio = source_root / "audio-16khz.wav"
+        if audio.exists():
+            _add_entry(
+                entries,
+                _source_entry(
+                    f"workspace/sources/{component}/audio-16khz.wav",
+                    kind="private-source-audio",
+                    source_root=source_root,
+                    source_path=audio,
+                ),
+            )
+        for directory in ("frames", "investigation-frames", "contact-sheets"):
+            visual_root = source_root / directory
+            if not visual_root.exists():
+                continue
+            for visual in _walk_regular_files(visual_root, archival=True):
+                if visual.suffix.casefold() not in _ARCHIVAL_IMAGE_SUFFIXES:
+                    continue
+                relative = visual.relative_to(visual_root).as_posix()
+                _add_entry(
+                    entries,
+                    _source_entry(
+                        f"workspace/sources/{component}/{directory}/{relative}",
+                        kind="private-source-visual",
+                        source_root=visual_root,
+                        source_path=visual,
+                    ),
+                )
+
+
+def _read_archival_json(
+    root: Path,
+    path: Path,
+    workspace: Workspace,
+    *,
+    expected_sha256: str | None = None,
+) -> object:
+    with _open_regular_beneath(root, path) as (descriptor, metadata):
+        if metadata.st_size > 64 * 1024 * 1024:
+            raise ProcessingError("Archival JSON evidence exceeds its size limit")
+        with os.fdopen(os.dup(descriptor), "rb") as handle:
+            payload = handle.read()
+    if expected_sha256 is not None and sha256(payload).hexdigest() != expected_sha256:
+        raise ProcessingError(f"Canonical archival evidence failed its digest check: {path.name}")
+    try:
+        parsed = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ProcessingError(f"Archival evidence is invalid JSON: {path.name}") from exc
+    return _archival_sanitize(parsed, workspace)
+
+
+def _archival_build_entries(
     workspace: Workspace,
     entries: dict[str, _Entry],
     root: Path,
@@ -780,19 +1117,102 @@ def _archival_tree(
 ) -> None:
     if not root.exists():
         return
-    for source in _walk_regular_files(root, archival=True):
-        relative = source.relative_to(root)
-        if relative.name in {"manifest.json", "edition.json", "evidence.sqlite3"}:
+    if root.is_symlink() or not root.is_dir():
+        raise ProcessingError("Archival build evidence root is unsafe")
+    for build in sorted(root.iterdir(), key=lambda path: path.name):
+        if build.is_symlink():
+            raise ProcessingError("Archival build evidence cannot use symbolic links")
+        if not build.is_dir():
             continue
-        _add_entry(
-            entries,
-            _source_entry(
-                f"{destination_root}/{relative.as_posix()}",
-                kind="private-workspace-file",
-                source_root=root,
-                source_path=source,
-            ),
+        component = _safe_component(build.name, prefix="build")
+        for name in sorted(_ARCHIVAL_BUILD_FILES):
+            path = build / name
+            if not path.exists():
+                continue
+            value = _read_archival_json(root, path, workspace)
+            _add_entry(
+                entries,
+                _payload_entry(
+                    f"{destination_root}/{component}/{name}",
+                    _json_bytes(value),
+                    kind="private-sanitized-build-record",
+                ),
+            )
+
+
+def _archival_canonical_entries(workspace: Workspace, entries: dict[str, _Entry]) -> None:
+    base = Workspace.open(workspace.root)
+    roots = [base.analysis_dir / "records"]
+    if workspace.edition_dir is not None:
+        roots.append(workspace.edition_dir / "analysis" / "records")
+    with base.connect() as connection:
+        rows = connection.execute(
+            "SELECT path, digest FROM canonical_records ORDER BY path"
+        ).fetchall()
+    for row in rows:
+        relative = Path(str(row["path"]))
+        source = workspace.root / relative
+        lexical_source = Path(os.path.abspath(source))
+        if not any(lexical_source.is_relative_to(Path(os.path.abspath(root))) for root in roots):
+            continue
+        destination = f"workspace/{relative.as_posix()}"
+        suffix = source.suffix.casefold()
+        if suffix == ".json":
+            value = _read_archival_json(
+                workspace.root,
+                source,
+                workspace,
+                expected_sha256=str(row["digest"]),
+            )
+            _add_entry(
+                entries,
+                _payload_entry(
+                    destination,
+                    _json_bytes(value),
+                    kind="private-sanitized-canonical-record",
+                ),
+            )
+        elif suffix in _ARCHIVAL_IMAGE_SUFFIXES:
+            _add_entry(
+                entries,
+                _source_entry(
+                    destination,
+                    kind="private-canonical-binary",
+                    source_root=workspace.root,
+                    source_path=source,
+                    expected_sha256=str(row["digest"]),
+                ),
+            )
+
+
+def _archival_evidence_entries(workspace: Workspace, entries: dict[str, _Entry]) -> None:
+    observations: list[object] = []
+    for source in workspace.list_sources(include_inactive=True):
+        observations.extend(
+            item.model_dump(mode="json")
+            for item in workspace.observations(source.id, limit=1_000_000)
         )
+    _add_entry(
+        entries,
+        _payload_entry(
+            "workspace/observations/observations.jsonl",
+            _jsonl_bytes(cast(list[object], _archival_sanitize(observations, workspace))),
+            kind="private-sanitized-evidence-record",
+        ),
+    )
+    _add_entry(
+        entries,
+        _payload_entry(
+            "workspace/observations/gaps.json",
+            _json_bytes(
+                _archival_sanitize(
+                    [item.model_dump(mode="json") for item in workspace.gaps(limit=None)],
+                    workspace,
+                )
+            ),
+            kind="private-sanitized-evidence-record",
+        ),
+    )
 
 
 def _external_archival_media(workspace: Workspace, entries: dict[str, _Entry]) -> None:
@@ -862,27 +1282,25 @@ def _archival_entries(workspace: Workspace, temporary_root: Path) -> dict[str, _
         entries,
         _payload_entry(
             "workspace/manifest.json",
-            _json_bytes(_sanitize_json(_sanitized_workspace_manifest(workspace), workspace)),
+            _json_bytes(_archival_sanitize(_sanitized_workspace_manifest(workspace), workspace)),
             kind="sanitized-workspace-manifest",
         ),
     )
     _add_entry(entries, _sqlite_snapshot_entry(workspace, temporary_root))
-    _archival_tree(workspace, entries, workspace.sources_dir, "workspace/sources")
-    _archival_tree(workspace, entries, base.analysis_dir, "workspace/analysis")
-    _archival_tree(workspace, entries, base.builds_dir, "workspace/builds")
-    _archival_tree(workspace, entries, workspace.root / "observations", "workspace/observations")
-    for name in ("coverage.json",):
-        path = workspace.root / name
-        if path.exists():
-            _add_entry(
-                entries,
-                _source_entry(
-                    f"workspace/{name}",
-                    kind="private-workspace-record",
-                    source_root=workspace.root,
-                    source_path=path,
-                ),
-            )
+    _archival_source_entries(workspace, entries)
+    _archival_canonical_entries(workspace, entries)
+    _archival_build_entries(workspace, entries, base.builds_dir, "workspace/builds")
+    _archival_evidence_entries(workspace, entries)
+    coverage_path = workspace.root / "coverage.json"
+    if coverage_path.exists():
+        _add_entry(
+            entries,
+            _payload_entry(
+                "workspace/coverage.json",
+                _json_bytes(_read_archival_json(workspace.root, coverage_path, workspace)),
+                kind="private-sanitized-evidence-record",
+            ),
+        )
     if workspace.edition_id is not None:
         assert workspace.edition_dir is not None
         edition = _sanitized_edition_state(workspace)
@@ -891,17 +1309,11 @@ def _archival_entries(workspace: Workspace, temporary_root: Path) -> dict[str, _
             entries,
             _payload_entry(
                 f"workspace/editions/{workspace.edition_id}/edition.json",
-                _json_bytes(_sanitize_json(edition, workspace)),
+                _json_bytes(_archival_sanitize(edition, workspace)),
                 kind="sanitized-edition-state",
             ),
         )
-        _archival_tree(
-            workspace,
-            entries,
-            workspace.edition_dir / "analysis" / "records",
-            f"workspace/editions/{workspace.edition_id}/analysis/records",
-        )
-        _archival_tree(
+        _archival_build_entries(
             workspace,
             entries,
             workspace.edition_dir / "builds",
@@ -1073,20 +1485,284 @@ def _archival_record_allowed(record: EvidenceBundleFile) -> bool:
         return True
     if parts[:2] == ("workspace", "editions") and parts[-1] == "edition.json":
         return False
+    if len(parts) == 4 and parts[:2] == ("workspace", "sources"):
+        suffix = PurePosixPath(record.path).suffix.casefold()
+        if parts[3] == f"media{suffix}" and suffix in _ARCHIVAL_MEDIA_SUFFIXES:
+            return record.kind == "private-source-media"
+        if parts[3] == "audio-16khz.wav":
+            return record.kind == "private-source-audio"
+        return False
     if (
-        len(parts) >= 3
-        and parts[0] == "workspace"
-        and parts[1]
-        in {
-            "sources",
-            "analysis",
-            "builds",
-            "observations",
-            "editions",
-        }
+        len(parts) >= 5
+        and parts[:2] == ("workspace", "sources")
+        and parts[3] in {"frames", "investigation-frames", "contact-sheets"}
+        and PurePosixPath(record.path).suffix.casefold() in _ARCHIVAL_IMAGE_SUFFIXES
     ):
-        return record.kind == "private-workspace-file"
+        return record.kind == "private-source-visual"
+    shared_canonical = len(parts) == 6 and parts[:3] == (
+        "workspace",
+        "analysis",
+        "records",
+    )
+    edition_canonical = (
+        len(parts) == 8
+        and parts[0] == "workspace"
+        and parts[1] == "editions"
+        and parts[3:5]
+        == (
+            "analysis",
+            "records",
+        )
+    )
+    if shared_canonical or edition_canonical:
+        if PurePosixPath(record.path).suffix.casefold() == ".json":
+            return record.kind == "private-sanitized-canonical-record"
+        if PurePosixPath(record.path).suffix.casefold() in _ARCHIVAL_IMAGE_SUFFIXES:
+            return record.kind == "private-canonical-binary"
+        return False
+    shared_build = len(parts) == 4 and parts[:2] == ("workspace", "builds")
+    edition_build = (
+        len(parts) == 6
+        and parts[0] == "workspace"
+        and parts[1] == "editions"
+        and parts[3] == "builds"
+    )
+    if shared_build or edition_build:
+        return (
+            parts[-1] in _ARCHIVAL_BUILD_FILES and record.kind == "private-sanitized-build-record"
+        )
     return False
+
+
+def _validate_archival_value(value: object) -> None:
+    verifier_root = Path("/__video_to_skill_archival_verifier__")
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str) or _archival_key_is_private(key):
+                raise ProcessingError("Archival JSON contains a forbidden private key")
+            try:
+                sanitized_key = sanitize_value(key, workspace_root=verifier_root)
+            except ValueError as exc:
+                raise ProcessingError(f"Archival JSON key is invalid: {exc}") from exc
+            if sanitized_key != key:
+                raise ProcessingError("Archival JSON contains an unsafe key")
+            _validate_archival_value(item)
+        return
+    if isinstance(value, list):
+        for item in value:
+            _validate_archival_value(item)
+        return
+    if isinstance(value, str):
+        try:
+            sanitized = sanitize_value(value, workspace_root=verifier_root)
+        except ValueError as exc:
+            raise ProcessingError(f"Archival JSON string is invalid: {exc}") from exc
+        if sanitized != value:
+            raise ProcessingError("Archival JSON contains an unsafe string")
+        return
+    if value is not None and not isinstance(value, (bool, int, float)):
+        raise ProcessingError("Archival JSON contains an unsupported value")
+
+
+def _parse_archival_json(payload: bytes, *, json_lines: bool) -> list[object]:
+    try:
+        if json_lines:
+            values = [json.loads(line) for line in payload.splitlines() if line.strip()]
+        else:
+            values = [json.loads(payload)]
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ProcessingError(f"Sanitized archival JSON is invalid: {exc}") from exc
+    for value in values:
+        _validate_archival_value(value)
+    return values
+
+
+def _validate_archival_json_members(
+    archive: zipfile.ZipFile, manifest: EvidenceBundleManifest
+) -> None:
+    json_kinds = {
+        "private-sanitized-build-record",
+        "private-sanitized-canonical-record",
+        "private-sanitized-evidence-record",
+        "sanitized-edition-state",
+        "sanitized-tool-runs",
+        "sanitized-workspace-manifest",
+    }
+    for record in manifest.files:
+        if record.kind not in json_kinds:
+            continue
+        json_lines = record.path.endswith(".jsonl")
+        _parse_archival_json(archive.read(record.path), json_lines=json_lines)
+
+
+def _database_canonical_path_allowed(path: str, manifest: EvidenceBundleManifest) -> bool:
+    candidate = PurePosixPath(path)
+    if candidate.is_absolute() or candidate.as_posix() != path:
+        return False
+    parts = candidate.parts
+    if any(part in {"", ".", ".."} for part in parts):
+        return False
+    if len(parts) == 5 and parts[:2] == ("analysis", "records"):
+        return True
+    if manifest.edition is None:
+        return False
+    edition_id = manifest.edition.get("edition_id")
+    return (
+        len(parts) == 8
+        and parts[:2] == ("editions", edition_id)
+        and parts[2:4] == ("analysis", "records")
+    )
+
+
+def _validate_database_json_row(
+    raw: object,
+    model: type[BaseModel],
+    *,
+    label: str,
+) -> dict[str, Any]:
+    try:
+        parsed = json.loads(str(raw))
+        validated = model.model_validate(parsed).model_dump(mode="json")
+    except (json.JSONDecodeError, ValidationError) as exc:
+        raise ProcessingError(f"Archival database {label} is invalid: {exc}") from exc
+    _validate_archival_value(parsed)
+    if parsed != validated:
+        raise ProcessingError(f"Archival database {label} is not canonical")
+    return cast(dict[str, Any], parsed)
+
+
+def _verify_archival_database(
+    archive: zipfile.ZipFile,
+    manifest: EvidenceBundleManifest,
+) -> set[str]:
+    with tempfile.TemporaryDirectory(prefix="video-to-skill-verify-db-") as temporary:
+        database = Path(temporary) / "evidence.sqlite3"
+        with archive.open("workspace/evidence.sqlite3") as source, database.open("wb") as output:
+            while chunk := source.read(_CHUNK_SIZE):
+                output.write(chunk)
+        try:
+            with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
+                connection.row_factory = sqlite3.Row
+                integrity = connection.execute("PRAGMA integrity_check").fetchall()
+                if [str(row[0]) for row in integrity] != ["ok"]:
+                    raise ProcessingError("Archival evidence database failed its integrity check")
+                if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                    raise ProcessingError("Archival evidence database has broken references")
+                objects = connection.execute(
+                    "SELECT type, name FROM sqlite_master "
+                    "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+                ).fetchall()
+                tables = {str(row["name"]) for row in objects if row["type"] == "table"}
+                if tables != set(_ARCHIVAL_DB_COLUMNS) or any(
+                    row["type"] in {"trigger", "view"} for row in objects
+                ):
+                    raise ProcessingError("Archival evidence database schema is forbidden")
+                for table, expected_columns in _ARCHIVAL_DB_COLUMNS.items():
+                    columns = tuple(
+                        str(row["name"])
+                        for row in connection.execute(f"PRAGMA table_info({table})")
+                    )
+                    if columns != expected_columns:
+                        raise ProcessingError(
+                            f"Archival evidence database columns are forbidden: {table}"
+                        )
+                metadata = connection.execute(
+                    "SELECT key, value FROM archive_metadata ORDER BY key"
+                ).fetchall()
+                if [(row["key"], row["value"]) for row in metadata] != [
+                    ("archive_schema_version", "1")
+                ]:
+                    raise ProcessingError("Archival evidence database metadata is invalid")
+                lineage = {
+                    str(item["source_id"]): str(item["descriptor_sha256"])
+                    for item in manifest.source_lineage
+                }
+                source_ids: set[str] = set()
+                for row in connection.execute(
+                    "SELECT id, descriptor_json, content_hash FROM sources ORDER BY id"
+                ):
+                    source_id = str(row["id"])
+                    _validate_archival_value(source_id)
+                    try:
+                        descriptor = json.loads(str(row["descriptor_json"]))
+                    except json.JSONDecodeError as exc:
+                        raise ProcessingError("Archival source metadata is invalid") from exc
+                    if (
+                        not isinstance(descriptor, dict)
+                        or set(descriptor) != _ARCHIVAL_SOURCE_METADATA_KEYS
+                        or descriptor.get("id") != source_id
+                    ):
+                        raise ProcessingError("Archival source metadata identity is invalid")
+                    _validate_archival_value(descriptor)
+                    if sha256(_json_bytes(descriptor)).hexdigest() != lineage.get(source_id):
+                        raise ProcessingError("Archival source metadata differs from lineage")
+                    if row["content_hash"] is not None:
+                        _validate_archival_value(str(row["content_hash"]))
+                    source_ids.add(source_id)
+                if source_ids != set(lineage):
+                    raise ProcessingError("Archival database sources differ from lineage")
+                typed_tables: tuple[tuple[str, type[BaseModel], tuple[str, ...]], ...] = (
+                    (
+                        "transcript_segments",
+                        TranscriptSegment,
+                        ("id", "source_id", "start", "end"),
+                    ),
+                    ("visual_events", VisualEvent, ("id", "source_id", "timestamp")),
+                    (
+                        "semantic_segments",
+                        SemanticSegment,
+                        ("id", "source_id", "ordinal", "start", "end"),
+                    ),
+                    (
+                        "agent_observations",
+                        AgentObservation,
+                        ("id", "source_id", "start", "end"),
+                    ),
+                    ("evidence_gaps", EvidenceGap, ("id", "source_id", "start", "end")),
+                )
+                for table, model, scalar_columns in typed_tables:
+                    selected = ", ".join((*scalar_columns, "data_json"))
+                    for row in connection.execute(f"SELECT {selected} FROM {table} ORDER BY id"):
+                        canonical = _validate_database_json_row(
+                            row["data_json"], model, label=f"{table}.data_json"
+                        )
+                        for column in scalar_columns:
+                            if row[column] != canonical[column]:
+                                raise ProcessingError(
+                                    f"Archival database {table}.{column} differs from data_json"
+                                )
+                            _validate_archival_value(row[column])
+                for row in connection.execute(
+                    "SELECT kind, record_id, revision, path, digest, created_at "
+                    "FROM canonical_records ORDER BY kind, record_id, revision"
+                ):
+                    for column in ("kind", "record_id", "created_at"):
+                        _validate_archival_value(str(row[column]))
+                    if not _database_canonical_path_allowed(str(row["path"]), manifest):
+                        raise ProcessingError("Archival canonical record path is forbidden")
+                    if not re.fullmatch(r"[a-f0-9]{64}", str(row["digest"])):
+                        raise ProcessingError("Archival canonical record digest is invalid")
+                return source_ids
+        except sqlite3.Error as exc:
+            raise ProcessingError(f"Archival evidence database is invalid: {exc}") from exc
+
+
+def _validate_archival_contents(archive: zipfile.ZipFile, manifest: EvidenceBundleManifest) -> None:
+    _validate_archival_json_members(archive, manifest)
+    source_ids = _verify_archival_database(archive, manifest)
+    source_components = {_safe_component(source_id, prefix="source") for source_id in source_ids}
+    for record in manifest.files:
+        parts = PurePosixPath(record.path).parts
+        if (
+            len(parts) >= 3
+            and parts[:2]
+            in {
+                ("workspace", "sources"),
+                ("workspace", "external-sources"),
+            }
+            and parts[2] not in source_components
+        ):
+            raise ProcessingError("Archival source asset has no database lineage")
 
 
 def _validate_manifest_policy(manifest: EvidenceBundleManifest) -> None:
@@ -1524,6 +2200,8 @@ def verify_evidence_bundle(path: Path) -> EvidenceBundleReport:
                         f"Evidence bundle member checksum mismatch: {info.filename}"
                     )
             _validate_manifest_policy(manifest)
+            if manifest.mode == EvidenceBundleMode.ARCHIVAL:
+                _validate_archival_contents(archive, manifest)
             identity_payload = manifest.model_dump(
                 mode="json",
                 exclude={"bundle_id"},

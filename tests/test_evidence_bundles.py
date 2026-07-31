@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sqlite3
 import stat
 import struct
 import zipfile
@@ -29,10 +30,12 @@ from video_to_skill.models import (
     EvidenceGapType,
     ObservationProducer,
     ObservationType,
+    SemanticSegment,
     SourceDescriptor,
     SourcePlatform,
     TranscriptOrigin,
     TranscriptSegment,
+    VisualEvent,
 )
 from video_to_skill.utils import stable_hash
 from video_to_skill.workspace import Workspace
@@ -165,6 +168,7 @@ def _write_policy_bundle(
     transcript_authorized: bool = False,
     mutate_info=None,
     archive_comment: bytes = b"",
+    source_lineage: list[dict[str, object]] | None = None,
 ) -> None:
     files = [
         {
@@ -184,7 +188,9 @@ def _write_policy_bundle(
         "workspace_job_id": "test-job",
         "workspace_snapshot_digest": "snapshot",
         "analysis_depth": None,
-        "source_lineage": (
+        "source_lineage": source_lineage
+        if source_lineage is not None
+        else (
             [{"source_id": "source-one", "descriptor_sha256": "0" * 64}]
             if mode == "compact"
             else []
@@ -331,7 +337,7 @@ def test_archival_bundle_requires_confirmation_is_private_and_excludes_secrets(
         assert "workspace/evidence.sqlite3" in names
         assert "workspace/sources/source-one/media.mp4" in names
         assert "workspace/sources/source-one/frames/frame-001.jpg" in names
-        assert "workspace/sources/source-one/captions.en.vtt" in names
+        assert "workspace/sources/source-one/captions.en.vtt" not in names
         assert "workspace/logs/tool-runs.jsonl" in names
         assert not any("cache" in name.casefold() for name in names)
         assert not any("auth" in name.casefold() for name in names)
@@ -342,6 +348,405 @@ def test_archival_bundle_requires_confirmation_is_private_and_excludes_secrets(
         sanitized_manifest = json.loads(archive.read("workspace/manifest.json"))
         assert "inputs" not in sanitized_manifest
         assert "workspace" not in sanitized_manifest
+
+
+def test_archival_bundle_omits_operational_authority_and_sanitizes_retained_evidence(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    private_root = tmp_path / "private-project-root"
+    secrets = {
+        "RUN-LEASE-TOKEN",
+        "ACCEPTED-LEASE-TOKEN",
+        "COMPLETION-LEASE-TOKEN",
+        "BUILD-LEASE-TOKEN",
+        "DB-LEASE-TOKEN-HASH",
+        "PRIVATE-SNAPSHOT-DIGEST",
+        "RAW-TREE-SENTINEL",
+        "FTS-SENTINEL",
+        "SCOPE-SECRET-SENTINEL",
+        "PERSONA-SECRET-SENTINEL",
+        "PACKET-AUTHORITY-SENTINEL",
+        "FAILURE-SECRET-SENTINEL",
+        "SCALAR-SECRET",
+    }
+    (workspace.source_directory("source-one") / "harmless.json").write_text(
+        json.dumps(
+            {
+                "value": "RAW-TREE-SENTINEL",
+                "project": "/Users/private/project",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (workspace.analysis_dir / "run-config.json").write_text(
+        json.dumps(
+            {
+                "output": str(tmp_path / "private-output"),
+                "project_root": str(private_root),
+                "skill_root": str(tmp_path / "private-skill-root"),
+                "workspace": str(workspace.root),
+                "nested": {
+                    "lease_token": "RUN-LEASE-TOKEN",
+                    "snapshot_digest": "PRIVATE-SNAPSHOT-DIGEST",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    result = workspace.analysis_dir / "results" / "accepted.json"
+    result.parent.mkdir(parents=True)
+    result.write_text(
+        json.dumps(
+            {
+                "lease_token": "ACCEPTED-LEASE-TOKEN",
+                "unknown_result_key": {
+                    "project_root": str(private_root),
+                    "snapshot_digest": "PRIVATE-SNAPSHOT-DIGEST",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    build = workspace.builds_dir / "build-private"
+    build.mkdir(parents=True)
+    (build / "completion.json").write_text(
+        json.dumps(
+            {
+                "generated_path": str(tmp_path / "generated"),
+                "installed_path": str(tmp_path / "installed"),
+                "validation_report_path": str(tmp_path / "validation.json"),
+                "workspace": str(workspace.root),
+                "lease_token": "COMPLETION-LEASE-TOKEN",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (build / "validation-report.json").write_text(
+        json.dumps(
+            {
+                "valid": True,
+                "summary": "retained-build-evidence",
+                "nested": {
+                    "lease_token": "BUILD-LEASE-TOKEN",
+                    "unknown_result_key": {"project_root": str(private_root)},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    now = "2026-01-01T00:00:00+00:00"
+    with workspace.connect() as connection:
+        connection.execute(
+            "INSERT INTO analysis_runs(id, snapshot_digest, created_at, updated_at) "
+            "VALUES(?, ?, ?, ?)",
+            ("run-private", "PRIVATE-SNAPSHOT-DIGEST", now, now),
+        )
+        connection.execute(
+            """
+            INSERT INTO work_items(
+                id, run_id, role, scope_json, persona_hint, packet_path, packet_digest,
+                result_schema_path, snapshot_digest, state, lease_token_hash, lease_owner,
+                lease_expires_at, execution_context_id, attempt_count, failure_reason,
+                created_at, updated_at
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 'leased', ?, ?, ?, ?, 1, ?, ?, ?)
+            """,
+            (
+                "task-private",
+                "run-private",
+                "observer",
+                json.dumps(
+                    {
+                        "unknown_result_key": {
+                            "lease_token": "ACCEPTED-LEASE-TOKEN",
+                            "project_root": str(private_root),
+                        },
+                        "opaque": "SCOPE-SECRET-SENTINEL",
+                    }
+                ),
+                "PERSONA-SECRET-SENTINEL",
+                str(tmp_path / "private-packet.json"),
+                "PACKET-AUTHORITY-SENTINEL",
+                str(tmp_path / "private-schema.json"),
+                "PRIVATE-SNAPSHOT-DIGEST",
+                "DB-LEASE-TOKEN-HASH",
+                "private-worker",
+                "2099-01-01T00:00:00+00:00",
+                "private-execution-context",
+                "FAILURE-SECRET-SENTINEL",
+                now,
+                now,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO transcript_fts(id, source_id, text) VALUES(?, ?, ?)",
+            ("fts-private", "source-one", "FTS-SENTINEL /Users/private/project"),
+        )
+        connection.execute(
+            "UPDATE transcript_segments SET id=? WHERE id='transcript-one'",
+            ("/Users/private/project/SCALAR-SECRET",),
+        )
+
+    output = tmp_path / "sanitized-archival.v2sbundle"
+    export_evidence_bundle(
+        workspace,
+        output,
+        mode="archival",
+        confirm_private_archival=True,
+    )
+
+    with zipfile.ZipFile(output) as archive:
+        names = set(archive.namelist())
+        assert "workspace/analysis/run-config.json" not in names
+        assert "workspace/sources/source-one/harmless.json" not in names
+        assert not any("/analysis/results/" in f"/{name}" for name in names)
+        assert "workspace/builds/build-private/completion.json" not in names
+        retained_name = "workspace/builds/build-private/validation-report.json"
+        assert retained_name in names
+        retained = json.loads(archive.read(retained_name))
+        assert retained["valid"] is True
+        assert retained["summary"] == "retained-build-evidence"
+        assert retained["nested"]["unknown_result_key"] == {}
+        assert "workspace/observations/observations.jsonl" in names
+        assert b"A retained observation" in archive.read(
+            "workspace/observations/observations.jsonl"
+        )
+        manifest = _manifest(archive)
+        bundle_bytes = b"".join(archive.read(name) for name in archive.namelist())
+        manifest_bytes = json.dumps(manifest, sort_keys=True).encode()
+        for secret in secrets:
+            assert secret.encode() not in bundle_bytes
+            assert secret.encode() not in manifest_bytes
+        assert os.fsencode(tmp_path) not in bundle_bytes
+        assert b"/Users/private/project" not in bundle_bytes
+
+        database_copy = tmp_path / "archival-evidence.sqlite3"
+        database_copy.write_bytes(archive.read("workspace/evidence.sqlite3"))
+    with sqlite3.connect(database_copy) as connection:
+        assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            )
+        }
+        assert tables == {
+            "agent_observations",
+            "archive_metadata",
+            "canonical_heads",
+            "canonical_records",
+            "evidence_gaps",
+            "semantic_segments",
+            "sources",
+            "transcript_segments",
+            "visual_events",
+        }
+        assert connection.execute("SELECT COUNT(*) FROM sources").fetchone() == (1,)
+        assert connection.execute("SELECT COUNT(*) FROM agent_observations").fetchone() == (1,)
+        assert connection.execute("SELECT COUNT(*) FROM evidence_gaps").fetchone() == (1,)
+        assert connection.execute("SELECT id FROM transcript_segments").fetchone() == (
+            "transcript-one",
+        )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "workspace/analysis/results/accepted.json",
+        "workspace/builds/build-one/completion.json",
+    ],
+)
+def test_verifier_rejects_raw_archival_operational_records(tmp_path: Path, path: str) -> None:
+    bundle = tmp_path / "forbidden-archival.v2sbundle"
+    records = _archival_records()
+    records[path] = ("private-workspace-file", b'{"lease_token":"secret"}\n')
+    _write_policy_bundle(bundle, records, mode="archival", private_sensitive=True)
+
+    with pytest.raises(ProcessingError, match="forbidden member or kind"):
+        verify_evidence_bundle(bundle)
+
+
+def test_verifier_rejects_checksummed_non_sqlite_archival_database(tmp_path: Path) -> None:
+    bundle = tmp_path / "not-sqlite.v2sbundle"
+    _write_policy_bundle(
+        bundle,
+        _archival_records(),
+        mode="archival",
+        private_sensitive=True,
+    )
+
+    with pytest.raises(ProcessingError, match="database is invalid"):
+        verify_evidence_bundle(bundle)
+
+
+def test_verifier_rejects_checksummed_database_with_operational_schema(tmp_path: Path) -> None:
+    forged_database = tmp_path / "forged-operational.sqlite3"
+    with sqlite3.connect(forged_database) as connection:
+        connection.execute(
+            "CREATE TABLE work_items(scope_json TEXT, persona_hint TEXT, "
+            "packet_digest TEXT, failure_reason TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO work_items VALUES(?, ?, ?, ?)",
+            (
+                '{"opaque":"SCOPE-SECRET-SENTINEL"}',
+                "PERSONA-SECRET-SENTINEL",
+                "PACKET-AUTHORITY-SENTINEL",
+                "FAILURE-SECRET-SENTINEL",
+            ),
+        )
+    records = _archival_records()
+    records["workspace/evidence.sqlite3"] = (
+        "private-evidence-database",
+        forged_database.read_bytes(),
+    )
+    bundle = tmp_path / "forged-operational.v2sbundle"
+    _write_policy_bundle(bundle, records, mode="archival", private_sensitive=True)
+
+    with pytest.raises(ProcessingError, match="database schema is forbidden"):
+        verify_evidence_bundle(bundle)
+
+
+def test_verifier_rejects_unsafe_sanitized_json_before_database_trust(tmp_path: Path) -> None:
+    records = _archival_records()
+    records["workspace/builds/build-one/validation-report.json"] = (
+        "private-sanitized-build-record",
+        b'{"nested":{"project":"/Users/private/project"}}\n',
+    )
+    bundle = tmp_path / "forged-json.v2sbundle"
+    _write_policy_bundle(bundle, records, mode="archival", private_sensitive=True)
+
+    with pytest.raises(ProcessingError, match="unsafe string"):
+        verify_evidence_bundle(bundle)
+
+
+def test_verifier_rejects_forbidden_source_metadata_in_valid_database(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    original = tmp_path / "original-private.v2sbundle"
+    export_evidence_bundle(
+        workspace,
+        original,
+        mode="archival",
+        confirm_private_archival=True,
+    )
+    forged_database = tmp_path / "forged-source.sqlite3"
+    with zipfile.ZipFile(original) as archive:
+        forged_database.write_bytes(archive.read("workspace/evidence.sqlite3"))
+    with sqlite3.connect(forged_database) as connection:
+        raw = connection.execute(
+            "SELECT descriptor_json FROM sources WHERE id='source-one'"
+        ).fetchone()
+        assert raw is not None
+        descriptor = json.loads(raw[0])
+        descriptor["locator"] = "sanitized-looking-but-forbidden"
+        descriptor_text = json.dumps(
+            descriptor,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        connection.execute(
+            "UPDATE sources SET descriptor_json=? WHERE id='source-one'",
+            (descriptor_text,),
+        )
+    descriptor_payload = (descriptor_text + "\n").encode()
+    records = _archival_records()
+    records["workspace/evidence.sqlite3"] = (
+        "private-evidence-database",
+        forged_database.read_bytes(),
+    )
+    bundle = tmp_path / "forged-source-metadata.v2sbundle"
+    _write_policy_bundle(
+        bundle,
+        records,
+        mode="archival",
+        private_sensitive=True,
+        source_lineage=[
+            {
+                "source_id": "source-one",
+                "descriptor_sha256": hashlib.sha256(descriptor_payload).hexdigest(),
+            }
+        ],
+    )
+
+    with pytest.raises(ProcessingError, match="source metadata identity is invalid"):
+        verify_evidence_bundle(bundle)
+
+
+@pytest.mark.parametrize(
+    ("table", "column", "bad_value"),
+    [
+        ("transcript_segments", "id", "/Users/private/project/SCALAR-SECRET"),
+        ("visual_events", "timestamp", 42.0),
+        ("semantic_segments", "ordinal", 7),
+        ("agent_observations", "start", 12.0),
+        ("evidence_gaps", "end", 99.0),
+    ],
+)
+def test_verifier_rejects_typed_evidence_scalar_mismatch(
+    tmp_path: Path,
+    table: str,
+    column: str,
+    bad_value: object,
+) -> None:
+    workspace = _workspace(tmp_path)
+    contact = workspace.source_directory("source-one") / "contact-sheets" / "overview.jpg"
+    workspace.replace_visuals(
+        "source-one",
+        [
+            VisualEvent(
+                id="visual-one",
+                source_id="source-one",
+                timestamp=0.5,
+                path=contact,
+            )
+        ],
+    )
+    workspace.replace_semantic_segments(
+        "source-one",
+        [
+            SemanticSegment(
+                id="semantic-one",
+                source_id="source-one",
+                ordinal=1,
+                title="Opening",
+                start=0,
+                end=1,
+                transcript_ids=["transcript-one"],
+                visual_event_ids=["visual-one"],
+            )
+        ],
+    )
+    original = tmp_path / "typed-original.v2sbundle"
+    export_evidence_bundle(
+        workspace,
+        original,
+        mode="archival",
+        confirm_private_archival=True,
+    )
+    forged_database = tmp_path / f"forged-{table}-{column}.sqlite3"
+    with zipfile.ZipFile(original) as archive:
+        forged_database.write_bytes(archive.read("workspace/evidence.sqlite3"))
+        source_lineage = _manifest(archive)["source_lineage"]
+    assert isinstance(source_lineage, list)
+    with sqlite3.connect(forged_database) as connection:
+        connection.execute(f"UPDATE {table} SET {column}=?", (bad_value,))
+    records = _archival_records()
+    records["workspace/evidence.sqlite3"] = (
+        "private-evidence-database",
+        forged_database.read_bytes(),
+    )
+    bundle = tmp_path / f"forged-{table}-{column}.v2sbundle"
+    _write_policy_bundle(
+        bundle,
+        records,
+        mode="archival",
+        private_sensitive=True,
+        source_lineage=source_lineage,
+    )
+
+    with pytest.raises(ProcessingError, match=f"{table}.{column} differs from data_json"):
+        verify_evidence_bundle(bundle)
 
 
 def test_bundle_is_deterministic_create_only_and_concurrency_safe(tmp_path: Path) -> None:
@@ -477,6 +882,11 @@ def test_workspace_hardlinks_are_rejected_for_compact_and_archival(tmp_path: Pat
     compact_link.unlink()
     archival_link = source_dir / "borrowed.mp4"
     os.link(outside, archival_link)
+    with workspace.connect() as connection:
+        connection.execute(
+            "UPDATE sources SET media_path=? WHERE id=?",
+            (str(archival_link), "source-one"),
+        )
     with pytest.raises(ProcessingError, match="hard links"):
         export_evidence_bundle(
             workspace,
