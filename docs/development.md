@@ -322,6 +322,10 @@ Existing frame and segment settings remain advanced baseline overrides; the sele
 
 The requested/effective contract is persisted in `manifest.json` and `analysis/run-config.json`. Resume must match the persisted request and profile version. Use `--refresh` when source inventory or inspectable density has changed; refresh recomputes the contract and affected cache keys. Legacy workspaces are assigned a marked compatibility contract before any new Analyze snapshot.
 
+Named editions do not refresh evidence. Immutable edition state lives at `editions/<edition-id>/edition.json`; edition-local orchestration uses `editions/<edition-id>/analysis/`, and build receipts use `editions/<edition-id>/builds/`. The state pins the integrated Analyze task, workspace/source snapshot, canonical Analyze digests, and depth-contract digest. `submit` resolves the edition from task scope rather than ambient process state. If any pinned value differs, resume fails and a new edition must be created after refreshed Analyze work.
+
+Existing unnamespaced `analysis/run-config.json`, language state, tasks, canonical heads, and `builds/` remain the legacy compatibility edition. No database rewrite is required: post-Analyze record IDs are internally prefixed with the deterministic edition ID, while Analyze record IDs remain shared. Cross-run dependencies let an edition's first downstream task depend on the completed integrated Analyze task; acquisition and Analyze tasks are never materialized in the edition run.
+
 The default safety limits include 500 course items, eight hours per source, 20 GiB per local file or download, two concurrent source workers, and a two-hour subprocess timeout. The remote source adapter selects analysis media at up to 720p when media is required.
 
 ### Platform authentication

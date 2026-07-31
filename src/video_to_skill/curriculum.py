@@ -22,7 +22,7 @@ from video_to_skill.orchestration import (
     CurriculumPlanResult,
     CurriculumSelection,
 )
-from video_to_skill.utils import atomic_write_json, hash_file, stable_hash
+from video_to_skill.utils import hash_file, stable_hash
 from video_to_skill.work import AnalysisRun, CanonicalRecord, WorkItem, WorkRole, WorkState
 from video_to_skill.workspace import Workspace
 
@@ -266,14 +266,24 @@ def load_canonical_curriculum_checkpoint(
         plan_record.producer_task_id,
         label="curriculum plan",
     )
-    if plan_task.role != WorkRole.AUTHOR or plan_task.scope.get("kind") != "curriculum-planning":
+    if plan_task.role != WorkRole.AUTHOR or plan_task.scope.get("kind") not in {
+        "curriculum-planning",
+        "curriculum-reuse",
+    }:
         raise ProcessingError("Canonical curriculum plan has an invalid producer task")
     selection_task = _completed_checkpoint_task(
         workspace,
         selection_record.producer_task_id,
         label="curriculum selection",
     )
-    if selection.source == "recommended":
+    if selection.source == "edition":
+        if (
+            plan_task.scope.get("kind") != "curriculum-reuse"
+            or selection_task.id != plan_task.id
+            or plan_task.scope.get("selected_path_id") != selection.selected_path_id
+        ):
+            raise ProcessingError("Reused edition curriculum has an invalid producer")
+    elif selection.source == "recommended":
         if plan.decision_required or selection_task.id != plan_task.id:
             raise ProcessingError("Recommended curriculum selection has an invalid producer")
     elif (
@@ -322,20 +332,24 @@ def validate_artifact_bound_curriculum(
     checkpoint: CanonicalCurriculumCheckpoint,
     curriculum: CurriculumDesign,
     artifacts: list[ArtifactDraftSpec],
+    *,
+    allow_localized_metadata: bool = False,
 ) -> None:
     if curriculum.selected_path_id != checkpoint.selection.selected_path_id:
         raise ProcessingError("Final curriculum differs from the selected canonical path")
     planned_paths = checkpoint.plan.paths
-    if curriculum.rationale != checkpoint.plan.rationale or [
+    if (not allow_localized_metadata and curriculum.rationale != checkpoint.plan.rationale) or [
         path.id for path in curriculum.paths
     ] != [path.id for path in planned_paths]:
         raise ProcessingError("Final curriculum differs from the canonical options")
     artifacts_by_id = {artifact.id: artifact for artifact in artifacts}
     for planned_path, final_path in zip(planned_paths, curriculum.paths, strict=True):
-        if (
-            final_path.title != planned_path.title
-            or final_path.kind != planned_path.kind
-            or final_path.use_when != planned_path.use_when
+        if final_path.kind != planned_path.kind or (
+            not allow_localized_metadata
+            and (
+                final_path.title != planned_path.title
+                or final_path.use_when != planned_path.use_when
+            )
         ):
             raise ProcessingError(f"Final curriculum path metadata differs for {planned_path.id}")
         unit_sequence: list[str] = []
@@ -459,15 +473,15 @@ def submit_curriculum_plan_result(
     output_directory = workspace.tasks_dir / task.id / "output"
     options_path = output_directory / "curriculum-options.json"
     language_path = output_directory / "artifact-language.json"
-    atomic_write_json(options_path, result.curriculum)
-    atomic_write_json(language_path, language_declaration)
+    workspace.write_json(options_path, result.curriculum)
+    workspace.write_json(language_path, language_declaration)
     canonical_outputs: list[tuple[str, str, Path]] = [
         ("curriculum-options", "default", options_path),
         ("artifact-language-declaration", "default", language_path),
     ]
     if not result.curriculum.decision_required:
         selection_path = output_directory / "selected-curriculum.json"
-        atomic_write_json(
+        workspace.write_json(
             selection_path,
             CurriculumSelection(
                 curriculum_plan_digest=hash_file(options_path),

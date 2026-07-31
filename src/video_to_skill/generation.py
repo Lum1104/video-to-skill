@@ -692,6 +692,25 @@ class CourseInteraction(GenerationModel):
         return compact
 
 
+class CourseSkillEditionLineage(GenerationModel):
+    """Portable, path-free proof that a build reused one immutable Analyze lineage."""
+
+    edition_id: str = Field(pattern=r"^edition-[a-f0-9]{20}$")
+    edition_name: str = Field(min_length=1, max_length=64)
+    config_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    analysis_lineage_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    analyze_task_id: str = Field(min_length=1)
+    analysis_snapshot_digest: str = Field(min_length=1)
+    source_snapshot_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    analysis_depth_contract_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    canonical_analyze_digests: dict[str, str]
+    curriculum_source_edition: str | None = None
+    source_curriculum_plan_digest: str | None = None
+    requested_curriculum_path_id: str | None = None
+    identity_family_id: str = Field(pattern=r"^identity-[a-f0-9]{20}$")
+    identity_drift_justification: str | None = None
+
+
 class CourseSkillBlueprint(GenerationModel):
     """The semantic handoff between the generator agent and package renderer."""
 
@@ -714,6 +733,7 @@ class CourseSkillBlueprint(GenerationModel):
     coverage_ledger: CourseCoverageLedger | None = None
     claims: list[CourseSkillClaim] = Field(min_length=1)
     limitations: list[str] = Field(default_factory=list, max_length=30)
+    edition_lineage: CourseSkillEditionLineage | None = None
     parent_build_id: str | None = Field(
         default=None,
         pattern=r"^v2s-[a-f0-9]{20}$",
@@ -1912,6 +1932,11 @@ def build_manifest_payload(
         "schema_version": 2,
         "build_id": _build_id(blueprint),
         "parent_build_id": blueprint.parent_build_id,
+        "edition_lineage": (
+            blueprint.edition_lineage.model_dump(mode="json", exclude_none=True)
+            if blueprint.edition_lineage is not None
+            else None
+        ),
         "generator": {
             "name": "video-to-skill",
             "version": __version__,
@@ -2039,6 +2064,7 @@ def render_course_skill_review_target(
     destination: Path,
     *,
     workspace_root: Path,
+    allowed_root: Path | None = None,
 ) -> Path:
     """Render the real package bytes into the one private, allowlisted review area."""
 
@@ -2050,9 +2076,13 @@ def render_course_skill_review_target(
         destination,
         label="Behavior review target",
     )
-    allowed_root = workspace / "analysis" / "behavior-targets"
-    _lexical_path_without_symlinks(allowed_root, label="Behavior review target root")
-    if target == allowed_root or not target.is_relative_to(allowed_root):
+    bounded_root = _lexical_path_without_symlinks(
+        allowed_root or workspace / "analysis" / "behavior-targets",
+        label="Behavior review target root",
+    )
+    if not bounded_root.is_relative_to(workspace):
+        raise ProcessingError("Behavior review target root must stay inside the workspace")
+    if target == bounded_root or not target.is_relative_to(bounded_root):
         raise ProcessingError("Behavior review targets must stay under analysis/behavior-targets")
     return _render_course_skill_package(
         blueprint,

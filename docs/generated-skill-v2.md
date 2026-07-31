@@ -530,6 +530,8 @@ Canonical semantic map
 
 Changing the selected curriculum later should not require reacquiring or reanalyzing the video.
 
+The implemented same-workspace route is a named edition. `edition WORKSPACE NAME` pins one immutable integrated Analyze lineage and creates namespaced downstream tasks, canonical heads, reports, build receipts, output configuration, and completion. Selecting an existing planned path performs a deterministic checkpoint binding and skips curriculum planning; `--plan-curriculum` redoes only the bounded curriculum checkpoint. Both routes perform fresh full Author, isolated behavior trials, independent Review, compile, validate, and no-clobber install. Existing legacy single-edition heads remain unchanged and independently resumable.
+
 ## Artifact design
 
 Create a file only when at least one condition holds:
@@ -797,6 +799,8 @@ For ordinary generation, the host infers artifact language from the user's subst
 The intent is either `source` or an explicit language/locale label. An explicit label is fixed. `source` resolves automatically only when every active source has known selected-transcript language and all observations agree on one normalized value. Mixed source evidence requires a declaration chosen from the observed languages; partly or wholly unknown evidence requires one evidence-informed concrete declaration. The curriculum checkpoint makes that declaration once, and full Author, repair, Review, compilation, build receipts, and completion remain bound to it. Code validates the declaration and its digests; Review audits the actual Markdown language.
 
 Do not duplicate every artifact merely to support multilingual interaction. When a separately published localized edition is needed, render it from the same semantic map with stable semantic-unit, claim, artifact, and timestamp IDs.
+
+Localized editions enforce those logical identities against the selected source-edition baseline. A real curriculum-structure change may carry an explicit immutable identity-drift justification; silent drift is rejected. Editions expose path-free lineage in `build-manifest.json` and do not set `parent_build_id`, because localization or redesign from shared evidence is not an update or fold-in.
 
 Preserve original proper names and technical terms. Distinguish paraphrase from short source quotation, and never turn uncertain captions into confident text through translation.
 

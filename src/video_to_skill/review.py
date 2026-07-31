@@ -57,7 +57,7 @@ from video_to_skill.review_contract import (
     reconstruct_review_snapshot,
     verified_canonical_review_json,
 )
-from video_to_skill.utils import atomic_write_json, hash_file, stable_hash
+from video_to_skill.utils import hash_file, stable_hash
 from video_to_skill.visual_assets import (
     canonical_visual_asset_candidates,
     visual_asset_candidate_packet,
@@ -160,7 +160,12 @@ def _review_snapshot(
             artifact_specs = [ArtifactDraftSpec.model_validate(item) for item in artifact_values]
         except PydanticValidationError as exc:
             raise ProcessingError(f"Invalid curriculum checkpoint projection: {exc}") from exc
-        validate_artifact_bound_curriculum(checkpoint, curriculum, artifact_specs)
+        validate_artifact_bound_curriculum(
+            checkpoint,
+            curriculum,
+            artifact_specs,
+            allow_localized_metadata=workspace.edition_id is not None,
+        )
         for kind, record in (
             ("curriculum-options", checkpoint.plan_record),
             ("selected-curriculum", checkpoint.selection_record),
@@ -285,21 +290,24 @@ def _behavior_evaluation_plan(
         length=32,
     )
     target_path = workspace.analysis_dir / "behavior-targets" / target_key
-    target_path.parent.mkdir(parents=True, exist_ok=True)
     target_root = workspace.analysis_dir / "behavior-targets"
+    workspace.ensure_directory(target_root)
     fresh_path = target_path.with_name(f".{target_path.name}-fresh-{secrets.token_hex(12)}")
     try:
         render_course_skill_review_target(
             projection.blueprint,
             fresh_path,
             workspace_root=workspace.root,
+            allowed_root=target_root,
         )
         fresh = snapshot_behavior_target(
             fresh_path,
             expected_build_id=build_id,
             allowed_root=target_root,
         )
-        if target_path.exists() or target_path.is_symlink():
+        if target_path.is_symlink():
+            raise ProcessingError("Cached behavior target cannot be a symlink")
+        if target_path.exists():
             existing = snapshot_behavior_target(
                 target_path,
                 expected_build_id=build_id,
@@ -813,8 +821,8 @@ def submit_review_result(
     review_path = output / "critic-report.json"
     behavior_path = output / "behavior-report.json"
     critic_report, behavior_report = reconstruct_review_reports(task, result)
-    atomic_write_json(review_path, critic_report)
-    atomic_write_json(behavior_path, behavior_report)
+    workspace.write_json(review_path, critic_report)
+    workspace.write_json(behavior_path, behavior_report)
     accepted, _canonical = workspace.accept_work_result(
         task_id=task.id,
         lease_token=result.lease_token,

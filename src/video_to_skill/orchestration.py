@@ -225,7 +225,7 @@ class CurriculumSelection(OrchestrationModel):
     schema_version: Literal[1] = 1
     curriculum_plan_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
     selected_path_id: str = Field(min_length=1, max_length=160)
-    source: Literal["recommended", "user"]
+    source: Literal["recommended", "user", "edition"]
 
     @field_validator("selected_path_id")
     @classmethod
@@ -825,6 +825,8 @@ class RunAction(OrchestrationModel):
 class RunEnvelope(OrchestrationModel):
     status: RunStatus
     workspace: Path
+    edition_id: str | None = None
+    edition_name: str | None = None
     actions: list[RunAction] = Field(default_factory=list)
     completion: dict[str, object] | None = None
 

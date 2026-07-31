@@ -6,6 +6,7 @@ import json
 import posixpath
 import re
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 from pydantic import ValidationError as PydanticValidationError
@@ -22,6 +23,7 @@ from video_to_skill.curriculum import (
     load_canonical_curriculum_plan,
     load_canonical_curriculum_selection,
 )
+from video_to_skill.editions import validate_edition_author_identity
 from video_to_skill.errors import ProcessingError
 from video_to_skill.generation import CapabilityLevel, CourseAsset, SemanticUnit, SkillMode
 from video_to_skill.orchestration import (
@@ -29,7 +31,7 @@ from video_to_skill.orchestration import (
     AuthorResult,
     CapabilityEvidence,
 )
-from video_to_skill.utils import atomic_write_json, hash_file
+from video_to_skill.utils import hash_file
 from video_to_skill.visual_assets import (
     MaterializedVisualAsset,
     canonical_visual_asset_candidates,
@@ -77,7 +79,7 @@ def plan_author_task(
         raise ProcessingError("Authoring requires the integrated canonical semantic map")
     if (
         curriculum_task.role != WorkRole.AUTHOR
-        or curriculum_task.scope.get("kind") != "curriculum-planning"
+        or curriculum_task.scope.get("kind") not in {"curriculum-planning", "curriculum-reuse"}
         or curriculum_task.state != WorkState.COMPLETE
     ):
         raise ProcessingError("Authoring requires a completed curriculum-planning task")
@@ -85,9 +87,10 @@ def plan_author_task(
         workspace,
         expected_producer_task_id=curriculum_task.id,
     )
+    reused_curriculum = curriculum_task.scope.get("kind") == "curriculum-reuse"
     expected_selection_producer = curriculum_task.id
     dependencies = [analyze_task.id, curriculum_task.id]
-    if curriculum_plan.decision_required:
+    if curriculum_plan.decision_required and not reused_curriculum:
         if (
             decision_task is None
             or decision_task.role != WorkRole.DECISION
@@ -133,6 +136,26 @@ def plan_author_task(
         curriculum_plan_record.digest,
     )
     records["selected-curriculum"] = (str(selection_record.path), selection_record.digest)
+    edition_instruction = ""
+    if workspace.edition_id is not None:
+        from video_to_skill.editions import assert_edition_analysis_lineage
+
+        edition_state = assert_edition_analysis_lineage(workspace)
+        requested_name = edition_state.configuration.skill_name
+        stable_ids = edition_state.configuration.identity_baseline
+        if requested_name is not None:
+            edition_instruction += f" Use exactly {requested_name!r} as the Skill name."
+        if stable_ids.established:
+            edition_instruction += (
+                " This is a language-only edition: preserve the logical artifact and claim IDs, "
+                "their semantic-unit bindings, and every evidence timestamp exactly as supplied "
+                "by the edition identity baseline."
+            )
+        else:
+            edition_instruction += (
+                " Establish stable logical artifact and claim IDs for this edition's durable "
+                "identity family; later editions and repairs must preserve them exactly."
+            )
     packet = {
         "instructions": (
             "Consume the selected canonical curriculum without redesigning or reopening it. "
@@ -147,6 +170,7 @@ def plan_author_task(
             f"{language_declaration.artifact_language!r} for all generated artifact prose, "
             "titles, interaction text, and metadata. Preserve original proper names and "
             "technical terms where appropriate, and echo this exact value in artifact_language."
+            + edition_instruction
         ),
         "artifact_language_contract": language_contract.model_dump(mode="json"),
         "artifact_language_contract_digest": language_contract_digest,
@@ -284,16 +308,21 @@ def _validate_selected_curriculum(
         raise ProcessingError("Author curriculum changed the selected canonical path")
     planned_ids = [path.id for path in plan.paths]
     authored_ids = [path.id for path in result.curriculum.paths]
-    if authored_ids != planned_ids or result.curriculum.rationale != plan.rationale:
+    localized_edition = workspace.edition_id is not None
+    if authored_ids != planned_ids or (
+        not localized_edition and result.curriculum.rationale != plan.rationale
+    ):
         raise ProcessingError("Author curriculum changed the canonical curriculum options")
     authored_paths = {path.id: path for path in result.curriculum.paths}
     artifacts = {artifact.id: artifact for artifact in result.artifacts}
     for planned_path in plan.paths:
         authored_path = authored_paths[planned_path.id]
-        if (
-            authored_path.title != planned_path.title
-            or authored_path.kind != planned_path.kind
-            or authored_path.use_when != planned_path.use_when
+        if authored_path.kind != planned_path.kind or (
+            not localized_edition
+            and (
+                authored_path.title != planned_path.title
+                or authored_path.use_when != planned_path.use_when
+            )
         ):
             raise ProcessingError(
                 f"Author curriculum changed canonical path metadata for {planned_path.id}"
@@ -356,7 +385,7 @@ def _validate_author_result(
     workspace: Workspace,
     task: WorkItem,
     result: AuthorResult,
-) -> ArtifactLanguageDeclaration:
+) -> tuple[ArtifactLanguageDeclaration, dict[str, Any] | None]:
     _validate_selected_curriculum(workspace, task, result)
     language_declaration = _author_language_declaration(
         workspace,
@@ -472,7 +501,16 @@ def _validate_author_result(
                 raise ProcessingError(
                     f"Artifact {artifact_path} does not link selected visual asset {selected.path}"
                 )
-    return language_declaration
+    # A first Author over analyze-only evidence may establish the shared logical
+    # identity family. Do so only after every structural and grounding check above
+    # succeeds, so an otherwise invalid submission cannot win that CAS.
+    identity_baseline = validate_edition_author_identity(
+        workspace,
+        name=result.name,
+        artifacts=result.artifacts,
+        claims=result.claims,
+    )
+    return language_declaration, identity_baseline
 
 
 def _course_assets(workspace: Workspace, result: AuthorResult) -> list[CourseAsset]:
@@ -513,7 +551,7 @@ def submit_author_result(
     result = _load_author_result(result_path)
     if result.task_id != task_id or result.snapshot_digest != task.snapshot_digest:
         raise ProcessingError("Author result does not belong to this task snapshot")
-    language_declaration = _validate_author_result(workspace, task, result)
+    language_declaration, identity_baseline = _validate_author_result(workspace, task, result)
     output = workspace.tasks_dir / task_id / "output"
     course_path = output / "course.json"
     curriculum_path = output / "curriculum.json"
@@ -523,7 +561,7 @@ def submit_author_result(
     affordance_path = output / "instructional-affordances.json"
     claims_path = output / "claims.json"
     assets_path = output / "assets.json"
-    atomic_write_json(
+    workspace.write_json(
         course_path,
         {
             "name": result.name,
@@ -538,22 +576,22 @@ def submit_author_result(
             "curriculum_decision_summary": result.curriculum_decision_summary,
         },
     )
-    atomic_write_json(curriculum_path, result.curriculum)
-    atomic_write_json(interaction_path, result.interaction)
-    atomic_write_json(capability_path, result.capability_profile)
-    atomic_write_json(
+    workspace.write_json(curriculum_path, result.curriculum)
+    workspace.write_json(interaction_path, result.interaction)
+    workspace.write_json(capability_path, result.capability_profile)
+    workspace.write_json(
         artifact_plan_path,
         [item.model_dump(mode="json") for item in result.artifacts],
     )
-    atomic_write_json(
+    workspace.write_json(
         affordance_path,
         [item.model_dump(mode="json") for item in result.affordance_ledger],
     )
-    atomic_write_json(
+    workspace.write_json(
         claims_path,
         [item.model_dump(mode="json") for item in result.claims],
     )
-    atomic_write_json(
+    workspace.write_json(
         assets_path,
         [item.model_dump(mode="json") for item in _course_assets(workspace, result)],
     )
@@ -569,7 +607,7 @@ def submit_author_result(
     ]
     if workspace.canonical_record("artifact-language-declaration") is None:
         language_path = output / "artifact-language.json"
-        atomic_write_json(language_path, language_declaration)
+        workspace.write_json(language_path, language_declaration)
         canonical_outputs.append(("artifact-language-declaration", "default", language_path))
     for artifact in result.artifacts:
         canonical_outputs.append(("artifact-draft", artifact.id, output / artifact.draft_path))
@@ -579,5 +617,6 @@ def submit_author_result(
         result_path=result_path,
         producer=result.producer.model_dump(mode="json"),
         canonical_outputs=canonical_outputs,
+        identity_baseline=identity_baseline,
     )
     return accepted

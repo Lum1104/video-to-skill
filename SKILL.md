@@ -80,6 +80,28 @@ Add `--project` only when the user requested project-local installation. Add `--
 
 On resume, omit `--output-language` and reuse the persisted value. Never silently change it; an explicit conflicting resume override is rejected.
 
+### Publish another edition from the same Analyze map
+
+When the user wants a separately named localization or a different already-planned learning path, create or resume a named edition instead of starting a new conversion:
+
+```bash
+"$V2S_ENGINE" edition WORKSPACE EDITION-NAME --host codex --output-language LANGUAGE --curriculum PATH-ID --skill-name SKILL-NAME
+"$V2S_ENGINE" edition WORKSPACE EDITION-NAME --host claude --output-language LANGUAGE --from-edition SOURCE-EDITION --curriculum PATH-ID --skill-name SKILL-NAME
+"$V2S_ENGINE" edition WORKSPACE EDITION-NAME --host codex --output-language LANGUAGE --plan-curriculum --skill-name SKILL-NAME
+```
+
+Use `--curriculum` to bind an existing path without another curriculum-planning worker. Use `--from-edition` only when the path and logical artifact/claim identity should come from another named edition; otherwise the legacy single-edition checkpoint is the source. Use `--plan-curriculum` only when a new learning design is actually requested. These choices are settled before artifact Authoring.
+
+Resume with only:
+
+```bash
+"$V2S_ENGINE" edition WORKSPACE EDITION-NAME
+```
+
+A named edition never inspects, acquires, transcribes, extracts visuals, or reruns Analyze. It pins the completed integrated Analyze task, source snapshot, semantic-record digests, and analysis-depth contract, then runs only the necessary curriculum checkpoint followed by full Author, isolated behavior trials, independent Review, compilation, validation, and no-clobber installation. If source/depth refresh or a new Analyze revision changes that lineage, create a new edition name instead of silently reusing it.
+
+Each edition has immutable language, curriculum-source, output, name, host, and installation-scope configuration. Multiple editions coexist without an active-edition switch. Submit returned tasks with ordinary `submit WORKSPACE TASK_ID RESULT_FILE`; the task scope resolves its edition. Preserve semantic IDs and, for localization of the same curriculum, logical artifact IDs, claim IDs, evidence links, and timestamps. Supply `--identity-drift-reason` only for a real structural exception. It records justification; it is not update lineage, and `parent_build_id` remains unset.
+
 Also omit `--analysis-depth` on resume and reuse the persisted requested/effective depth and versioned budget profile. A conflicting request or profile drift is rejected. `--refresh` re-inspects the inventory; when duration, items, chapters, captions, or density signals change, the engine deterministically refreshes the contract and invalidates only affected stage/task snapshots.
 
 `run` performs every available deterministic transition and emits one JSON envelope.
@@ -112,6 +134,8 @@ After all dispatched workers finish, call `run --workspace WORKSPACE` again. Rep
 Report the installed Skill name and path, invocation, workspace path and retention, processed and failed source counts, source and semantic coverage, instructional-affordance coverage, critic repair count, build ID, and validation results.
 
 Also report the requested output-language intent, resolved canonical artifact language, resolution state, and whether it was deterministically resolved or agent-declared.
+
+For a named edition, also report its deterministic edition ID and configuration digest, pinned Analyze/source/depth lineage, curriculum source and selected path, identity-drift justification if any, and edition-local completion status.
 
 Report requested, recommended, and effective analysis depth, the recommendation reasons, and the versioned non-secret budget summary from the completion envelope.
 

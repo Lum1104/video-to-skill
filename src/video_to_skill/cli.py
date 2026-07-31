@@ -824,6 +824,120 @@ def submit_work_result(
     typer.echo(receipt.model_dump_json(indent=2))
 
 
+@app.command("edition")
+def edition_workflow(
+    workspace: Annotated[
+        Path,
+        typer.Argument(help="Completed evidence workspace whose Analyze state will be reused."),
+    ],
+    edition_name: Annotated[
+        str,
+        typer.Argument(help="Immutable lowercase-hyphenated edition name."),
+    ],
+    host: Annotated[
+        SkillHost | None,
+        typer.Option(
+            "--host",
+            case_sensitive=False,
+            help="Install for claude or codex; required only for a new edition.",
+        ),
+    ] = None,
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", help="Portable generated Skill path."),
+    ] = None,
+    project: Annotated[
+        bool | None,
+        typer.Option(
+            "--project/--user",
+            help="Installation scope; omit on resume to reuse the edition setting.",
+        ),
+    ] = None,
+    output_language: Annotated[
+        str | None,
+        typer.Option(
+            "--output-language",
+            help="Canonical artifact language or 'source'; immutable within this edition.",
+        ),
+    ] = None,
+    curriculum: Annotated[
+        str | None,
+        typer.Option(
+            "--curriculum",
+            help="Existing planned curriculum path id to bind before Authoring.",
+        ),
+    ] = None,
+    from_edition: Annotated[
+        str | None,
+        typer.Option(
+            "--from-edition",
+            help="Named edition whose curriculum checkpoint and identity baseline are reused.",
+        ),
+    ] = None,
+    plan_curriculum: Annotated[
+        bool,
+        typer.Option(
+            "--plan-curriculum",
+            help="Run one bounded curriculum-planning task over the reused Analyze map.",
+        ),
+    ] = False,
+    skill_name: Annotated[
+        str | None,
+        typer.Option("--skill-name", help="Required generated Skill name for this edition."),
+    ] = None,
+    identity_drift_reason: Annotated[
+        str | None,
+        typer.Option(
+            "--identity-drift-reason",
+            help="Explicit justification when logical artifact or claim ids must change.",
+        ),
+    ] = None,
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+    analysis_depth: Annotated[
+        str | None,
+        typer.Option(
+            "--analysis-depth",
+            help="Must match the persisted evidence workspace depth request.",
+        ),
+    ] = None,
+    max_workers: Annotated[int | None, typer.Option("--max-workers")] = None,
+    skip_official: Annotated[
+        bool,
+        typer.Option("--skip-official", help="Do not call skills-ref during final validation."),
+    ] = False,
+) -> None:
+    """Create or resume an isolated edition from immutable completed Analyze state."""
+
+    try:
+        settings = _settings(
+            config,
+            output_language=output_language,
+            analysis_depth=analysis_depth,
+            max_workers=max_workers,
+        )
+        envelope = advance_run(
+            sources=[],
+            workspace_path=workspace,
+            settings=settings,
+            output_language_override=output_language,
+            host=host,
+            output=output,
+            project=project,
+            refresh=False,
+            run_official_validation=not skip_official,
+            edition_name=edition_name,
+            curriculum_path_id=curriculum,
+            curriculum_source_edition=from_edition,
+            plan_curriculum=plan_curriculum,
+            skill_name=skill_name,
+            identity_drift_justification=identity_drift_reason,
+        )
+    except (VideoToSkillError, ValueError) as exc:
+        typer.echo(f"ERROR: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    typer.echo(envelope.model_dump_json(indent=2))
+
+
 @app.command()
 def validate(
     skill_directory: Annotated[Path, typer.Argument(help="Generated skill folder.")],

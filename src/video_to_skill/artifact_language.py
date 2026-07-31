@@ -11,7 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 from video_to_skill.config import normalize_concrete_language, normalize_output_language
 from video_to_skill.errors import ProcessingError
-from video_to_skill.utils import atomic_write_json, hash_file, stable_hash
+from video_to_skill.utils import hash_file, stable_hash
 from video_to_skill.workspace import Workspace
 
 ArtifactLanguageResolution = Literal[
@@ -226,7 +226,7 @@ def persist_artifact_language_contract(
         if existing != contract:
             raise ProcessingError("Workspace artifact-language contract is immutable")
         return digest
-    atomic_write_json(path, contract)
+    workspace.write_json(path, contract)
     return artifact_language_contract_digest(contract)
 
 

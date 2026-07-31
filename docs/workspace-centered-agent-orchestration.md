@@ -20,11 +20,13 @@ The main agent exchanges only workspace paths, task IDs, expert personas, typed 
 
 ## Public protocol
 
-The normal orchestration surface contains two commands:
+The normal orchestration surface contains three commands:
 
 ```bash
 video-to-skill run SOURCES... --workspace WORKSPACE --host codex
 video-to-skill run --workspace WORKSPACE
+video-to-skill edition WORKSPACE EDITION-NAME --host codex --output-language LANGUAGE
+video-to-skill edition WORKSPACE EDITION-NAME
 video-to-skill submit WORKSPACE TASK_ID RESULT_FILE
 ```
 
@@ -33,6 +35,8 @@ The first `run` creates or resumes evidence extraction, records the host and out
 The resume form reads sources, host, output, installation scope, and validation settings from the workspace. The main agent does not need to retransmit them.
 
 `submit` validates and atomically persists one role-specific result. Workers call it themselves after writing `TASK_PATH/output/result.json`.
+
+`edition` creates or resumes an immutable downstream publication namespace from a completed integrated Analyze task. It accepts no sources and no refresh. An existing `--curriculum PATH-ID` creates a deterministic checkpoint binding without agent planning; `--plan-curriculum` requests one bounded new plan over the same semantic map. Every edition then performs fresh artifact Authoring, isolated behavior trials, Review, compile, validate, and no-clobber install. The task carries the edition ID, so ordinary `submit` remains safe when editions are interleaved.
 
 The former public `blueprint-schema` and `build-skill` authoring commands are removed. The strict blueprint remains an internal compilation boundary and build receipt.
 
@@ -112,6 +116,8 @@ Each canonical revision records:
 
 The canonical head points to the accepted revision. A valid submission advances the head atomically after file, schema, evidence, snapshot, and lease validation.
 
+Analyze kinds (`semantic-map`, relations, capability evidence, semantic coverage/conflicts, and visual candidates/images) remain shared. Language declaration, curriculum checkpoint, all Author records/drafts, Review reports, and delivery selection use edition-prefixed logical record IDs. Edition-local task/run/build files live beneath `editions/<edition-id>/`; legacy unprefixed heads remain directly resumable. There is no mutable current-edition row or file.
+
 ## Task contract
 
 Each task is content-derived from its run, role, scope, dependencies, and source snapshot.
@@ -145,6 +151,8 @@ pending
 An expired lease returns to `pending`. An invalid submission returns an actionable error without creating submitted or rejected states.
 
 A failed quality review is still a completed Review execution. It creates a new dependent Author task instead of changing the original task to a follow-up state.
+
+Edition tasks may depend on the completed integrated Analyze task from the evidence run. This is the only cross-run reuse boundary. Their configuration pins the Analyze producer, snapshot, canonical digests, source digest, and depth-contract digest. A source/depth refresh or changed Analyze head rejects the old edition instead of silently reusing new evidence.
 
 Candidate versus canonical status is represented by immutable file revisions and canonical heads, not by generic task states.
 

@@ -107,7 +107,12 @@ def reconstruct_review_snapshot(
             artifact_specs = [ArtifactDraftSpec.model_validate(item) for item in artifact_values]
         except PydanticValidationError as exc:
             raise ProcessingError(f"Invalid curriculum checkpoint projection: {exc}") from exc
-        validate_artifact_bound_curriculum(checkpoint, curriculum, artifact_specs)
+        validate_artifact_bound_curriculum(
+            checkpoint,
+            curriculum,
+            artifact_specs,
+            allow_localized_metadata=workspace.edition_id is not None,
+        )
         for kind, record in (
             ("curriculum-options", checkpoint.plan_record),
             ("selected-curriculum", checkpoint.selection_record),

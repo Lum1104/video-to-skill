@@ -31,6 +31,7 @@ class WorkState(StrEnum):
 class AnalysisRun(WorkModel):
     id: str
     snapshot_digest: str
+    edition_id: str | None = None
     created_at: datetime
     updated_at: datetime
 

@@ -44,6 +44,7 @@ from video_to_skill.generation import (
     CourseInteraction,
     CourseSkillBlueprint,
     CourseSkillClaim,
+    CourseSkillEditionLineage,
     CourseSkillSource,
     CurriculumDesign,
     SemanticRelation,
@@ -73,7 +74,7 @@ from video_to_skill.review_contract import (
     reconstruct_review_reports,
     reconstruct_review_snapshot,
 )
-from video_to_skill.utils import atomic_write_json, hash_file, stable_hash
+from video_to_skill.utils import hash_file, stable_hash
 from video_to_skill.validation import render_validation_report, validate_skill
 from video_to_skill.visual_assets import canonical_visual_asset_candidates
 from video_to_skill.work import WorkRole, WorkState
@@ -115,6 +116,7 @@ class WorkspaceBuildReceipt(CompileModel):
     behavior_report_digest: str
     delivery_selection_digest: str | None = None
     artifacts: list[CompiledArtifactReference]
+    edition_lineage: CourseSkillEditionLineage | None = None
 
     @model_validator(mode="after")
     def coherent_curriculum_checkpoint(self) -> WorkspaceBuildReceipt:
@@ -223,13 +225,14 @@ def _fresh_canonical_target_snapshot(
     projection: WorkspaceBlueprintProjection,
 ) -> BehaviorTargetSnapshot:
     target_root = workspace.analysis_dir / "behavior-targets"
-    target_root.mkdir(parents=True, exist_ok=True)
+    workspace.ensure_directory(target_root)
     fresh_path = target_root / f".compiler-fresh-{secrets.token_hex(16)}"
     try:
         render_course_skill_review_target(
             projection.blueprint,
             fresh_path,
             workspace_root=workspace.root,
+            allowed_root=target_root,
         )
         return snapshot_behavior_target(
             fresh_path,
@@ -610,7 +613,12 @@ def assemble_workspace_blueprint(workspace: Workspace) -> WorkspaceBlueprintProj
     checkpoint = load_canonical_curriculum_checkpoint(workspace)
     if checkpoint is not None:
         validate_curriculum_checkpoint_author_binding(workspace, checkpoint)
-        validate_artifact_bound_curriculum(checkpoint, curriculum, artifacts)
+        validate_artifact_bound_curriculum(
+            checkpoint,
+            curriculum,
+            artifacts,
+            allow_localized_metadata=workspace.edition_id is not None,
+        )
     _validated_list(
         InstructionalAffordance,
         _canonical_json(workspace, "instructional-affordances"),
@@ -697,6 +705,9 @@ def assemble_workspace_blueprint(workspace: Workspace) -> WorkspaceBlueprintProj
         raise ProcessingError("Workspace blueprint seed has invalid sources")
     course_limitations = list(course.get("limitations", []))
     try:
+        from video_to_skill.editions import public_edition_lineage
+
+        raw_edition_lineage = public_edition_lineage(workspace)
         blueprint = CourseSkillBlueprint(
             name=(delivery_selection.name if delivery_selection is not None else course["name"]),
             title=course["title"],
@@ -720,6 +731,11 @@ def assemble_workspace_blueprint(workspace: Workspace) -> WorkspaceBlueprintProj
             coverage_ledger=CourseCoverageLedger.model_validate(seed["coverage_ledger"]),
             claims=claims,
             limitations=list(dict.fromkeys([*seed_limitations, *course_limitations])),
+            edition_lineage=(
+                CourseSkillEditionLineage.model_validate(raw_edition_lineage)
+                if raw_edition_lineage is not None
+                else None
+            ),
         )
     except (KeyError, TypeError, PydanticValidationError, ValueError) as exc:
         raise ProcessingError(f"Canonical workspace state cannot compile a Skill: {exc}") from exc
@@ -817,14 +833,15 @@ def compile_workspace_blueprint(
         behavior_report_digest=behavior_digest,
         delivery_selection_digest=projection.delivery_selection_digest,
         artifacts=projection.artifact_references,
+        edition_lineage=blueprint.edition_lineage,
     )
-    build_directory = workspace.root / "builds" / build_id
-    atomic_write_json(build_directory / "blueprint.json", receipt)
-    atomic_write_json(
+    build_directory = workspace.builds_dir / build_id
+    workspace.write_json(build_directory / "blueprint.json", receipt)
+    workspace.write_json(
         build_directory / "critic-report.json",
         _canonical_json(workspace, "critic-report"),
     )
-    atomic_write_json(
+    workspace.write_json(
         build_directory / "behavior-report.json",
         _canonical_json(workspace, "behavior-report"),
     )
@@ -875,7 +892,7 @@ def build_workspace_skill(
         check_code=True,
     )
     validation_path = build_directory / "validation-report.json"
-    atomic_write_json(validation_path, report)
+    workspace.write_json(validation_path, report)
     if not report.valid:
         raise ProcessingError(render_validation_report(report))
     root = skill_root or host_skill_root(
