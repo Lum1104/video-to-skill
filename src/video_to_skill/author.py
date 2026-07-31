@@ -10,6 +10,10 @@ from urllib.parse import urlparse
 
 from pydantic import ValidationError as PydanticValidationError
 
+from video_to_skill.curriculum import (
+    load_canonical_curriculum_plan,
+    load_canonical_curriculum_selection,
+)
 from video_to_skill.errors import ProcessingError
 from video_to_skill.generation import CapabilityLevel, CourseAsset, SemanticUnit, SkillMode
 from video_to_skill.orchestration import (
@@ -23,7 +27,7 @@ from video_to_skill.visual_assets import (
     canonical_visual_asset_candidates,
     visual_asset_candidate_packet,
 )
-from video_to_skill.work import AnalysisRun, WorkItem, WorkRole
+from video_to_skill.work import AnalysisRun, WorkItem, WorkRole, WorkState
 from video_to_skill.workspace import Workspace
 
 AUTHOR_PERSONA = (
@@ -55,12 +59,47 @@ def plan_author_task(
     run: AnalysisRun,
     *,
     analyze_task: WorkItem,
+    curriculum_task: WorkItem,
+    decision_task: WorkItem | None = None,
 ) -> WorkItem:
     if analyze_task.role != WorkRole.ANALYZE or analyze_task.state.value != "complete":
         raise ProcessingError("Authoring requires a completed integrated Analyze task")
     semantic_map = workspace.canonical_record("semantic-map")
     if semantic_map is None or semantic_map.producer_task_id != analyze_task.id:
         raise ProcessingError("Authoring requires the integrated canonical semantic map")
+    if (
+        curriculum_task.role != WorkRole.AUTHOR
+        or curriculum_task.scope.get("kind") != "curriculum-planning"
+        or curriculum_task.state != WorkState.COMPLETE
+    ):
+        raise ProcessingError("Authoring requires a completed curriculum-planning task")
+    curriculum_plan, curriculum_plan_record = load_canonical_curriculum_plan(
+        workspace,
+        expected_producer_task_id=curriculum_task.id,
+    )
+    expected_selection_producer = curriculum_task.id
+    dependencies = [analyze_task.id, curriculum_task.id]
+    if curriculum_plan.decision_required:
+        if (
+            decision_task is None
+            or decision_task.role != WorkRole.DECISION
+            or decision_task.scope.get("kind") != "curriculum-plan-selection"
+            or decision_task.scope.get("curriculum_task_id") != curriculum_task.id
+            or decision_task.state != WorkState.COMPLETE
+        ):
+            raise ProcessingError("Authoring requires the completed material curriculum decision")
+        expected_selection_producer = decision_task.id
+        dependencies.append(decision_task.id)
+    elif decision_task is not None:
+        raise ProcessingError("A curriculum decision task is not valid for an automatic selection")
+    curriculum_selection, selection_record = load_canonical_curriculum_selection(
+        workspace,
+        expected_producer_task_id=expected_selection_producer,
+    )
+    if curriculum_selection.curriculum_plan_digest != curriculum_plan_record.digest:
+        raise ProcessingError("Selected curriculum does not belong to the canonical options")
+    if curriculum_selection.selected_path_id not in {path.id for path in curriculum_plan.paths}:
+        raise ProcessingError("Selected curriculum identifies an unknown path")
     records = {
         kind: _canonical_path(workspace, kind)
         for kind in (
@@ -71,16 +110,22 @@ def plan_author_task(
             "semantic-conflicts",
         )
     }
+    records["curriculum-options"] = (
+        str(curriculum_plan_record.path),
+        curriculum_plan_record.digest,
+    )
+    records["selected-curriculum"] = (str(selection_record.path), selection_record.digest)
     packet = {
         "instructions": (
-            "Design a thematic default curriculum and materially different alternate paths "
-            "when justified. Write every Markdown artifact directly under the task output "
-            "directory. Complete the full instructional-affordance ledger without creating "
-            "one artifact per behavior. Keep solutions and answer-bearing rubrics separate "
-            "and after-attempt. Do not exceed Analyze capability ceilings. Select only "
-            "evidence-grounded visual_asset_candidates when a visual materially improves "
-            "teaching or verification. Link every selected PNG from each used_by artifact, "
-            "and leave decorative or redundant candidates unused."
+            "Consume the selected canonical curriculum without redesigning or reopening it. "
+            "Bind every planned path to justified artifacts and write every Markdown draft "
+            "directly under the task output directory. Complete the full instructional-"
+            "affordance ledger without creating one artifact per behavior. Keep solutions and "
+            "answer-bearing rubrics separate and after-attempt. Do not exceed Analyze capability "
+            "ceilings. Select only evidence-grounded visual_asset_candidates when a visual "
+            "materially improves teaching or verification. Link every selected PNG from each "
+            "used_by artifact, and leave decorative or redundant candidates unused. Curriculum "
+            "decision fields are legacy-only and must remain false and null."
         ),
         "canonical_records": {
             kind: {"path": path, "digest": digest} for kind, (path, digest) in records.items()
@@ -91,11 +136,18 @@ def plan_author_task(
     return workspace.ensure_work_item(
         run_id=run.id,
         role=WorkRole.AUTHOR,
-        scope={"kind": "course-authoring", "revision": 1},
+        scope={
+            "kind": "course-authoring",
+            "revision": 1,
+            "curriculum_task_id": curriculum_task.id,
+            "curriculum_plan_digest": curriculum_plan_record.digest,
+            "curriculum_selection_digest": selection_record.digest,
+            "curriculum_selection_producer_task_id": expected_selection_producer,
+        },
         persona_hint=AUTHOR_PERSONA,
         packet=packet,
         result_schema=AuthorResult.model_json_schema(mode="validation"),
-        dependencies=[analyze_task.id],
+        dependencies=dependencies,
         snapshot_digest=run.snapshot_digest,
     )
 
@@ -157,11 +209,87 @@ def _visual_asset_candidates_by_id(
     }
 
 
+def _is_subsequence(expected: list[str], actual: list[str]) -> bool:
+    position = 0
+    for item in actual:
+        if position < len(expected) and item == expected[position]:
+            position += 1
+    return position == len(expected)
+
+
+def _validate_selected_curriculum(
+    workspace: Workspace,
+    task: WorkItem,
+    result: AuthorResult,
+) -> None:
+    expected_plan_digest = task.scope.get("curriculum_plan_digest")
+    if expected_plan_digest is None:
+        return
+    if not isinstance(expected_plan_digest, str):
+        raise ProcessingError("Author task has an invalid curriculum plan digest")
+    curriculum_task_id = task.scope.get("curriculum_task_id")
+    expected_selection_digest = task.scope.get("curriculum_selection_digest")
+    expected_selection_producer = task.scope.get("curriculum_selection_producer_task_id")
+    if not all(
+        isinstance(value, str)
+        for value in (
+            curriculum_task_id,
+            expected_selection_digest,
+            expected_selection_producer,
+        )
+    ):
+        raise ProcessingError("Author task is missing its selected curriculum binding")
+    plan, plan_record = load_canonical_curriculum_plan(
+        workspace,
+        expected_digest=expected_plan_digest,
+        expected_producer_task_id=str(curriculum_task_id),
+    )
+    selection, _selection_record = load_canonical_curriculum_selection(
+        workspace,
+        expected_digest=str(expected_selection_digest),
+        expected_producer_task_id=str(expected_selection_producer),
+    )
+    if selection.curriculum_plan_digest != plan_record.digest:
+        raise ProcessingError("Author task selection targets different curriculum options")
+    if result.curriculum_decision_required or result.curriculum_decision_summary is not None:
+        raise ProcessingError("Curriculum decisions must be settled before artifact authoring")
+    if result.curriculum.selected_path_id != selection.selected_path_id:
+        raise ProcessingError("Author curriculum changed the selected canonical path")
+    planned_ids = [path.id for path in plan.paths]
+    authored_ids = [path.id for path in result.curriculum.paths]
+    if authored_ids != planned_ids or result.curriculum.rationale != plan.rationale:
+        raise ProcessingError("Author curriculum changed the canonical curriculum options")
+    authored_paths = {path.id: path for path in result.curriculum.paths}
+    artifacts = {artifact.id: artifact for artifact in result.artifacts}
+    for planned_path in plan.paths:
+        authored_path = authored_paths[planned_path.id]
+        if (
+            authored_path.title != planned_path.title
+            or authored_path.kind != planned_path.kind
+            or authored_path.use_when != planned_path.use_when
+        ):
+            raise ProcessingError(
+                f"Author curriculum changed canonical path metadata for {planned_path.id}"
+            )
+        authored_unit_sequence: list[str] = []
+        seen_units: set[str] = set()
+        for artifact_id in authored_path.artifact_ids:
+            for unit_id in artifacts[artifact_id].semantic_unit_ids:
+                if unit_id not in seen_units:
+                    authored_unit_sequence.append(unit_id)
+                    seen_units.add(unit_id)
+        if not _is_subsequence(planned_path.unit_sequence, authored_unit_sequence):
+            raise ProcessingError(
+                f"Author artifacts do not preserve curriculum unit order for {planned_path.id}"
+            )
+
+
 def _validate_author_result(
     workspace: Workspace,
     task: WorkItem,
     result: AuthorResult,
 ) -> None:
+    _validate_selected_curriculum(workspace, task, result)
     units = _load_semantic_units(workspace)
     known_units = {unit.id for unit in units}
     units_by_id = {unit.id: unit for unit in units}
@@ -303,7 +431,10 @@ def submit_author_result(
     result_path: Path,
 ) -> WorkItem:
     task = workspace.get_work_item(task_id)
-    if task.role != WorkRole.AUTHOR:
+    if task.role != WorkRole.AUTHOR or task.scope.get("kind") not in {
+        "course-authoring",
+        "course-authoring-repair",
+    }:
         raise ProcessingError(f"Task is not an Author task: {task_id}")
     result = _load_author_result(result_path)
     if result.task_id != task_id or result.snapshot_digest != task.snapshot_digest:

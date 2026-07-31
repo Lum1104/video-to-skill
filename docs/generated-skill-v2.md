@@ -1043,7 +1043,9 @@ The implemented sequence is:
 
 1. `run` inspects, acquires, transcribes, analyzes visuals, segments sources, and creates bounded Analyze work.
 2. Analyze submissions produce the canonical semantic map, relations, conflicts, coverage, and capability ceilings.
-3. Author submissions produce curriculum, interaction, artifact plans, instructional-affordance coverage, claims, and immutable drafts.
-4. Review submissions independently audit semantic and product retention plus runtime behavior.
-5. Failed reviews create immutable Author repair tasks and fresh Reviews, with at most three cycles.
-6. Passing state compiles, renders outside the workspace, validates, installs without clobbering, and persists a completion record.
+3. A bounded curriculum-planning Author submission produces immutable options and ordered semantic-unit sequences, without artifact plans, claims, assets, or drafts.
+4. The coordinator persists the recommended selection automatically or emits a durable `ask-user` action when the learning experience materially differs.
+5. Only after selection, the full Author consumes the pinned option and selection digests and produces interaction, artifact-bound curriculum paths, artifact plans, instructional-affordance coverage, claims, assets, and immutable drafts.
+6. Review submissions independently audit semantic and product retention plus runtime behavior.
+7. Failed reviews create immutable Author repair tasks pinned to the same selected curriculum and fresh Reviews, with at most three cycles.
+8. Passing state compiles, renders outside the workspace, validates, installs without clobbering, and persists a completion record.

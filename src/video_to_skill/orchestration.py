@@ -15,6 +15,7 @@ from video_to_skill.generation import (
     CourseInteraction,
     CourseSkillClaim,
     CurriculumDesign,
+    CurriculumKind,
     SemanticRelation,
     SemanticUnit,
     SkillMode,
@@ -132,6 +133,100 @@ class AnalyzeResult(OrchestrationModel):
         ):
             raise ValueError("material semantic units are not fully accounted for")
         return self
+
+
+class CurriculumPlanPath(OrchestrationModel):
+    id: str = Field(min_length=1, max_length=160)
+    title: str = Field(min_length=1, max_length=300)
+    kind: CurriculumKind
+    use_when: str = Field(min_length=1, max_length=500)
+    unit_sequence: list[str] = Field(min_length=1)
+
+    @field_validator("id", "title", "use_when")
+    @classmethod
+    def compact_text(cls, value: str) -> str:
+        compact = " ".join(value.split())
+        if not compact:
+            raise ValueError("curriculum plan path text cannot be blank")
+        return compact
+
+    @field_validator("unit_sequence")
+    @classmethod
+    def unique_unit_sequence(cls, value: list[str]) -> list[str]:
+        compact = [" ".join(item.split()) for item in value]
+        if not all(compact) or len(compact) != len(set(compact)):
+            raise ValueError("curriculum plan unit sequence must contain unique non-empty ids")
+        return compact
+
+
+class CurriculumPlan(OrchestrationModel):
+    recommended_path_id: str = Field(min_length=1, max_length=160)
+    rationale: str = Field(min_length=1, max_length=1200)
+    paths: list[CurriculumPlanPath] = Field(min_length=1, max_length=3)
+    decision_required: bool = False
+    decision_summary: str | None = Field(default=None, min_length=1, max_length=1200)
+
+    @field_validator("recommended_path_id", "rationale")
+    @classmethod
+    def compact_text(cls, value: str) -> str:
+        compact = " ".join(value.split())
+        if not compact:
+            raise ValueError("curriculum plan text cannot be blank")
+        return compact
+
+    @field_validator("decision_summary")
+    @classmethod
+    def compact_optional_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        compact = " ".join(value.split())
+        if not compact:
+            raise ValueError("curriculum decision summary cannot be blank")
+        return compact
+
+    @model_validator(mode="after")
+    def coherent_paths(self) -> CurriculumPlan:
+        path_ids = [path.id for path in self.paths]
+        if len(path_ids) != len(set(path_ids)):
+            raise ValueError("curriculum plan path ids must be unique")
+        known_paths = set(path_ids)
+        if self.recommended_path_id not in known_paths:
+            raise ValueError("recommended_path_id must identify a curriculum plan path")
+        recommended = next(path for path in self.paths if path.id == self.recommended_path_id)
+        if recommended.kind != "thematic":
+            raise ValueError("the recommended curriculum plan path must be thematic")
+        if self.decision_required != (self.decision_summary is not None):
+            raise ValueError("material curriculum decisions require a concise decision summary")
+        if self.decision_required and len(self.paths) < 2:
+            raise ValueError("material curriculum decisions require at least two paths")
+        signatures = {(path.kind, tuple(path.unit_sequence)) for path in self.paths}
+        if len(self.paths) > 1 and len(signatures) != len(self.paths):
+            raise ValueError("curriculum options must differ in kind or unit sequence")
+        return self
+
+
+class CurriculumPlanResult(OrchestrationModel):
+    schema_version: Literal[1] = 1
+    task_id: str
+    lease_token: str = Field(min_length=20)
+    snapshot_digest: str
+    producer: ObservationProducer
+    curriculum: CurriculumPlan
+
+
+class CurriculumSelection(OrchestrationModel):
+    schema_version: Literal[1] = 1
+    curriculum_plan_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    selected_path_id: str = Field(min_length=1, max_length=160)
+    source: Literal["recommended", "user"]
+
+    @field_validator("selected_path_id")
+    @classmethod
+    def compact_selected_path_id(cls, value: str) -> str:
+        compact = " ".join(value.split())
+        if not compact:
+            raise ValueError("selected curriculum path id cannot be blank")
+        return compact
 
 
 AffordanceKind = Literal[

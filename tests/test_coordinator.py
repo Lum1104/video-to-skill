@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from test_author import _analyzed_workspace, _author_result
+from test_author import _analyzed_workspace, _author_result, _curriculum_result
 from test_review import _review_result
 
 from video_to_skill.config import Settings
@@ -16,6 +16,7 @@ from video_to_skill.installation import SkillHost
 from video_to_skill.models import ObservationProducer
 from video_to_skill.orchestration import DecisionResult, RunEnvelope
 from video_to_skill.utils import atomic_write_json
+from video_to_skill.work import WorkRole
 from video_to_skill.workspace import Workspace
 
 
@@ -39,7 +40,7 @@ def _reviewed_workspace(
     output = tmp_path / "generated" / "evidence-updated-conviction"
     skill_root = tmp_path / "skills"
 
-    author_envelope = advance_run(
+    curriculum_envelope = advance_run(
         sources=[],
         workspace_path=workspace.root,
         settings=settings,
@@ -49,9 +50,26 @@ def _reviewed_workspace(
         run_official_validation=False,
     )
 
-    assert author_envelope.status == "actions-required"
+    assert curriculum_envelope.status == "actions-required"
+    [curriculum_action] = curriculum_envelope.actions
+    assert curriculum_action.role == "author"
+    curriculum_task = workspace.get_work_item(curriculum_action.task_id)
+    assert curriculum_task.scope["kind"] == "curriculum-planning"
+    curriculum_lease = json.loads(
+        (curriculum_action.task_path / "lease.json").read_text(encoding="utf-8")
+    )
+    curriculum_result = _curriculum_result(
+        curriculum_task,
+        str(curriculum_lease["lease_token"]),
+    )
+    curriculum_result_path = curriculum_action.task_path / "output" / "result.json"
+    atomic_write_json(curriculum_result_path, curriculum_result)
+    submit_workspace_result(workspace, curriculum_task.id, curriculum_result_path)
+
+    author_envelope = _resume(workspace, settings)
     [author_action] = author_envelope.actions
     assert author_action.role == "author"
+    assert workspace.get_work_item(author_action.task_id).scope["kind"] == "course-authoring"
     assert "transcript" not in author_envelope.model_dump_json()
     author_task = workspace.get_work_item(author_action.task_id)
     lease = json.loads((author_action.task_path / "lease.json").read_text(encoding="utf-8"))
@@ -115,6 +133,87 @@ def test_run_and_submit_complete_without_main_agent_data_forwarding(
     assert resumed.completion["generated_path"] == complete.completion["generated_path"]
     assert resumed.completion["installed_path"] == complete.completion["installed_path"]
     assert resumed.completion["installation_status"] == "unchanged"
+
+
+def test_material_curriculum_decision_precedes_artifact_authoring(tmp_path: Path) -> None:
+    workspace, _analyze_task = _analyzed_workspace(tmp_path)
+    settings = Settings(cache_root=tmp_path)
+    first = advance_run(
+        sources=[],
+        workspace_path=workspace.root,
+        settings=settings,
+        host=SkillHost.CODEX,
+        output=tmp_path / "generated" / "evidence-updated-conviction",
+        skill_root=tmp_path / "skills",
+        run_official_validation=False,
+    )
+    [curriculum_action] = first.actions
+    curriculum_task = workspace.get_work_item(curriculum_action.task_id)
+    curriculum_lease = json.loads(
+        (curriculum_action.task_path / "lease.json").read_text(encoding="utf-8")
+    )
+    curriculum_result_path = curriculum_action.task_path / "output" / "result.json"
+    atomic_write_json(
+        curriculum_result_path,
+        _curriculum_result(
+            curriculum_task,
+            str(curriculum_lease["lease_token"]),
+            decision_required=True,
+        ),
+    )
+    submit_workspace_result(workspace, curriculum_task.id, curriculum_result_path)
+
+    decision_envelope = _resume(workspace, settings)
+    [decision_action] = decision_envelope.actions
+    assert decision_action.kind == "ask-user"
+    assert all(
+        workspace.canonical_record(kind) is None
+        for kind in ("course", "artifact-plan", "claims", "assets")
+    )
+    assert not any(
+        item.scope.get("kind") == "course-authoring"
+        for item in workspace.list_work_items(curriculum_task.run_id)
+    )
+    repeated = _resume(workspace, settings)
+    [repeated_action] = repeated.actions
+    assert repeated_action.task_id == decision_action.task_id
+    assert repeated_action.already_leased is True
+
+    decision_task = workspace.get_work_item(decision_action.task_id)
+    decision_lease = json.loads(
+        (decision_action.task_path / "lease.json").read_text(encoding="utf-8")
+    )
+    decision_result_path = decision_action.task_path / "output" / "result.json"
+    atomic_write_json(
+        decision_result_path,
+        DecisionResult(
+            task_id=decision_task.id,
+            lease_token=str(decision_lease["lease_token"]),
+            snapshot_digest=decision_task.snapshot_digest,
+            producer=ObservationProducer(name="user"),
+            selected_option_id="application-first",
+        ),
+    )
+    submit_workspace_result(workspace, decision_task.id, decision_result_path)
+
+    author_envelope = _resume(workspace, settings)
+    [author_action] = author_envelope.actions
+    author_task = workspace.get_work_item(author_action.task_id)
+    options_record = workspace.canonical_record("curriculum-options")
+    selection_record = workspace.canonical_record("selected-curriculum")
+    assert options_record is not None
+    assert selection_record is not None
+    selection = json.loads((workspace.root / selection_record.path).read_text(encoding="utf-8"))
+    assert selection["selected_path_id"] == "application-first"
+    assert selection["source"] == "user"
+    assert author_task.scope["curriculum_plan_digest"] == options_record.digest
+    assert author_task.scope["curriculum_selection_digest"] == selection_record.digest
+    assert author_task.scope["curriculum_selection_producer_task_id"] == decision_task.id
+    assert set(author_task.dependencies) == {
+        str(curriculum_task.scope["analyze_task_id"]),
+        curriculum_task.id,
+        decision_task.id,
+    }
 
 
 def test_run_revalidates_cached_completion_and_recovers_missing_artifacts(
@@ -234,6 +333,38 @@ def test_run_reclaims_expired_task_lease(tmp_path: Path) -> None:
     assert resumed_action.task_id == first_action.task_id
     assert resumed_action.already_leased is False
     assert workspace.get_work_item(first_action.task_id).attempt_count == first_attempts + 1
+
+
+def test_run_resumes_pre_checkpoint_author_task_without_replanning(tmp_path: Path) -> None:
+    workspace, analyze_task = _analyzed_workspace(tmp_path)
+    run = workspace.create_analysis_run(analyze_task.snapshot_digest)
+    legacy_author = workspace.ensure_work_item(
+        run_id=run.id,
+        role=WorkRole.AUTHOR,
+        scope={"kind": "course-authoring", "revision": 1},
+        persona_hint="Legacy course Author.",
+        packet={},
+        result_schema={"type": "object"},
+        dependencies=[analyze_task.id],
+        snapshot_digest=run.snapshot_digest,
+    )
+
+    resumed = advance_run(
+        sources=[],
+        workspace_path=workspace.root,
+        settings=Settings(cache_root=tmp_path),
+        host=SkillHost.CODEX,
+        output=tmp_path / "generated" / "legacy-course",
+        skill_root=tmp_path / "skills",
+        run_official_validation=False,
+    )
+
+    [action] = resumed.actions
+    assert action.task_id == legacy_author.id
+    assert not any(
+        item.scope.get("kind") == "curriculum-planning"
+        for item in workspace.list_work_items(run.id)
+    )
 
 
 def test_submit_rejects_result_outside_task_output_before_parsing(

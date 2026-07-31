@@ -1,19 +1,29 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
 from video_to_skill.config import Settings
 from video_to_skill.errors import ProcessingError
+from video_to_skill.generation import CurriculumDesign, CurriculumPath
 from video_to_skill.models import ObservationProducer
-from video_to_skill.orchestration import BehaviorCheck, ReviewFinding, ReviewResult
+from video_to_skill.orchestration import (
+    ArtifactDraftSpec,
+    BehaviorCheck,
+    CurriculumPlan,
+    CurriculumPlanPath,
+    CurriculumSelection,
+    ReviewFinding,
+    ReviewResult,
+)
 from video_to_skill.review import (
     plan_author_repair_task,
     plan_review_task,
     submit_review_result,
 )
-from video_to_skill.utils import atomic_write_json
+from video_to_skill.utils import atomic_write_json, hash_file
 from video_to_skill.work import WorkRole, WorkState
 from video_to_skill.workspace import Workspace
 
@@ -25,27 +35,113 @@ def _authored_workspace(tmp_path: Path) -> tuple[Workspace, object, object]:
         settings=Settings(cache_root=tmp_path),
     )
     run = workspace.create_analysis_run()
-    author = workspace.ensure_work_item(
+    curriculum = workspace.ensure_work_item(
         run_id=run.id,
         role=WorkRole.AUTHOR,
-        scope={"kind": "course-authoring", "revision": 1},
+        scope={"kind": "curriculum-planning"},
         persona_hint="Principal curriculum architect.",
         packet={},
         result_schema={"type": "object"},
         snapshot_digest=run.snapshot_digest,
     )
+    curriculum_lease = workspace.lease_work_item(curriculum.id, owner="codex")
+    curriculum_result = curriculum_lease.output_directory / "result.json"
+    atomic_write_json(curriculum_result, {"curriculum": "curriculum-worker"})
+    options_path = curriculum_lease.output_directory / "curriculum-options.json"
+    atomic_write_json(
+        options_path,
+        CurriculumPlan(
+            recommended_path_id="thematic",
+            rationale="Use the thematic path.",
+            paths=[
+                CurriculumPlanPath(
+                    id="thematic",
+                    title="Course",
+                    kind="thematic",
+                    use_when="learning the course",
+                    unit_sequence=["unit"],
+                )
+            ],
+        ),
+    )
+    selection_path = curriculum_lease.output_directory / "selected-curriculum.json"
+    atomic_write_json(
+        selection_path,
+        CurriculumSelection(
+            curriculum_plan_digest=hash_file(options_path),
+            selected_path_id="thematic",
+            source="recommended",
+        ),
+    )
+    curriculum, curriculum_records = workspace.accept_work_result(
+        task_id=curriculum.id,
+        lease_token=curriculum_lease.token,
+        result_path=curriculum_result,
+        producer=ObservationProducer(
+            name="curriculum-worker",
+            run_id="curriculum-run",
+        ).model_dump(mode="json"),
+        canonical_outputs=[
+            ("curriculum-options", "default", options_path),
+            ("selected-curriculum", "default", selection_path),
+        ],
+    )
+    records_by_kind = {record.kind: record for record in curriculum_records}
+    author = workspace.ensure_work_item(
+        run_id=run.id,
+        role=WorkRole.AUTHOR,
+        scope={
+            "kind": "course-authoring",
+            "revision": 1,
+            "curriculum_task_id": curriculum.id,
+            "curriculum_plan_digest": records_by_kind["curriculum-options"].digest,
+            "curriculum_selection_digest": records_by_kind["selected-curriculum"].digest,
+            "curriculum_selection_producer_task_id": curriculum.id,
+        },
+        persona_hint="Principal curriculum architect.",
+        packet={},
+        result_schema={"type": "object"},
+        dependencies=[curriculum.id],
+        snapshot_digest=run.snapshot_digest,
+    )
     lease = workspace.lease_work_item(author.id, owner="codex")
     result_path = lease.output_directory / "result.json"
     atomic_write_json(result_path, {"author": "author-worker"})
+    draft = lease.output_directory / "course.md"
+    draft.write_text("# Course\n", encoding="utf-8")
+    artifact = ArtifactDraftSpec(
+        id="artifact",
+        path="chapters/course.md",
+        title="Course",
+        modes=["learn"],
+        disclosure="normal",
+        use_when="learning the course",
+        independent_loading_reason="Load the course as one coherent guide.",
+        semantic_unit_ids=["unit"],
+        draft_path=draft.name,
+        draft_sha256=hash_file(draft),
+    )
     values = {
         "semantic-map": [{"id": "unit"}],
         "semantic-relations": [],
         "semantic-coverage": {"material_units_accounted_for": True},
         "course": {"name": "course"},
-        "curriculum": {"selected_path_id": "thematic"},
+        "curriculum": CurriculumDesign(
+            selected_path_id="thematic",
+            rationale="Use the thematic path.",
+            paths=[
+                CurriculumPath(
+                    id="thematic",
+                    title="Course",
+                    kind="thematic",
+                    use_when="learning the course",
+                    artifact_ids=[artifact.id],
+                )
+            ],
+        ).model_dump(mode="json"),
         "interaction": {"welcome": "start"},
         "capability-profile": {"learn": "light"},
-        "artifact-plan": [{"id": "artifact", "path": "chapters/course.md"}],
+        "artifact-plan": [artifact.model_dump(mode="json")],
         "instructional-affordances": [{"id": "affordance"}],
         "claims": [{"id": "claim"}],
         "assets": [],
@@ -55,8 +151,6 @@ def _authored_workspace(tmp_path: Path) -> tuple[Workspace, object, object]:
         path = lease.output_directory / f"{kind}.json"
         atomic_write_json(path, value)
         outputs.append((kind, "default", path))
-    draft = lease.output_directory / "course.md"
-    draft.write_text("# Course\n", encoding="utf-8")
     outputs.append(("artifact-draft", "artifact", draft))
     author, _records = workspace.accept_work_result(
         task_id=author.id,
@@ -153,6 +247,40 @@ def test_review_rejects_author_as_reviewer(tmp_path: Path) -> None:
         submit_review_result(workspace, review.id, result_path)
 
 
+def test_review_rejects_tampered_curriculum_checkpoint_bytes(tmp_path: Path) -> None:
+    workspace, run, author = _authored_workspace(tmp_path)
+    options_record = workspace.canonical_record("curriculum-options")
+    assert options_record is not None
+    options_path = workspace.root / options_record.path
+    options_path.write_bytes(options_path.read_bytes() + b"\n")
+
+    with pytest.raises(ProcessingError, match="curriculum plan failed its digest check"):
+        plan_review_task(workspace, run, author_task=author)
+
+
+def test_review_rejects_selection_changed_after_authoring(tmp_path: Path) -> None:
+    workspace, run, author = _authored_workspace(tmp_path)
+    options_record = workspace.canonical_record("curriculum-options")
+    selection_record = workspace.canonical_record("selected-curriculum")
+    assert options_record is not None
+    assert selection_record is not None
+    selection = json.loads((workspace.root / selection_record.path).read_text(encoding="utf-8"))
+    drift_path = (
+        workspace.tasks_dir / options_record.producer_task_id / "output" / "selection-drift.json"
+    )
+    drift_path.write_text(json.dumps(selection, separators=(",", ":")), encoding="utf-8")
+    workspace.publish_canonical_record(
+        kind="selected-curriculum",
+        record_id="default",
+        source_path=drift_path,
+        producer_task_id=options_record.producer_task_id,
+        snapshot_digest=selection_record.snapshot_digest,
+    )
+
+    with pytest.raises(ProcessingError, match="not bound to the current curriculum checkpoint"):
+        plan_review_task(workspace, run, author_task=author)
+
+
 def test_failed_review_creates_new_author_revision_task(tmp_path: Path) -> None:
     workspace, run, author = _authored_workspace(tmp_path)
     review = plan_review_task(workspace, run, author_task=author)
@@ -179,3 +307,7 @@ def test_failed_review_creates_new_author_revision_task(tmp_path: Path) -> None:
     assert repair.role == WorkRole.AUTHOR
     assert repair.dependencies == [failed_review.id]
     assert repair.scope["revision"] == 2
+    assert repair.scope["curriculum_plan_digest"] == author.scope["curriculum_plan_digest"]
+    assert (
+        repair.scope["curriculum_selection_digest"] == author.scope["curriculum_selection_digest"]
+    )

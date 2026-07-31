@@ -57,7 +57,7 @@ An `ask-user` action contains:
 
 - a stable decision task ID;
 - the material decision prompt; and
-- bounded options produced by canonical Author state.
+- bounded options produced by canonical curriculum-planning state.
 
 The coordinator materializes and leases every action before returning it. A resumed main agent can redispatch an already-leased task from its durable directory; duplicate completion is detected by result digest.
 
@@ -153,7 +153,7 @@ Candidate versus canonical status is represented by immutable file revisions and
 The semantic workflow is:
 
 ```text
-Analyze → Author → Review
+Analyze → Author (curriculum checkpoint → artifact authoring) → Review
 ```
 
 These are reasoning boundaries rather than public commands.
@@ -174,13 +174,15 @@ Analyze submissions validate source scope, timestamps, packet evidence IDs, sema
 
 ### Author
 
-Author consumes canonical semantic files by path and digest, not copied JSON in a main-agent prompt.
+Author consumes canonical files by path and digest, not copied JSON in a main-agent prompt. It has two immutable task shapes under the same role so the public protocol remains `Analyze → Author → Review`.
 
-It produces:
+The bounded curriculum-planning task runs immediately after the integrated semantic map. It produces one recommended thematic option plus up to two materially different alternatives, with ordered semantic-unit IDs and concise decision metadata. It cannot produce artifact specifications, drafts, claims, or asset selections. When a material choice exists, the coordinator emits `ask-user`; otherwise it persists the recommendation automatically. Immutable `curriculum-options` and `selected-curriculum` records keep the proposal separate from the choice.
+
+Only after `selected-curriculum` is canonical does the full Author task run. Its scope pins both option and selection digests and their producers. It produces:
 
 - course identity and interaction behavior;
 - capability profile within Analyze ceilings;
-- curriculum paths and any material user choice;
+- artifact-bound curriculum paths that preserve the selected canonical design;
 - artifact specifications;
 - task-owned Markdown drafts;
 - claims and provenance;
@@ -199,13 +201,13 @@ Author receives candidate metadata and verified workspace-relative PNG paths. It
 
 Review must use a producer identity independent of the Author producer.
 
-The review snapshot includes semantic records, curriculum, interaction, capability profile, artifact plan, instructional-affordance ledger, claims, assets, every canonical draft digest, the visual-candidate manifest, and selected image digests.
+The review snapshot includes semantic records, curriculum options, selected curriculum, final artifact-bound curriculum, interaction, capability profile, artifact plan, instructional-affordance ledger, claims, assets, every canonical draft digest, the visual-candidate manifest, and selected image digests.
 
 Review audits semantic retention and instructional-affordance retention separately, followed by grounding, disclosure, runtime behavior, safety, scope, and shareability. For every selected visual, Review checks necessity, legibility, retained context, temporal ordering, privacy, claim grounding, and whether the generated Skill opens it only on demand.
 
 A pass requires no blocking findings and no failed behavior checks. A fail requires a blocking finding or failed behavior check.
 
-A failed Review creates a complete Author revision task and a new independent Review. The coordinator permits at most three repair cycles.
+A failed Review creates a complete Author revision task pinned to the same curriculum option and selection digests, followed by a new independent Review. The coordinator permits at most three repair cycles and never reopens the settled curriculum choice.
 
 ## Deterministic compilation
 
@@ -268,7 +270,7 @@ The implementation is successful when:
 - the normal main-agent protocol uses `run` and workers use `submit`;
 - the main agent never receives a complete transcript, semantic map, artifact body, or critic report;
 - workers operate from task paths and persist results directly;
-- short content follows Analyze, Author, Review, compile, validate, and install;
+- short content follows Analyze, the Author curriculum checkpoint and artifact pass, Review, compile, validate, and install;
 - long content fans out without unbounded packets;
 - stale, forged, duplicate, and out-of-scope submissions are rejected;
 - semantic and instructional-affordance coverage survive conversation loss;

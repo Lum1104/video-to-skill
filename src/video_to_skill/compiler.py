@@ -6,9 +6,14 @@ import json
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic import ValidationError as PydanticValidationError
 
+from video_to_skill.curriculum import (
+    load_canonical_curriculum_checkpoint,
+    validate_artifact_bound_curriculum,
+    validate_curriculum_checkpoint_author_binding,
+)
 from video_to_skill.errors import ProcessingError
 from video_to_skill.generation import (
     CapabilityProfile,
@@ -63,6 +68,8 @@ class WorkspaceBuildReceipt(CompileModel):
     name: str
     semantic_map_digest: str
     curriculum_digest: str
+    curriculum_options_digest: str | None = None
+    selected_curriculum_digest: str | None = None
     instructional_affordance_digest: str
     assets_digest: str
     visual_asset_candidates_digest: str | None = None
@@ -70,6 +77,12 @@ class WorkspaceBuildReceipt(CompileModel):
     behavior_report_digest: str
     delivery_selection_digest: str | None = None
     artifacts: list[CompiledArtifactReference]
+
+    @model_validator(mode="after")
+    def coherent_curriculum_checkpoint(self) -> WorkspaceBuildReceipt:
+        if (self.curriculum_options_digest is None) != (self.selected_curriculum_digest is None):
+            raise ValueError("build receipt curriculum checkpoint digests must appear together")
+        return self
 
 
 class WorkspaceBuildResult(CompileModel):
@@ -222,6 +235,14 @@ def compile_workspace_blueprint(
         _canonical_json(workspace, "artifact-plan"),
         label="artifact plan",
     )
+    try:
+        curriculum = CurriculumDesign.model_validate(_canonical_json(workspace, "curriculum"))
+    except PydanticValidationError as exc:
+        raise ProcessingError(f"Invalid canonical curriculum: {exc}") from exc
+    checkpoint = load_canonical_curriculum_checkpoint(workspace)
+    if checkpoint is not None:
+        validate_curriculum_checkpoint_author_binding(workspace, checkpoint)
+        validate_artifact_bound_curriculum(checkpoint, curriculum, artifacts)
     _validated_list(
         InstructionalAffordance,
         _canonical_json(workspace, "instructional-affordances"),
@@ -311,7 +332,7 @@ def compile_workspace_blueprint(
             capability_profile=CapabilityProfile.model_validate(
                 _canonical_json(workspace, "capability-profile")
             ),
-            curriculum=CurriculumDesign.model_validate(_canonical_json(workspace, "curriculum")),
+            curriculum=curriculum,
             prerequisites=course.get("prerequisites", []),
             core_principles=[
                 CorePrinciple.model_validate(item) for item in course.get("core_principles", [])
@@ -344,6 +365,12 @@ def compile_workspace_blueprint(
         name=blueprint.name,
         semantic_map_digest=semantic_record.digest,
         curriculum_digest=curriculum_record.digest,
+        curriculum_options_digest=(
+            checkpoint.plan_record.digest if checkpoint is not None else None
+        ),
+        selected_curriculum_digest=(
+            checkpoint.selection_record.digest if checkpoint is not None else None
+        ),
         instructional_affordance_digest=affordance_record.digest,
         assets_digest=assets_record.digest,
         visual_asset_candidates_digest=(

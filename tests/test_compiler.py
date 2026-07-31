@@ -4,10 +4,10 @@ import json
 from pathlib import Path
 
 import pytest
-from test_author import _analyzed_workspace, _author_result
+from test_author import _analyzed_workspace, _author_result, _plan_course_author_task
 from test_generation import _blueprint
 
-from video_to_skill.author import plan_author_task, submit_author_result
+from video_to_skill.author import submit_author_result
 from video_to_skill.compiler import (
     build_workspace_skill,
     compile_workspace_blueprint,
@@ -235,7 +235,7 @@ def test_compiler_refuses_failed_review(tmp_path: Path) -> None:
 def test_compiler_binds_selected_visual_to_integrated_candidate(tmp_path: Path) -> None:
     workspace, analyze_task = _analyzed_workspace(tmp_path, with_visual=True)
     run = workspace.create_analysis_run(analyze_task.snapshot_digest)
-    author_task = plan_author_task(workspace, run, analyze_task=analyze_task)
+    author_task = _plan_course_author_task(workspace, run, analyze_task)
     author_lease = workspace.lease_work_item(author_task.id, owner="codex")
     draft = author_lease.output_directory / "course.md"
     draft.write_text(
@@ -279,8 +279,39 @@ def test_compiler_binds_selected_visual_to_integrated_candidate(tmp_path: Path) 
 
     assert blueprint.assets[0].candidate_id == "status-panel"
     assert receipt.visual_asset_candidates_digest is not None
+    options_record = workspace.canonical_record("curriculum-options")
+    selection_record = workspace.canonical_record("selected-curriculum")
+    assert options_record is not None
+    assert selection_record is not None
+    assert receipt.curriculum_options_digest == options_record.digest
+    assert receipt.selected_curriculum_digest == selection_record.digest
+    options_path = workspace.root / options_record.path
+    original_options = options_path.read_bytes()
+    options_path.write_bytes(original_options + b"\n")
+    with pytest.raises(ProcessingError, match="curriculum plan failed its digest check"):
+        compile_workspace_blueprint(workspace)
+    options_path.write_bytes(original_options)
+
     image_record = workspace.canonical_record("visual-asset-image", "default:status-panel")
     assert image_record is not None
-    (workspace.root / image_record.path).write_bytes(b"tampered")
+    image_path = workspace.root / image_record.path
+    original_image = image_path.read_bytes()
+    image_path.write_bytes(b"tampered")
     with pytest.raises(ProcessingError, match="image failed its digest check"):
+        compile_workspace_blueprint(workspace)
+    image_path.write_bytes(original_image)
+
+    selection = json.loads((workspace.root / selection_record.path).read_text(encoding="utf-8"))
+    drift_path = (
+        workspace.tasks_dir / options_record.producer_task_id / "output" / "selection-drift.json"
+    )
+    drift_path.write_text(json.dumps(selection, separators=(",", ":")), encoding="utf-8")
+    workspace.publish_canonical_record(
+        kind="selected-curriculum",
+        record_id="default",
+        source_path=drift_path,
+        producer_task_id=options_record.producer_task_id,
+        snapshot_digest=selection_record.snapshot_digest,
+    )
+    with pytest.raises(ProcessingError, match="not bound to the current curriculum checkpoint"):
         compile_workspace_blueprint(workspace)

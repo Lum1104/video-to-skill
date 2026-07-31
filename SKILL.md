@@ -142,7 +142,9 @@ Every semantic unit needs a stable ID, source and time range, kind, compact summ
 
 ### Author
 
-Use a principal learning-science and Agent Skill author. Read canonical semantic records from the task packet, design a thematic default and justified alternate paths, and write Markdown drafts directly inside the task output directory.
+Author has two bounded task shapes under the same internal role. First, use a principal curriculum architect to read the canonical semantic records, recommend a thematic path, and propose up to two justified alternate learning experiences. This curriculum-planning task writes only curriculum options, ordered semantic-unit sequences, and concise decision metadata—never artifact plans, claims, assets, or Markdown drafts.
+
+When the alternatives would materially change the learning experience, stop at the durable `ask-user` action. Otherwise the coordinator canonically selects the recommendation. Only after that selection exists, dispatch the full Agent Skill author with the selected-curriculum path and digest. The full Author must preserve the selected path and planned semantic order while binding them to justified artifacts and writing Markdown drafts inside its task output directory. Do not reopen the curriculum choice during authoring or repair.
 
 Treat Learn, Practice, Apply, and Reference as evidence-bounded capability levels, not artifact quotas. Never exceed the Analyze capability ceiling.
 
@@ -156,11 +158,11 @@ Select only from the verified visual candidates in the Author packet. Retain a v
 
 ### Review
 
-Use a fresh senior Agent Skill critic who is independent of the Author producer. Review the actual canonical drafts and records, not an author-supplied summary.
+Use a fresh senior Agent Skill critic who is independent of both curriculum-planning and artifact-Author producers. Review the actual canonical drafts and records, not an author-supplied summary.
 
 Audit source-meaning retention and instructional-affordance retention separately, then grounding, uncertainty, disclosure, empty invocation, runtime behavior, safety, scope, source failures, and shareability. Inspect every selected teaching visual for necessity, legibility, context, ordering, privacy, evidence grounding, and on-demand loading.
 
-A failed Review completes its execution task but creates a new immutable Author revision and a fresh independent Review. Allow at most three repair cycles. Never weaken a capability claim merely to hide an affordance the evidence supports and the product needs.
+A failed Review completes its execution task but creates a new immutable Author revision pinned to the same selected curriculum and a fresh independent Review. Allow at most three repair cycles. Never weaken a capability claim merely to hide an affordance the evidence supports and the product needs.
 
 ## Evidence rules
 

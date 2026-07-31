@@ -21,10 +21,16 @@ from video_to_skill.compiler import (
     portable_build_matches,
 )
 from video_to_skill.config import Settings
+from video_to_skill.curriculum import (
+    load_canonical_curriculum_plan,
+    plan_curriculum_task,
+    submit_curriculum_plan_result,
+)
 from video_to_skill.errors import ProcessingError
 from video_to_skill.generation import CurriculumDesign
 from video_to_skill.installation import SkillHost, host_skill_root
 from video_to_skill.orchestration import (
+    CurriculumSelection,
     DecisionResult,
     DeliverySelection,
     RunAction,
@@ -153,6 +159,17 @@ def _course_requires_decision(workspace: Workspace) -> bool:
     return isinstance(course, dict) and bool(course.get("curriculum_decision_required"))
 
 
+def _curriculum_requires_decision(
+    workspace: Workspace,
+    curriculum_task: WorkItem,
+) -> bool:
+    curriculum, _record = load_canonical_curriculum_plan(
+        workspace,
+        expected_producer_task_id=curriculum_task.id,
+    )
+    return curriculum.decision_required
+
+
 def _plan_decision_task(
     workspace: Workspace,
     run: AnalysisRun,
@@ -192,6 +209,45 @@ def _plan_decision_task(
         },
         result_schema=DecisionResult.model_json_schema(mode="validation"),
         dependencies=[author_task.id],
+        snapshot_digest=run.snapshot_digest,
+    )
+
+
+def _plan_curriculum_decision_task(
+    workspace: Workspace,
+    run: AnalysisRun,
+    curriculum_task: WorkItem,
+) -> WorkItem:
+    curriculum, curriculum_record = load_canonical_curriculum_plan(
+        workspace,
+        expected_producer_task_id=curriculum_task.id,
+    )
+    if not curriculum.decision_required or curriculum.decision_summary is None:
+        raise ProcessingError("Curriculum options do not require a material user decision")
+    return workspace.ensure_work_item(
+        run_id=run.id,
+        role=WorkRole.DECISION,
+        scope={
+            "kind": "curriculum-plan-selection",
+            "curriculum_task_id": curriculum_task.id,
+            "curriculum_plan_digest": curriculum_record.digest,
+        },
+        persona_hint="User curriculum decision.",
+        packet={
+            "prompt": curriculum.decision_summary,
+            "options": [
+                {
+                    "id": path.id,
+                    "label": path.title,
+                    "description": path.use_when,
+                }
+                for path in curriculum.paths
+            ],
+            "curriculum_options_path": str(curriculum_record.path),
+            "curriculum_options_digest": curriculum_record.digest,
+        },
+        result_schema=DecisionResult.model_json_schema(mode="validation"),
+        dependencies=[curriculum_task.id],
         snapshot_digest=run.snapshot_digest,
     )
 
@@ -285,19 +341,42 @@ def submit_decision_result(
         raise ProcessingError(f"Invalid user decision result: {exc}") from exc
     if result.task_id != task.id or result.snapshot_digest != task.snapshot_digest:
         raise ProcessingError("User decision does not belong to this task snapshot")
+    _verified_task_packet(workspace, task)
     canonical_outputs: list[tuple[str, str, Path]]
-    if task.scope.get("kind") == "curriculum-selection":
-        curriculum_record = workspace.canonical_record("curriculum")
-        if curriculum_record is None:
-            raise ProcessingError("User decision requires canonical curriculum state")
-        curriculum = CurriculumDesign.model_validate(
-            _load_json(workspace.root / curriculum_record.path)
+    if task.scope.get("kind") == "curriculum-plan-selection":
+        curriculum_task_id = task.scope.get("curriculum_task_id")
+        expected_plan_digest = task.scope.get("curriculum_plan_digest")
+        if not isinstance(curriculum_task_id, str) or not isinstance(expected_plan_digest, str):
+            raise ProcessingError("Curriculum decision is missing its canonical plan binding")
+        curriculum_plan, curriculum_plan_record = load_canonical_curriculum_plan(
+            workspace,
+            expected_digest=expected_plan_digest,
+            expected_producer_task_id=curriculum_task_id,
         )
-        if result.selected_option_id not in {path.id for path in curriculum.paths}:
+        if result.selected_option_id not in {path.id for path in curriculum_plan.paths}:
             raise ProcessingError("User selected an unknown curriculum path")
-        selected = curriculum.model_copy(update={"selected_path_id": result.selected_option_id})
+        curriculum_selection = CurriculumSelection(
+            curriculum_plan_digest=curriculum_plan_record.digest,
+            selected_path_id=result.selected_option_id,
+            source="user",
+        )
+        output = workspace.tasks_dir / task.id / "output" / "selected-curriculum.json"
+        atomic_write_json(output, curriculum_selection)
+        canonical_outputs = [("selected-curriculum", "default", output)]
+    elif task.scope.get("kind") == "curriculum-selection":
+        legacy_curriculum_record = workspace.canonical_record("curriculum")
+        if legacy_curriculum_record is None:
+            raise ProcessingError("User decision requires canonical curriculum state")
+        legacy_curriculum = CurriculumDesign.model_validate(
+            _load_json(workspace.root / legacy_curriculum_record.path)
+        )
+        if result.selected_option_id not in {path.id for path in legacy_curriculum.paths}:
+            raise ProcessingError("User selected an unknown curriculum path")
+        legacy_selection = legacy_curriculum.model_copy(
+            update={"selected_path_id": result.selected_option_id}
+        )
         output = workspace.tasks_dir / task.id / "output" / "curriculum.json"
-        atomic_write_json(output, selected)
+        atomic_write_json(output, legacy_selection)
         canonical_outputs = [("curriculum", "default", output)]
     elif task.scope.get("kind") == "delivery-name-selection":
         packet = _verified_task_packet(workspace, task)
@@ -370,7 +449,10 @@ def submit_workspace_result(
     if item.role == WorkRole.ANALYZE:
         accepted = submit_analyze_result(workspace, task_id, resolved_result)
     elif item.role == WorkRole.AUTHOR:
-        accepted = submit_author_result(workspace, task_id, resolved_result)
+        if item.scope.get("kind") == "curriculum-planning":
+            accepted = submit_curriculum_plan_result(workspace, task_id, resolved_result)
+        else:
+            accepted = submit_author_result(workspace, task_id, resolved_result)
     elif item.role == WorkRole.REVIEW:
         accepted = submit_review_result(workspace, task_id, resolved_result)
     else:
@@ -523,32 +605,92 @@ def advance_run(
             continue
         analyze_task = integrated[-1]
 
-        author_tasks = workspace.list_work_items(run.id, role=WorkRole.AUTHOR)
-        if not author_tasks:
-            plan_author_task(workspace, run, analyze_task=analyze_task)
-            continue
-        incomplete_authors = [item for item in author_tasks if item.state != WorkState.COMPLETE]
-        if incomplete_authors:
-            return _actions_required(workspace, incomplete_authors)
-        author_task = author_tasks[-1]
-
+        all_author_tasks = workspace.list_work_items(run.id, role=WorkRole.AUTHOR)
+        curriculum_tasks = [
+            item for item in all_author_tasks if item.scope.get("kind") == "curriculum-planning"
+        ]
+        course_author_tasks = [
+            item
+            for item in all_author_tasks
+            if item.scope.get("kind") in {"course-authoring", "course-authoring-repair"}
+        ]
+        legacy_authoring = bool(course_author_tasks) and not curriculum_tasks
         decision_dependency: list[str] = []
-        if _course_requires_decision(workspace):
-            decisions = [
-                item
-                for item in _matching_tasks(
-                    workspace.list_work_items(run.id, role=WorkRole.DECISION),
-                    scope_key="author_task_id",
-                    scope_value=author_task.id,
-                )
-                if item.scope.get("kind") == "curriculum-selection"
+        if legacy_authoring:
+            incomplete_authors = [
+                item for item in course_author_tasks if item.state != WorkState.COMPLETE
             ]
-            if not decisions:
-                _plan_decision_task(workspace, run, author_task)
+            if incomplete_authors:
+                return _actions_required(workspace, incomplete_authors)
+            author_task = course_author_tasks[-1]
+            if _course_requires_decision(workspace):
+                decisions = [
+                    item
+                    for item in _matching_tasks(
+                        workspace.list_work_items(run.id, role=WorkRole.DECISION),
+                        scope_key="author_task_id",
+                        scope_value=author_task.id,
+                    )
+                    if item.scope.get("kind") == "curriculum-selection"
+                ]
+                if not decisions:
+                    _plan_decision_task(workspace, run, author_task)
+                    continue
+                if decisions[-1].state != WorkState.COMPLETE:
+                    return _actions_required(workspace, [decisions[-1]])
+                decision_dependency = [decisions[-1].id]
+        else:
+            if not curriculum_tasks:
+                plan_curriculum_task(workspace, run, analyze_task=analyze_task)
                 continue
-            if decisions[-1].state != WorkState.COMPLETE:
-                return _actions_required(workspace, [decisions[-1]])
-            decision_dependency = [decisions[-1].id]
+            incomplete_curricula = [
+                item for item in curriculum_tasks if item.state != WorkState.COMPLETE
+            ]
+            if incomplete_curricula:
+                return _actions_required(workspace, incomplete_curricula)
+            curriculum_task = curriculum_tasks[-1]
+            curriculum_decision: WorkItem | None = None
+            if _curriculum_requires_decision(workspace, curriculum_task):
+                decisions = [
+                    item
+                    for item in _matching_tasks(
+                        workspace.list_work_items(run.id, role=WorkRole.DECISION),
+                        scope_key="curriculum_task_id",
+                        scope_value=curriculum_task.id,
+                    )
+                    if item.scope.get("kind") == "curriculum-plan-selection"
+                ]
+                if not decisions:
+                    _plan_curriculum_decision_task(workspace, run, curriculum_task)
+                    continue
+                curriculum_decision = decisions[-1]
+                if curriculum_decision.state != WorkState.COMPLETE:
+                    return _actions_required(workspace, [curriculum_decision])
+            bound_course_authors = [
+                item
+                for item in course_author_tasks
+                if item.scope.get("curriculum_task_id") == curriculum_task.id
+            ]
+            if course_author_tasks and not bound_course_authors:
+                raise ProcessingError(
+                    "Workspace mixes legacy Author state with a curriculum checkpoint"
+                )
+            if not bound_course_authors:
+                plan_author_task(
+                    workspace,
+                    run,
+                    analyze_task=analyze_task,
+                    curriculum_task=curriculum_task,
+                    decision_task=curriculum_decision,
+                )
+                continue
+            incomplete_authors = [
+                item for item in bound_course_authors if item.state != WorkState.COMPLETE
+            ]
+            if incomplete_authors:
+                return _actions_required(workspace, incomplete_authors)
+            course_author_tasks = bound_course_authors
+            author_task = course_author_tasks[-1]
 
         reviews = _matching_tasks(
             workspace.list_work_items(run.id, role=WorkRole.REVIEW),
@@ -577,7 +719,7 @@ def advance_run(
             if repair_cycle >= MAX_REPAIR_CYCLES:
                 raise ProcessingError("Maximum Author repair cycles exceeded")
             repairs = _matching_tasks(
-                author_tasks,
+                course_author_tasks,
                 scope_key="review_task_id",
                 scope_value=review_task.id,
             )
