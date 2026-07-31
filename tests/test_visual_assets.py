@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
+from video_to_skill import visual_assets
 from video_to_skill.config import Settings
 from video_to_skill.errors import ProcessingError
 from video_to_skill.generation import NormalizedCrop, VisualAssetCandidate
@@ -125,6 +126,31 @@ def test_materializer_rejects_non_visual_and_external_sources(tmp_path: Path) ->
                     }
                 )
             ],
+            tmp_path / "output",
+            record_prefix="default",
+        )
+
+
+def test_materializer_enforces_total_output_bound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace, _first, _second = _workspace(tmp_path)
+    monkeypatch.setattr(visual_assets, "MAX_ASSET_OUTPUT_BYTES", 8)
+    candidate = VisualAssetCandidate(
+        id="bounded-frame",
+        source_id="source",
+        evidence_ids=["frame-first"],
+        semantic_unit_ids=["unit-status"],
+        presentation="frame",
+        description="A bounded frame",
+        teaching_value="The output must remain within the package asset budget.",
+    )
+
+    with pytest.raises(ProcessingError, match="total output byte bound"):
+        materialize_visual_asset_candidates(
+            workspace,
+            [candidate],
             tmp_path / "output",
             record_prefix="default",
         )

@@ -3,18 +3,26 @@
 from __future__ import annotations
 
 import json
+import posixpath
+import re
 from pathlib import Path
+from urllib.parse import urlparse
 
 from pydantic import ValidationError as PydanticValidationError
 
 from video_to_skill.errors import ProcessingError
-from video_to_skill.generation import CapabilityLevel, SemanticUnit, SkillMode
+from video_to_skill.generation import CapabilityLevel, CourseAsset, SemanticUnit, SkillMode
 from video_to_skill.orchestration import (
     AFFORDANCE_CATALOG,
     AuthorResult,
     CapabilityEvidence,
 )
 from video_to_skill.utils import atomic_write_json, hash_file
+from video_to_skill.visual_assets import (
+    MaterializedVisualAsset,
+    canonical_visual_asset_candidates,
+    visual_asset_candidate_packet,
+)
 from video_to_skill.work import AnalysisRun, WorkItem, WorkRole
 from video_to_skill.workspace import Workspace
 
@@ -31,6 +39,8 @@ _LEVEL_RANK: dict[CapabilityLevel, int] = {
     "medium": 2,
     "strong": 3,
 }
+
+_MARKDOWN_TARGET_RE = re.compile(r"!?\[[^\]]*\]\((?P<target>[^)\s]+)(?:\s+[^)]*)?\)")
 
 
 def _canonical_path(workspace: Workspace, kind: str) -> tuple[str, str]:
@@ -67,12 +77,16 @@ def plan_author_task(
             "when justified. Write every Markdown artifact directly under the task output "
             "directory. Complete the full instructional-affordance ledger without creating "
             "one artifact per behavior. Keep solutions and answer-bearing rubrics separate "
-            "and after-attempt. Do not exceed Analyze capability ceilings."
+            "and after-attempt. Do not exceed Analyze capability ceilings. Select only "
+            "evidence-grounded visual_asset_candidates when a visual materially improves "
+            "teaching or verification. Link every selected PNG from each used_by artifact, "
+            "and leave decorative or redundant candidates unused."
         ),
         "canonical_records": {
             kind: {"path": path, "digest": digest} for kind, (path, digest) in records.items()
         },
         "affordance_catalog": AFFORDANCE_CATALOG,
+        "visual_asset_candidates": visual_asset_candidate_packet(workspace),
     }
     return workspace.ensure_work_item(
         run_id=run.id,
@@ -121,6 +135,28 @@ def _load_capability_evidence(workspace: Workspace) -> list[CapabilityEvidence]:
         raise ProcessingError(f"Invalid canonical capability evidence: {exc}") from exc
 
 
+def _draft_links_asset(content: str, artifact_path: str, asset_path: str) -> bool:
+    artifact_directory = posixpath.dirname(artifact_path)
+    for match in _MARKDOWN_TARGET_RE.finditer(content):
+        target = match.group("target").strip("<>")
+        parsed = urlparse(target)
+        if parsed.scheme or parsed.netloc:
+            continue
+        normalized = posixpath.normpath(posixpath.join(artifact_directory, parsed.path))
+        if normalized == asset_path:
+            return True
+    return False
+
+
+def _visual_asset_candidates_by_id(
+    workspace: Workspace,
+) -> dict[str, tuple[MaterializedVisualAsset, Path]]:
+    return {
+        candidate.candidate_id: (candidate, image_path)
+        for candidate, image_path in canonical_visual_asset_candidates(workspace)
+    }
+
+
 def _validate_author_result(
     workspace: Workspace,
     task: WorkItem,
@@ -142,6 +178,7 @@ def _validate_author_result(
             raise ProcessingError(f"Author {mode} capability exceeds the Analyze evidence ceiling")
     represented: set[str] = set()
     task_output = (workspace.tasks_dir / task.id / "output").resolve()
+    draft_content_by_path: dict[str, str] = {}
     for artifact in result.artifacts:
         if not set(artifact.semantic_unit_ids) <= known_units:
             raise ProcessingError(f"Artifact {artifact.id} references unknown semantic units")
@@ -151,6 +188,10 @@ def _validate_author_result(
             raise ProcessingError(f"Artifact {artifact.id} draft is outside its task output")
         if hash_file(draft) != artifact.draft_sha256:
             raise ProcessingError(f"Artifact {artifact.id} draft digest does not match")
+        try:
+            draft_content_by_path[artifact.path] = draft.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ProcessingError(f"Could not read artifact {artifact.id} draft: {exc}") from exc
     required_units = {
         unit.id
         for unit in units
@@ -167,6 +208,7 @@ def _validate_author_result(
                 f"Instructional affordance {affordance.id} references unknown semantic units"
             )
     artifact_paths = {artifact.path for artifact in result.artifacts}
+    claims_by_id = {claim.id: claim for claim in result.claims}
     for claim in result.claims:
         if not set(claim.semantic_unit_ids) <= known_units:
             raise ProcessingError(f"Claim {claim.id} references unknown semantic units")
@@ -192,6 +234,67 @@ def _validate_author_result(
             source = sources[evidence.source_id]
             if source.duration is not None and evidence.end > source.duration:
                 raise ProcessingError(f"Claim {claim.id} evidence extends beyond source duration")
+    candidate_assets = _visual_asset_candidates_by_id(workspace)
+    for selected in result.assets:
+        candidate_pair = candidate_assets.get(selected.candidate_id)
+        if candidate_pair is None:
+            raise ProcessingError(
+                f"Author selected unknown visual asset candidate {selected.candidate_id}"
+            )
+        candidate, _image_path = candidate_pair
+        linked_claims = [claims_by_id[claim_id] for claim_id in selected.claim_ids]
+        linked_evidence_ids = {
+            evidence_id
+            for claim in linked_claims
+            for evidence in claim.evidence
+            if evidence.source_id == candidate.source_id
+            and set(evidence.modalities) & {"visual", "temporal"}
+            for evidence_id in evidence.evidence_ids
+        }
+        if not set(candidate.evidence_ids) <= linked_evidence_ids:
+            raise ProcessingError(
+                f"Visual asset {selected.path} evidence is not retained by its linked claims"
+            )
+        linked_semantic_units = {
+            unit_id for claim in linked_claims for unit_id in claim.semantic_unit_ids
+        }
+        if not set(candidate.semantic_unit_ids) <= linked_semantic_units:
+            raise ProcessingError(
+                f"Visual asset {selected.path} semantic units are not retained by its linked claims"
+            )
+        for artifact_path in selected.used_by:
+            if not _draft_links_asset(
+                draft_content_by_path[artifact_path],
+                artifact_path,
+                selected.path,
+            ):
+                raise ProcessingError(
+                    f"Artifact {artifact_path} does not link selected visual asset {selected.path}"
+                )
+
+
+def _course_assets(workspace: Workspace, result: AuthorResult) -> list[CourseAsset]:
+    candidates = _visual_asset_candidates_by_id(workspace)
+    assets: list[CourseAsset] = []
+    for selected in result.assets:
+        candidate, image_path = candidates[selected.candidate_id]
+        assets.append(
+            CourseAsset(
+                path=selected.path,
+                source_path=image_path.relative_to(workspace.root),
+                candidate_id=candidate.candidate_id,
+                source_id=candidate.source_id,
+                evidence_ids=candidate.evidence_ids,
+                semantic_unit_ids=candidate.semantic_unit_ids,
+                presentation=candidate.presentation,
+                crop=candidate.crop,
+                source_sha256=candidate.sha256,
+                description=selected.description,
+                used_by=selected.used_by,
+                claim_ids=selected.claim_ids,
+            )
+        )
+    return assets
 
 
 def submit_author_result(
@@ -247,7 +350,7 @@ def submit_author_result(
     )
     atomic_write_json(
         assets_path,
-        [item.model_dump(mode="json") for item in result.assets],
+        [item.model_dump(mode="json") for item in _course_assets(workspace, result)],
     )
     canonical_outputs: list[tuple[str, str, Path]] = [
         ("course", "default", course_path),

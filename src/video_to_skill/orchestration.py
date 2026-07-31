@@ -12,13 +12,13 @@ from video_to_skill.generation import (
     CapabilityLevel,
     CapabilityProfile,
     CorePrinciple,
-    CourseAsset,
     CourseInteraction,
     CourseSkillClaim,
     CurriculumDesign,
     SemanticRelation,
     SemanticUnit,
     SkillMode,
+    VisualAssetCandidate,
 )
 from video_to_skill.models import ObservationProducer
 
@@ -80,6 +80,7 @@ class AnalyzeResult(OrchestrationModel):
     semantic_relations: list[SemanticRelation] = Field(default_factory=list)
     capability_evidence: list[CapabilityEvidence] = Field(min_length=4, max_length=4)
     conflicts: list[SemanticConflict] = Field(default_factory=list)
+    visual_asset_candidates: list[VisualAssetCandidate] = Field(default_factory=list, max_length=24)
     coverage: SemanticCoverage
 
     @model_validator(mode="after")
@@ -105,6 +106,23 @@ class AnalyzeResult(OrchestrationModel):
         for conflict in self.conflicts:
             if not set(conflict.semantic_unit_ids) <= known:
                 raise ValueError("semantic conflicts reference unknown semantic units")
+        candidate_ids = [candidate.id for candidate in self.visual_asset_candidates]
+        if len(candidate_ids) != len(set(candidate_ids)):
+            raise ValueError("visual asset candidate ids must be unique")
+        units_by_id = {unit.id: unit for unit in self.semantic_units}
+        for candidate in self.visual_asset_candidates:
+            if not set(candidate.semantic_unit_ids) <= known:
+                raise ValueError("visual asset candidates reference unknown semantic units")
+            linked_units = [units_by_id[unit_id] for unit_id in candidate.semantic_unit_ids]
+            if any(unit.source_id != candidate.source_id for unit in linked_units):
+                raise ValueError("visual asset candidates cannot cross source boundaries")
+            grounded_evidence = {
+                evidence_id for unit in linked_units for evidence_id in unit.evidence_ids
+            }
+            if not set(candidate.evidence_ids) <= grounded_evidence:
+                raise ValueError(
+                    "visual asset candidate evidence must belong to its semantic units"
+                )
         material = [
             unit for unit in self.semantic_units if unit.materiality in {"core", "supporting"}
         ]
@@ -277,6 +295,56 @@ class ArtifactDraftSpec(OrchestrationModel):
         return value
 
 
+class AuthorVisualAsset(OrchestrationModel):
+    candidate_id: str = Field(
+        min_length=1,
+        max_length=80,
+        pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$",
+    )
+    path: str
+    description: str = Field(min_length=1, max_length=500)
+    used_by: list[str] = Field(min_length=1, max_length=20)
+    claim_ids: list[str] = Field(min_length=1, max_length=20)
+
+    @field_validator("path")
+    @classmethod
+    def safe_destination(cls, value: str) -> str:
+        path = PurePosixPath(value.strip())
+        if (
+            path.is_absolute()
+            or len(path.parts) != 2
+            or path.parts[0] != "assets"
+            or ".." in path.parts
+            or "\\" in value
+            or path.suffix.casefold() != ".png"
+        ):
+            raise ValueError("asset destination must be `assets/<safe-name>.png`")
+        if not re.fullmatch(r"[a-z0-9][a-z0-9._-]*\.png", path.name):
+            raise ValueError("asset filename must use lowercase letters, digits, dots, or hyphens")
+        return path.as_posix()
+
+    @field_validator("description")
+    @classmethod
+    def compact_description(cls, value: str) -> str:
+        return " ".join(value.split())
+
+    @field_validator("used_by")
+    @classmethod
+    def safe_used_by(cls, value: list[str]) -> list[str]:
+        compact = [ArtifactDraftSpec.safe_artifact_path(item) for item in value]
+        if len(compact) != len(set(compact)):
+            raise ValueError("asset used_by paths cannot contain duplicates")
+        return compact
+
+    @field_validator("claim_ids")
+    @classmethod
+    def compact_claim_ids(cls, value: list[str]) -> list[str]:
+        compact = [" ".join(item.split()) for item in value]
+        if not all(compact) or len(compact) != len(set(compact)):
+            raise ValueError("asset claim_ids must be non-empty and unique")
+        return compact
+
+
 class AuthorResult(OrchestrationModel):
     schema_version: Literal[1] = 1
     task_id: str
@@ -295,7 +363,7 @@ class AuthorResult(OrchestrationModel):
     core_principles: list[CorePrinciple] = Field(default_factory=list, max_length=24)
     artifacts: list[ArtifactDraftSpec] = Field(min_length=1)
     affordance_ledger: list[InstructionalAffordance]
-    assets: list[CourseAsset] = Field(default_factory=list)
+    assets: list[AuthorVisualAsset] = Field(default_factory=list, max_length=24)
     claims: list[CourseSkillClaim] = Field(min_length=1)
     limitations: list[str] = Field(default_factory=list, max_length=30)
     curriculum_decision_required: bool = False
@@ -374,6 +442,22 @@ class AuthorResult(OrchestrationModel):
         claim_ids = [claim.id for claim in self.claims]
         if len(claim_ids) != len(set(claim_ids)):
             raise ValueError("claim ids must be unique")
+        asset_candidate_ids = [asset.candidate_id for asset in self.assets]
+        asset_paths = [asset.path for asset in self.assets]
+        if len(asset_candidate_ids) != len(set(asset_candidate_ids)):
+            raise ValueError("visual asset candidates cannot be selected more than once")
+        if len(asset_paths) != len(set(asset_paths)):
+            raise ValueError("visual asset destination paths must be unique")
+        known_artifact_paths = set(artifact_paths)
+        known_claims = set(claim_ids)
+        claims_by_id = {claim.id: claim for claim in self.claims}
+        for asset in self.assets:
+            if not set(asset.used_by) <= known_artifact_paths:
+                raise ValueError("visual assets reference unknown artifact paths")
+            if not set(asset.claim_ids) <= known_claims:
+                raise ValueError("visual assets reference unknown claims")
+            if any(claims_by_id[claim_id].file not in asset.used_by for claim_id in asset.claim_ids):
+                raise ValueError("visual asset claims must belong to artifacts that use the asset")
         core_claim_ids = {item.claim_id for item in self.core_principles}
         if not core_claim_ids <= set(claim_ids):
             raise ValueError("core principles must reference submitted claims")
@@ -384,6 +468,7 @@ ReviewCategory = Literal[
     "semantic-retention",
     "instructional-affordance",
     "grounding",
+    "visual-assets",
     "disclosure",
     "runtime-behavior",
     "safety",

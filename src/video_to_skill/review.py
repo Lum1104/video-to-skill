@@ -11,6 +11,10 @@ from video_to_skill.author import AUTHOR_PERSONA
 from video_to_skill.errors import ProcessingError
 from video_to_skill.orchestration import AuthorResult, ReviewResult
 from video_to_skill.utils import atomic_write_json, stable_hash
+from video_to_skill.visual_assets import (
+    canonical_visual_asset_candidates,
+    visual_asset_candidate_packet,
+)
 from video_to_skill.work import AnalysisRun, WorkItem, WorkRole, WorkState
 from video_to_skill.workspace import Workspace
 
@@ -50,6 +54,13 @@ def _review_snapshot(workspace: Workspace) -> tuple[str, dict[str, object]]:
             "digest": record.digest,
             "producer_task_id": record.producer_task_id,
         }
+    visual_candidates_record = workspace.canonical_record("visual-asset-candidates")
+    if visual_candidates_record is not None:
+        records["visual-asset-candidates"] = {
+            "path": str(visual_candidates_record.path),
+            "digest": visual_candidates_record.digest,
+            "producer_task_id": visual_candidates_record.producer_task_id,
+        }
     artifact_plan = workspace.root / records["artifact-plan"]["path"]
     try:
         artifacts = json.loads(artifact_plan.read_text(encoding="utf-8"))
@@ -71,11 +82,31 @@ def _review_snapshot(workspace: Workspace) -> tuple[str, dict[str, object]]:
         "digest": stable_hash(draft_records, length=64),
         "producer_task_id": "",
     }
+    visual_image_records = {
+        candidate.candidate_id: {
+            "path": str(image_path.relative_to(workspace.root)),
+            "digest": candidate.sha256,
+        }
+        for candidate, image_path in canonical_visual_asset_candidates(workspace)
+    }
+    records["visual-asset-images"] = {
+        "path": "",
+        "digest": stable_hash(visual_image_records, length=64),
+        "producer_task_id": "",
+    }
     snapshot = stable_hash(
-        {"records": records, "drafts": draft_records},
+        {
+            "records": records,
+            "drafts": draft_records,
+            "visual_asset_images": visual_image_records,
+        },
         length=64,
     )
-    return snapshot, {"records": records, "artifact_drafts": draft_records}
+    return snapshot, {
+        "records": records,
+        "artifact_drafts": draft_records,
+        "visual_asset_images": visual_image_records,
+    }
 
 
 def plan_review_task(
@@ -97,10 +128,13 @@ def plan_review_task(
             "coverage, then grounding, disclosure, runtime behavior, safety, and scope. "
             "Inspect canonical files directly. Treat missing quick reference, operational "
             "validation or recovery, capstone scoring, progressive hints, retry, and teaching "
-            "scaffolds as product losses when the claimed capability requires them."
+            "scaffolds as product losses when the claimed capability requires them. Inspect "
+            "every selected teaching visual and audit necessity, legibility, surrounding "
+            "context, privacy, evidence grounding, and whether artifacts load it only on demand."
         ),
         "reviewed_snapshot_digest": reviewed_snapshot,
         "canonical": record_packet,
+        "visual_asset_candidates": visual_asset_candidate_packet(workspace),
         "author_task_id": author_task.id,
         "repair_cycle": repair_cycle,
     }
@@ -223,11 +257,14 @@ def plan_author_repair_task(
             "Repair every blocking critic finding against the current canonical state. "
             "Write revised drafts only in this task's output directory and submit a complete "
             "Author result so publication remains atomic. Preserve unaffected grounded "
-            "material and do not weaken capability claims merely to hide missing affordances."
+            "material and do not weaken capability claims merely to hide missing affordances. "
+            "Reuse only verified visual asset candidates, keep indispensable images linked "
+            "on demand, and remove decorative, illegible, private, or misleading selections."
         ),
         "prior_author_result": str(prior_author_task.result_path),
         "critic_report": str(review_record.path),
         "repair_cycle": repair_cycle,
+        "visual_asset_candidates": visual_asset_candidate_packet(workspace),
     }
     return workspace.ensure_work_item(
         run_id=run.id,

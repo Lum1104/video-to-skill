@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, ConfigDict, Field
+from pydantic import ValidationError as PydanticValidationError
 
 from video_to_skill.errors import ProcessingError
 from video_to_skill.generation import (
     MAX_ASSET_DIMENSION,
     MAX_ASSET_INPUT_BYTES,
+    MAX_ASSET_OUTPUT_BYTES,
     MAX_ASSET_PIXELS,
     NormalizedCrop,
     VisualAssetCandidate,
@@ -139,6 +142,7 @@ def materialize_visual_asset_candidates(
         for source in workspace.list_sources()
     }
     materialized: list[tuple[MaterializedVisualAsset, Path]] = []
+    total_output_bytes = 0
     for candidate in candidates:
         source_events = events_by_source.get(candidate.source_id, {})
         try:
@@ -164,6 +168,13 @@ def materialize_visual_asset_candidates(
             ) from exc
         finally:
             rendered.close()
+        output_bytes = destination.stat().st_size
+        if output_bytes > MAX_ASSET_OUTPUT_BYTES - total_output_bytes:
+            destination.unlink(missing_ok=True)
+            raise ProcessingError(
+                "Materialized visual asset candidates exceed the total output byte bound"
+            )
+        total_output_bytes += output_bytes
         with Image.open(destination) as image:
             width, height = image.size
         materialized.append(
@@ -187,3 +198,61 @@ def materialize_visual_asset_candidates(
             )
         )
     return materialized
+
+
+def canonical_visual_asset_candidates(
+    workspace: Workspace,
+) -> list[tuple[MaterializedVisualAsset, Path]]:
+    """Load verified integrated teaching-visual candidates and their canonical images."""
+
+    manifest_record = workspace.canonical_record("visual-asset-candidates")
+    if manifest_record is None:
+        return []
+    manifest_path = workspace.root / manifest_record.path
+    try:
+        if (
+            manifest_path.is_symlink()
+            or not manifest_path.is_file()
+            or hash_file(manifest_path) != manifest_record.digest
+        ):
+            raise ProcessingError("Canonical visual asset candidate manifest failed its digest check")
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, list):
+            raise ProcessingError("Canonical visual asset candidate manifest must be a list")
+        candidates = [MaterializedVisualAsset.model_validate(item) for item in payload]
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, PydanticValidationError) as exc:
+        raise ProcessingError(f"Invalid canonical visual asset candidate manifest: {exc}") from exc
+    result: list[tuple[MaterializedVisualAsset, Path]] = []
+    for candidate in candidates:
+        image_record = workspace.canonical_record(
+            "visual-asset-image",
+            candidate.image_record_id,
+        )
+        if image_record is None:
+            raise ProcessingError(
+                f"Visual asset candidate {candidate.candidate_id} has no canonical image"
+            )
+        image_path = workspace.root / image_record.path
+        if (
+            image_path.is_symlink()
+            or not image_path.is_file()
+            or image_record.digest != candidate.sha256
+            or hash_file(image_path) != candidate.sha256
+        ):
+            raise ProcessingError(
+                f"Visual asset candidate {candidate.candidate_id} image failed its digest check"
+            )
+        result.append((candidate, image_path))
+    return result
+
+
+def visual_asset_candidate_packet(workspace: Workspace) -> list[dict[str, object]]:
+    """Return bounded candidate metadata with verified paths for an Author task packet."""
+
+    return [
+        {
+            **candidate.model_dump(mode="json"),
+            "image_path": str(image_path.relative_to(workspace.root)),
+        }
+        for candidate, image_path in canonical_visual_asset_candidates(workspace)
+    ]

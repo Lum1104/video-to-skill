@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
+from PIL import Image
 from pydantic import ValidationError as PydanticValidationError
 
 from video_to_skill.analyze import plan_analyze_tasks, submit_analyze_result
@@ -16,6 +18,7 @@ from video_to_skill.generation import (
     CurriculumDesign,
     CurriculumPath,
     SemanticUnit,
+    VisualAssetCandidate,
 )
 from video_to_skill.models import (
     ObservationProducer,
@@ -24,12 +27,14 @@ from video_to_skill.models import (
     SourcePlatform,
     TranscriptOrigin,
     TranscriptSegment,
+    VisualEvent,
 )
 from video_to_skill.orchestration import (
     AFFORDANCE_CATALOG,
     AnalyzeResult,
     ArtifactDraftSpec,
     AuthorResult,
+    AuthorVisualAsset,
     CapabilityEvidence,
     InstructionalAffordance,
     SemanticCoverage,
@@ -39,7 +44,11 @@ from video_to_skill.work import WorkItem, WorkState
 from video_to_skill.workspace import Workspace
 
 
-def _analyzed_workspace(tmp_path: Path) -> tuple[Workspace, WorkItem]:
+def _analyzed_workspace(
+    tmp_path: Path,
+    *,
+    with_visual: bool = False,
+) -> tuple[Workspace, WorkItem]:
     workspace = Workspace.create(
         root=tmp_path / "workspace",
         inputs=["demo"],
@@ -60,6 +69,17 @@ def _analyzed_workspace(tmp_path: Path) -> tuple[Workspace, WorkItem]:
         text="Test a conviction with evidence and update it when reality changes.",
         origin=TranscriptOrigin.MANUAL_CAPTION,
     )
+    visual = None
+    if with_visual:
+        frame_path = workspace.root / "frames" / "status.png"
+        frame_path.parent.mkdir()
+        Image.new("RGB", (120, 80), "#2d5aa6").save(frame_path)
+        visual = VisualEvent(
+            id="frame-status",
+            source_id=source.id,
+            timestamp=30,
+            path=frame_path,
+        )
     section = SemanticSegment(
         id="section-1",
         source_id=source.id,
@@ -68,9 +88,12 @@ def _analyzed_workspace(tmp_path: Path) -> tuple[Workspace, WorkItem]:
         start=0,
         end=120,
         transcript_ids=[transcript.id],
+        visual_event_ids=[visual.id] if visual is not None else [],
     )
     workspace.upsert_sources([source])
     workspace.replace_transcripts(source.id, [transcript])
+    if visual is not None:
+        workspace.upsert_visuals([visual])
     workspace.replace_semantic_segments(source.id, [section])
     run = workspace.create_analysis_run()
     [task] = plan_analyze_tasks(workspace, run)
@@ -86,8 +109,8 @@ def _analyzed_workspace(tmp_path: Path) -> tuple[Workspace, WorkItem]:
         disposition="included",
         inferred=False,
         confidence="high",
-        modalities=["speech"],
-        evidence_ids=[transcript.id],
+        modalities=["speech", "visual"] if visual is not None else ["speech"],
+        evidence_ids=[transcript.id, visual.id] if visual is not None else [transcript.id],
     )
     result = AnalyzeResult(
         task_id=task.id,
@@ -105,6 +128,21 @@ def _analyzed_workspace(tmp_path: Path) -> tuple[Workspace, WorkItem]:
             )
             for mode in ("learn", "practice", "apply", "reference")
         ],
+        visual_asset_candidates=(
+            [
+                VisualAssetCandidate(
+                    id="status-panel",
+                    source_id=source.id,
+                    evidence_ids=[visual.id],
+                    semantic_unit_ids=[unit.id],
+                    presentation="frame",
+                    description="The visible status after the decision",
+                    teaching_value="The interface state verifies the spoken principle.",
+                )
+            ]
+            if visual is not None
+            else []
+        ),
         coverage=SemanticCoverage(
             source_ids=[source.id],
             core_units=1,
@@ -167,6 +205,7 @@ def _author_result(
     *,
     practice_level: str = "light",
     strong_practice_ledger: bool = False,
+    with_visual: bool = False,
 ) -> AuthorResult:
     affordances = _affordances(strong_practice=strong_practice_ledger)
     provided_ids = [item.id for item in affordances if item.status == "provided"]
@@ -220,6 +259,19 @@ def _author_result(
         ),
         artifacts=[artifact],
         affordance_ledger=affordances,
+        assets=(
+            [
+                AuthorVisualAsset(
+                    candidate_id="status-panel",
+                    path="assets/status-panel.png",
+                    description="The visible status after the decision",
+                    used_by=[artifact.path],
+                    claim_ids=["claim-conviction"],
+                )
+            ]
+            if with_visual
+            else []
+        ),
         claims=[
             CourseSkillClaim(
                 id="claim-conviction",
@@ -234,8 +286,14 @@ def _author_result(
                         "source_id": "source",
                         "start": 0,
                         "end": 60,
-                        "modalities": ["speech"],
-                        "evidence_ids": ["transcript-1"],
+                        "modalities": (
+                            ["speech", "visual"] if with_visual else ["speech"]
+                        ),
+                        "evidence_ids": (
+                            ["transcript-1", "frame-status"]
+                            if with_visual
+                            else ["transcript-1"]
+                        ),
                     }
                 ],
             )
@@ -268,6 +326,55 @@ def test_author_task_persists_affordance_ledger_and_draft(tmp_path: Path) -> Non
         .read_text(encoding="utf-8")
         .startswith("# Evidence-Updated Conviction")
     )
+
+
+def test_author_selects_only_materialized_visuals_linked_by_drafts(tmp_path: Path) -> None:
+    workspace, analyze_task = _analyzed_workspace(tmp_path, with_visual=True)
+    run = workspace.create_analysis_run(analyze_task.snapshot_digest)
+    task = plan_author_task(workspace, run, analyze_task=analyze_task)
+    packet = json.loads((workspace.root / task.packet_path).read_text(encoding="utf-8"))[
+        "payload"
+    ]
+    assert packet["visual_asset_candidates"][0]["candidate_id"] == "status-panel"
+    candidate_path = workspace.root / packet["visual_asset_candidates"][0]["image_path"]
+    assert candidate_path.is_file()
+
+    lease = workspace.lease_work_item(task.id, owner="codex")
+    draft = lease.output_directory / "course.md"
+    draft.write_text(
+        "# Evidence-Updated Conviction\n\n"
+        "![Decision status](../assets/status-panel.png)\n",
+        encoding="utf-8",
+    )
+    result = _author_result(task, lease.token, draft, with_visual=True)
+    result_path = lease.output_directory / "result.json"
+    atomic_write_json(result_path, result)
+
+    accepted = submit_author_result(workspace, task.id, result_path)
+
+    assert accepted.state == WorkState.COMPLETE
+    assets_record = workspace.canonical_record("assets")
+    assert assets_record is not None
+    assets = json.loads((workspace.root / assets_record.path).read_text(encoding="utf-8"))
+    assert assets[0]["candidate_id"] == "status-panel"
+    assert assets[0]["evidence_ids"] == ["frame-status"]
+    assert assets[0]["source_path"].endswith(".png")
+    assert len(assets[0]["source_sha256"]) == 64
+
+
+def test_author_rejects_selected_visual_missing_from_draft(tmp_path: Path) -> None:
+    workspace, analyze_task = _analyzed_workspace(tmp_path, with_visual=True)
+    run = workspace.create_analysis_run(analyze_task.snapshot_digest)
+    task = plan_author_task(workspace, run, analyze_task=analyze_task)
+    lease = workspace.lease_work_item(task.id, owner="codex")
+    draft = lease.output_directory / "course.md"
+    draft.write_text("# Evidence-Updated Conviction\n", encoding="utf-8")
+    result = _author_result(task, lease.token, draft, with_visual=True)
+    result_path = lease.output_directory / "result.json"
+    atomic_write_json(result_path, result)
+
+    with pytest.raises(ProcessingError, match="does not link selected visual asset"):
+        submit_author_result(workspace, task.id, result_path)
 
 
 def test_strong_practice_requires_capstone_affordance(tmp_path: Path) -> None:

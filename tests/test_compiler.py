@@ -4,8 +4,10 @@ import json
 from pathlib import Path
 
 import pytest
+from test_author import _analyzed_workspace, _author_result
 from test_generation import _blueprint
 
+from video_to_skill.author import plan_author_task, submit_author_result
 from video_to_skill.compiler import (
     build_workspace_skill,
     compile_workspace_blueprint,
@@ -23,8 +25,11 @@ from video_to_skill.models import (
 from video_to_skill.orchestration import (
     AFFORDANCE_CATALOG,
     ArtifactDraftSpec,
+    BehaviorCheck,
     InstructionalAffordance,
+    ReviewResult,
 )
+from video_to_skill.review import plan_review_task, submit_review_result
 from video_to_skill.utils import atomic_write_json, hash_file
 from video_to_skill.work import WorkRole
 from video_to_skill.workspace import Workspace
@@ -224,4 +229,59 @@ def test_compiler_refuses_failed_review(tmp_path: Path) -> None:
     workspace = _compiled_workspace(tmp_path, review_passes=False)
 
     with pytest.raises(ProcessingError, match="Review has not passed"):
+        compile_workspace_blueprint(workspace)
+
+
+def test_compiler_binds_selected_visual_to_integrated_candidate(tmp_path: Path) -> None:
+    workspace, analyze_task = _analyzed_workspace(tmp_path, with_visual=True)
+    run = workspace.create_analysis_run(analyze_task.snapshot_digest)
+    author_task = plan_author_task(workspace, run, analyze_task=analyze_task)
+    author_lease = workspace.lease_work_item(author_task.id, owner="codex")
+    draft = author_lease.output_directory / "course.md"
+    draft.write_text(
+        "# Evidence-Updated Conviction\n\n"
+        "![Decision status](../assets/status-panel.png)\n",
+        encoding="utf-8",
+    )
+    author_result = _author_result(
+        author_task,
+        author_lease.token,
+        draft,
+        with_visual=True,
+    )
+    author_result_path = author_lease.output_directory / "result.json"
+    atomic_write_json(author_result_path, author_result)
+    accepted_author = submit_author_result(workspace, author_task.id, author_result_path)
+
+    review_task = plan_review_task(workspace, run, author_task=accepted_author)
+    review_lease = workspace.lease_work_item(review_task.id, owner="codex")
+    review_result = ReviewResult(
+        task_id=review_task.id,
+        lease_token=review_lease.token,
+        snapshot_digest=review_task.snapshot_digest,
+        reviewed_snapshot_digest=str(review_task.scope["reviewed_snapshot_digest"]),
+        producer=ObservationProducer(name="review-worker", run_id="review-run"),
+        verdict="pass",
+        findings=[],
+        behavior_checks=[
+            BehaviorCheck(
+                id="visual-on-demand",
+                scenario="Use the artifact that links the teaching visual.",
+                passed=True,
+                summary="The artifact links one grounded PNG on demand.",
+            )
+        ],
+    )
+    review_result_path = review_lease.output_directory / "result.json"
+    atomic_write_json(review_result_path, review_result)
+    submit_review_result(workspace, review_task.id, review_result_path)
+
+    blueprint, receipt, _build_directory = compile_workspace_blueprint(workspace)
+
+    assert blueprint.assets[0].candidate_id == "status-panel"
+    assert receipt.visual_asset_candidates_digest is not None
+    image_record = workspace.canonical_record("visual-asset-image", "default:status-panel")
+    assert image_record is not None
+    (workspace.root / image_record.path).write_bytes(b"tampered")
+    with pytest.raises(ProcessingError, match="image failed its digest check"):
         compile_workspace_blueprint(workspace)

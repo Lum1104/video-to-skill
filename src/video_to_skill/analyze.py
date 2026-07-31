@@ -14,6 +14,7 @@ from video_to_skill.generation import SemanticUnit
 from video_to_skill.models import VisualEvent, VisualOrigin
 from video_to_skill.orchestration import AnalyzeResult
 from video_to_skill.utils import atomic_write_json, hash_file, is_within, stable_hash
+from video_to_skill.visual_assets import materialize_visual_asset_candidates
 from video_to_skill.work import AnalysisRun, WorkItem, WorkRole, WorkState
 from video_to_skill.workspace import Workspace
 
@@ -144,7 +145,10 @@ def plan_analyze_tasks(workspace: Workspace, run: AnalysisRun) -> list[WorkItem]
             "instructions": (
                 "Perform high-recall extraction, terminology normalization, relation linking, "
                 "materiality review, and capability-ceiling analysis. Do not design a curriculum. "
-                "Use only evidence IDs in allowed_evidence_ids and record uncertainty."
+                "Use only evidence IDs in allowed_evidence_ids and record uncertainty. Propose "
+                "visual asset candidates only when a frame, focused crop, or two-to-four-frame "
+                "sequence materially improves teaching or preserves visible evidence that text "
+                "cannot replace. Give normalized crop coordinates; never edit image pixels."
             ),
             "sources": [
                 source.model_dump(mode="json") for source in sources if source.id in source_sections
@@ -198,7 +202,9 @@ def plan_analyze_integration_task(
         "instructions": (
             "Integrate the completed shard results without deleting source-specific semantic "
             "units. Normalize terminology only where equivalence is supported, adjudicate or "
-            "retain conflicts, recompute relations and coverage, and emit an integrated result."
+            "retain conflicts, recompute relations and coverage, and emit an integrated result. "
+            "Curate a bounded final set of non-duplicate visual asset candidates from shard "
+            "evidence; retain only visuals with independent teaching or verification value."
         ),
         "shard_results": shard_result_paths,
         "allowed_evidence_ids": sorted(
@@ -337,6 +343,23 @@ def _validate_analyze_evidence(
         source = known_sources[unit.source_id]
         if source.duration is not None and unit.end > source.duration:
             raise ProcessingError(f"Semantic unit {unit.id} extends beyond source duration")
+    visuals_by_source = {
+        source_id: {visual.id for visual in workspace.visuals(source_id)}
+        for source_id in scoped_sources
+    }
+    for candidate in result.visual_asset_candidates:
+        if candidate.source_id not in scoped_sources:
+            raise ProcessingError(
+                f"Visual asset candidate {candidate.id} references source outside its Analyze task"
+            )
+        if not set(candidate.evidence_ids) <= allowed_by_source.get(candidate.source_id, set()):
+            raise ProcessingError(
+                f"Visual asset candidate {candidate.id} references evidence outside its Analyze packet"
+            )
+        if not set(candidate.evidence_ids) <= visuals_by_source.get(candidate.source_id, set()):
+            raise ProcessingError(
+                f"Visual asset candidate {candidate.id} must reference visual evidence"
+            )
     expected_integrated = bool(task.scope.get("integrated"))
     if result.integrated != expected_integrated:
         raise ProcessingError("Analyze result integration flag disagrees with its task")
@@ -422,17 +445,34 @@ def submit_analyze_result(
         conflicts_path,
         [item.model_dump(mode="json") for item in result.conflicts],
     )
+    materialized_assets = materialize_visual_asset_candidates(
+        workspace,
+        result.visual_asset_candidates,
+        output / "visual-assets",
+        record_prefix=record_id,
+    )
+    visual_assets_path = output / "visual-assets.json"
+    atomic_write_json(
+        visual_assets_path,
+        [item.model_dump(mode="json") for item, _path in materialized_assets],
+    )
+    canonical_outputs = [
+        ("semantic-map", record_id, semantic_map_path),
+        ("semantic-relations", record_id, relations_path),
+        ("capability-evidence", record_id, capability_path),
+        ("semantic-coverage", record_id, coverage_path),
+        ("semantic-conflicts", record_id, conflicts_path),
+        ("visual-asset-candidates", record_id, visual_assets_path),
+        *[
+            ("visual-asset-image", item.image_record_id, path)
+            for item, path in materialized_assets
+        ],
+    ]
     accepted, _records = workspace.accept_work_result(
         task_id=task_id,
         lease_token=result.lease_token,
         result_path=result_path,
         producer=result.producer.model_dump(mode="json"),
-        canonical_outputs=[
-            ("semantic-map", record_id, semantic_map_path),
-            ("semantic-relations", record_id, relations_path),
-            ("capability-evidence", record_id, capability_path),
-            ("semantic-coverage", record_id, coverage_path),
-            ("semantic-conflicts", record_id, conflicts_path),
-        ],
+        canonical_outputs=canonical_outputs,
     )
     return accepted

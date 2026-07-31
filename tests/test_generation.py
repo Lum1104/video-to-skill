@@ -22,6 +22,7 @@ from video_to_skill.generation import (
     blueprint_from_json,
     render_course_skill_package,
 )
+from video_to_skill.utils import hash_file
 from video_to_skill.validation import validate_skill
 
 
@@ -266,6 +267,7 @@ def _blueprint() -> CourseSkillBlueprint:
 
 
 def _blueprint_with_asset(workspace: Path, source_path: Path) -> CourseSkillBlueprint:
+    resolved_source = source_path if source_path.is_absolute() else workspace / source_path
     payload = _blueprint().model_dump(mode="json")
     for artifact in payload["artifacts"]:
         if artifact["path"] == "chapters/foundations.md":
@@ -275,6 +277,12 @@ def _blueprint_with_asset(workspace: Path, source_path: Path) -> CourseSkillBlue
         CourseAsset(
             path="assets/observed-state.png",
             source_path=source_path,
+            candidate_id="observed-state",
+            source_id="course-01",
+            evidence_ids=["frame-before"],
+            semantic_unit_ids=["unit-transition"],
+            presentation="frame",
+            source_sha256=hash_file(resolved_source),
             description="Observed before and after state",
             used_by=["chapters/foundations.md"],
             claim_ids=["claim-foundation"],
@@ -335,6 +343,16 @@ def test_renderer_copies_only_sanitized_minimal_course_assets(tmp_path: Path) ->
         assert not image.getexif()
     assert source.is_file()
     assert "assets/observed-state.png" in (target / "sources.md").read_text(encoding="utf-8")
+    assert "![Observed before and after state]" not in (
+        target / "sources.md"
+    ).read_text(encoding="utf-8")
+    assert "do not preload the `assets/` directory" in (
+        target / "SKILL.md"
+    ).read_text(encoding="utf-8")
+    provenance = json.loads((target / "provenance.json").read_text(encoding="utf-8"))
+    assert provenance["assets"][0]["candidate_id"] == "observed-state"
+    assert provenance["assets"][0]["source_sha256"] == hash_file(source)
+    assert "source_path" not in provenance["assets"][0]
     assert validate_skill(target, run_official=False).valid
 
 
@@ -545,7 +563,7 @@ def test_blueprint_requires_asset_link_and_visual_provenance(tmp_path: Path) -> 
     for claim in ungrounded["claims"]:
         if claim["id"] == "claim-foundation":
             claim["evidence"][0]["modalities"] = ["speech"]
-    with pytest.raises(ValueError, match="needs a visual or temporal claim"):
+    with pytest.raises(ValueError, match="linked visual or temporal claim"):
         CourseSkillBlueprint.model_validate(ungrounded)
 
 

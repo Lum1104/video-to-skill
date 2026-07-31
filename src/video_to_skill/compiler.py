@@ -40,6 +40,7 @@ from video_to_skill.orchestration import (
 )
 from video_to_skill.utils import atomic_write_json, hash_file
 from video_to_skill.validation import render_validation_report, validate_skill
+from video_to_skill.visual_assets import canonical_visual_asset_candidates
 from video_to_skill.workspace import Workspace
 
 
@@ -63,6 +64,8 @@ class WorkspaceBuildReceipt(CompileModel):
     semantic_map_digest: str
     curriculum_digest: str
     instructional_affordance_digest: str
+    assets_digest: str
+    visual_asset_candidates_digest: str | None = None
     critic_report_digest: str
     behavior_report_digest: str
     delivery_selection_digest: str | None = None
@@ -101,6 +104,42 @@ def _validated_list(model: type[BaseModel], values: Any, *, label: str) -> list[
         return [model.model_validate(value) for value in values]
     except PydanticValidationError as exc:
         raise ProcessingError(f"Invalid canonical {label}: {exc}") from exc
+
+
+def _validate_selected_visual_assets(
+    workspace: Workspace,
+    assets: list[CourseAsset],
+) -> None:
+    candidates = {
+        candidate.candidate_id: (candidate, image_path)
+        for candidate, image_path in canonical_visual_asset_candidates(workspace)
+    }
+    for asset in assets:
+        pair = candidates.get(asset.candidate_id)
+        if pair is None:
+            raise ProcessingError(
+                f"Selected visual asset has no integrated Analyze candidate: {asset.candidate_id}"
+            )
+        candidate, image_path = pair
+        expected_source_path = image_path.relative_to(workspace.root)
+        if asset.source_path != expected_source_path:
+            raise ProcessingError(
+                f"Selected visual asset source does not match its canonical image: {asset.path}"
+            )
+        if asset.source_sha256 != candidate.sha256 or hash_file(image_path) != asset.source_sha256:
+            raise ProcessingError(
+                f"Selected visual asset failed its source digest check: {asset.path}"
+            )
+        if (
+            asset.source_id != candidate.source_id
+            or asset.evidence_ids != candidate.evidence_ids
+            or asset.semantic_unit_ids != candidate.semantic_unit_ids
+            or asset.presentation != candidate.presentation
+            or asset.crop != candidate.crop
+        ):
+            raise ProcessingError(
+                f"Selected visual asset derivation differs from Analyze: {asset.path}"
+            )
 
 
 def _quality_gate(workspace: Workspace) -> tuple[str, str]:
@@ -198,6 +237,7 @@ def compile_workspace_blueprint(
         _canonical_json(workspace, "assets"),
         label="assets",
     )
+    _validate_selected_visual_assets(workspace, assets)
     course = _canonical_json(workspace, "course")
     delivery_record = workspace.canonical_record("delivery-selection")
     try:
@@ -292,9 +332,12 @@ def compile_workspace_blueprint(
     semantic_record = workspace.canonical_record("semantic-map")
     curriculum_record = workspace.canonical_record("curriculum")
     affordance_record = workspace.canonical_record("instructional-affordances")
+    assets_record = workspace.canonical_record("assets")
+    visual_candidates_record = workspace.canonical_record("visual-asset-candidates")
     assert semantic_record is not None
     assert curriculum_record is not None
     assert affordance_record is not None
+    assert assets_record is not None
     receipt = WorkspaceBuildReceipt(
         build_id=build_id,
         workspace_snapshot_digest=workspace.workspace_snapshot_digest(),
@@ -302,6 +345,10 @@ def compile_workspace_blueprint(
         semantic_map_digest=semantic_record.digest,
         curriculum_digest=curriculum_record.digest,
         instructional_affordance_digest=affordance_record.digest,
+        assets_digest=assets_record.digest,
+        visual_asset_candidates_digest=(
+            visual_candidates_record.digest if visual_candidates_record is not None else None
+        ),
         critic_report_digest=critic_digest,
         behavior_report_digest=behavior_digest,
         delivery_selection_digest=(delivery_record.digest if delivery_record is not None else None),

@@ -427,10 +427,21 @@ class VisualAssetCandidate(GenerationModel):
 
 
 class CourseAsset(GenerationModel):
-    """One indispensable, sanitized visual copied from the private workspace."""
+    """One selected teaching visual derived from grounded workspace evidence."""
 
     path: str
     source_path: Path
+    candidate_id: str = Field(
+        min_length=1,
+        max_length=80,
+        pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$",
+    )
+    source_id: str = Field(min_length=1, max_length=160)
+    evidence_ids: list[str] = Field(min_length=1, max_length=4)
+    semantic_unit_ids: list[str] = Field(min_length=1, max_length=20)
+    presentation: VisualAssetPresentation
+    crop: NormalizedCrop | None = None
+    source_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     description: str = Field(min_length=1, max_length=500)
     used_by: list[str] = Field(min_length=1, max_length=20)
     claim_ids: list[str] = Field(min_length=1, max_length=20)
@@ -457,6 +468,19 @@ class CourseAsset(GenerationModel):
     def compact_description(cls, value: str) -> str:
         return _compact_required(value)
 
+    @field_validator("source_id")
+    @classmethod
+    def compact_source_id(cls, value: str) -> str:
+        return _compact_required(value)
+
+    @field_validator("evidence_ids", "semantic_unit_ids")
+    @classmethod
+    def unique_grounding_ids(cls, value: list[str]) -> list[str]:
+        compact = [_compact_required(item) for item in value]
+        if len(compact) != len(set(compact)):
+            raise ValueError("asset grounding IDs cannot contain duplicates")
+        return compact
+
     @field_validator("used_by")
     @classmethod
     def safe_used_by(cls, value: list[str]) -> list[str]:
@@ -472,6 +496,18 @@ class CourseAsset(GenerationModel):
         if len(compact) != len(set(compact)):
             raise ValueError("asset claim_ids cannot contain duplicates")
         return compact
+
+    @model_validator(mode="after")
+    def coherent_derivation(self) -> CourseAsset:
+        if self.presentation == "frame":
+            if len(self.evidence_ids) != 1 or self.crop is not None:
+                raise ValueError("frame assets require one evidence ID and no crop")
+        elif self.presentation == "crop":
+            if len(self.evidence_ids) != 1 or self.crop is None:
+                raise ValueError("crop assets require one evidence ID and one crop")
+        elif len(self.evidence_ids) < 2:
+            raise ValueError("sequence assets require two to four evidence IDs")
+        return self
 
 
 def _artifact_uses_asset(artifact: CourseArtifact, asset_path: str) -> bool:
@@ -847,6 +883,16 @@ class CourseSkillBlueprint(GenerationModel):
         artifacts_by_path = {artifact.path: artifact for artifact in self.artifacts}
         claims_by_id = {claim.id: claim for claim in self.claims}
         for asset in self.assets:
+            if asset.source_id not in known_sources:
+                raise ValueError(
+                    f"asset '{asset.path}' references unknown source '{asset.source_id}'"
+                )
+            unknown_asset_units = set(asset.semantic_unit_ids) - known_semantic_units
+            if unknown_asset_units:
+                raise ValueError(
+                    f"asset '{asset.path}' references unknown semantic units: "
+                    + ", ".join(sorted(unknown_asset_units))
+                )
             for used_by in asset.used_by:
                 linked_artifact = artifacts_by_path.get(used_by)
                 if linked_artifact is None:
@@ -855,22 +901,29 @@ class CourseSkillBlueprint(GenerationModel):
                     )
                 if not _artifact_uses_asset(linked_artifact, asset.path):
                     raise ValueError(f"artifact '{used_by}' does not link to asset '{asset.path}'")
-            grounded = False
+            grounded_evidence_ids: set[str] = set()
+            grounded_unit_ids: set[str] = set()
             for claim_id in asset.claim_ids:
                 linked_claim = claims_by_id.get(claim_id)
                 if linked_claim is None:
                     raise ValueError(f"asset '{asset.path}' references unknown claim '{claim_id}'")
                 if linked_claim.file not in asset.used_by:
                     continue
-                if any(
-                    {"visual", "temporal"} & set(evidence.modalities)
-                    for evidence in linked_claim.evidence
-                ):
-                    grounded = True
-            if not grounded:
+                for evidence in linked_claim.evidence:
+                    if (
+                        evidence.source_id == asset.source_id
+                        and {"visual", "temporal"} & set(evidence.modalities)
+                    ):
+                        grounded_evidence_ids.update(evidence.evidence_ids)
+                        grounded_unit_ids.update(linked_claim.semantic_unit_ids)
+            if not set(asset.evidence_ids) <= grounded_evidence_ids:
                 raise ValueError(
-                    f"asset '{asset.path}' needs a visual or temporal claim for an artifact "
-                    "that links to it"
+                    f"asset '{asset.path}' evidence must be retained by a linked visual or "
+                    "temporal claim"
+                )
+            if not set(asset.semantic_unit_ids) <= grounded_unit_ids:
+                raise ValueError(
+                    f"asset '{asset.path}' semantic units must be retained by its linked claims"
                 )
         for principle in self.core_principles:
             if principle.claim_id not in known_claims:
@@ -1384,6 +1437,12 @@ def render_course_skill_markdown(blueprint: CourseSkillBlueprint) -> str:
         ),
         "",
         (
+            "Teaching visuals are optional evidence surfaces, not resident context. When a "
+            "relevant artifact links one and visible state matters, open only that asset; "
+            "do not preload the `assets/` directory."
+        ),
+        "",
+        (
             "Use source-grounded material first. Mark teaching or application inference "
             "naturally. When the request calls for outside or current knowledge, keep it "
             "distinct from what the source establishes; ask permission only when a "
@@ -1653,7 +1712,7 @@ def render_sources_markdown(blueprint: CourseSkillBlueprint) -> str:
         for asset in blueprint.assets:
             claim_ids = ", ".join(f"`{claim_id}`" for claim_id in asset.claim_ids)
             lines.append(
-                f"- ![{asset.description}]({asset.path}) {asset.description} (supports {claim_ids})"
+                f"- [Visual: {asset.description}]({asset.path}) (supports {claim_ids})"
             )
     lines.append("")
     return "\n".join(lines)
@@ -1696,6 +1755,8 @@ def _resolve_asset_source(asset: CourseAsset, workspace: Path) -> Path:
         raise ProcessingError(
             f"Asset source exceeds {MAX_ASSET_INPUT_BYTES} bytes: {asset.source_path}"
         )
+    if _file_sha256(source) != asset.source_sha256:
+        raise ProcessingError(f"Asset source digest does not match: {asset.source_path}")
     return source
 
 
@@ -1772,6 +1833,14 @@ def provenance_payload(blueprint: CourseSkillBlueprint) -> dict[str, object]:
             for relation in blueprint.semantic_relations
         ],
         "claims": [claim.model_dump(mode="json", exclude_none=True) for claim in blueprint.claims],
+        "assets": [
+            asset.model_dump(
+                mode="json",
+                exclude={"source_path"},
+                exclude_none=True,
+            )
+            for asset in blueprint.assets
+        ],
     }
 
 

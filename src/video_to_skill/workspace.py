@@ -1001,7 +1001,9 @@ class Workspace:
                     ).fetchone()
                     revision = int(head["revision"]) + 1 if head is not None else 1
                     suffix = (
-                        source_path.suffix if source_path.suffix in {".json", ".md"} else ".data"
+                        source_path.suffix
+                        if source_path.suffix in {".json", ".md", ".png"}
+                        else ".data"
                     )
                     destination = (
                         self.analysis_dir
