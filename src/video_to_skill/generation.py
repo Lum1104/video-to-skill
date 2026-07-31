@@ -51,6 +51,7 @@ MAX_WORKSPACE_LEDGER_ENTRIES = 10_000
 
 SkillMode = Literal["learn", "practice", "apply", "reference"]
 ArtifactDisclosure = Literal["normal", "after-attempt"]
+VisualAssetPresentation = Literal["frame", "crop", "sequence"]
 Confidence = Literal["high", "medium", "low"]
 CoverageStatus = Literal["complete", "partial", "failed", "skipped"]
 EvidenceModality = Literal["speech", "visual", "ocr", "metadata", "temporal"]
@@ -360,6 +361,69 @@ class CourseArtifact(GenerationModel):
         if len(compact) != len(set(compact)):
             raise ValueError("artifact list values cannot contain duplicates")
         return compact
+
+
+class NormalizedCrop(GenerationModel):
+    """One normalized crop box over a source frame."""
+
+    left: float = Field(ge=0, lt=1)
+    top: float = Field(ge=0, lt=1)
+    right: float = Field(gt=0, le=1)
+    bottom: float = Field(gt=0, le=1)
+
+    @model_validator(mode="after")
+    def positive_area(self) -> NormalizedCrop:
+        if self.right <= self.left or self.bottom <= self.top:
+            raise ValueError("normalized crop must have positive width and height")
+        if self.right - self.left < 0.02 or self.bottom - self.top < 0.02:
+            raise ValueError("normalized crop is too small to remain useful")
+        return self
+
+
+class VisualAssetCandidate(GenerationModel):
+    """One evidence-grounded visual proposed by Analyze for deterministic materialization."""
+
+    id: str = Field(
+        min_length=1,
+        max_length=80,
+        pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$",
+    )
+    source_id: str = Field(min_length=1, max_length=160)
+    evidence_ids: list[str] = Field(min_length=1, max_length=4)
+    semantic_unit_ids: list[str] = Field(min_length=1, max_length=20)
+    presentation: VisualAssetPresentation
+    crop: NormalizedCrop | None = None
+    description: str = Field(min_length=1, max_length=500)
+    teaching_value: str = Field(min_length=1, max_length=1000)
+
+    @field_validator(
+        "source_id",
+        "description",
+        "teaching_value",
+    )
+    @classmethod
+    def compact_text(cls, value: str) -> str:
+        return _compact_required(value)
+
+    @field_validator("evidence_ids", "semantic_unit_ids")
+    @classmethod
+    def unique_ids(cls, value: list[str]) -> list[str]:
+        compact = [_compact_required(item) for item in value]
+        if len(compact) != len(set(compact)):
+            raise ValueError("visual asset candidate IDs must be unique")
+        return compact
+
+    @model_validator(mode="after")
+    def coherent_presentation(self) -> VisualAssetCandidate:
+        if self.presentation == "frame":
+            if len(self.evidence_ids) != 1 or self.crop is not None:
+                raise ValueError("frame candidates require one evidence ID and no crop")
+        elif self.presentation == "crop":
+            if len(self.evidence_ids) != 1 or self.crop is None:
+                raise ValueError("crop candidates require one evidence ID and one crop")
+        elif len(self.evidence_ids) < 2:
+            raise ValueError("sequence candidates require two to four evidence IDs")
+        return self
 
 
 class CourseAsset(GenerationModel):
