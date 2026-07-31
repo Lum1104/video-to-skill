@@ -286,13 +286,9 @@ def _author_result(
                         "source_id": "source",
                         "start": 0,
                         "end": 60,
-                        "modalities": (
-                            ["speech", "visual"] if with_visual else ["speech"]
-                        ),
+                        "modalities": (["speech", "visual"] if with_visual else ["speech"]),
                         "evidence_ids": (
-                            ["transcript-1", "frame-status"]
-                            if with_visual
-                            else ["transcript-1"]
+                            ["transcript-1", "frame-status"] if with_visual else ["transcript-1"]
                         ),
                     }
                 ],
@@ -332,9 +328,7 @@ def test_author_selects_only_materialized_visuals_linked_by_drafts(tmp_path: Pat
     workspace, analyze_task = _analyzed_workspace(tmp_path, with_visual=True)
     run = workspace.create_analysis_run(analyze_task.snapshot_digest)
     task = plan_author_task(workspace, run, analyze_task=analyze_task)
-    packet = json.loads((workspace.root / task.packet_path).read_text(encoding="utf-8"))[
-        "payload"
-    ]
+    packet = json.loads((workspace.root / task.packet_path).read_text(encoding="utf-8"))["payload"]
     assert packet["visual_asset_candidates"][0]["candidate_id"] == "status-panel"
     candidate_path = workspace.root / packet["visual_asset_candidates"][0]["image_path"]
     assert candidate_path.is_file()
@@ -342,8 +336,7 @@ def test_author_selects_only_materialized_visuals_linked_by_drafts(tmp_path: Pat
     lease = workspace.lease_work_item(task.id, owner="codex")
     draft = lease.output_directory / "course.md"
     draft.write_text(
-        "# Evidence-Updated Conviction\n\n"
-        "![Decision status](../assets/status-panel.png)\n",
+        "# Evidence-Updated Conviction\n\n![Decision status](../assets/status-panel.png)\n",
         encoding="utf-8",
     )
     result = _author_result(task, lease.token, draft, with_visual=True)

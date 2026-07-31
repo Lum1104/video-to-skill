@@ -239,8 +239,7 @@ def test_compiler_binds_selected_visual_to_integrated_candidate(tmp_path: Path) 
     author_lease = workspace.lease_work_item(author_task.id, owner="codex")
     draft = author_lease.output_directory / "course.md"
     draft.write_text(
-        "# Evidence-Updated Conviction\n\n"
-        "![Decision status](../assets/status-panel.png)\n",
+        "# Evidence-Updated Conviction\n\n![Decision status](../assets/status-panel.png)\n",
         encoding="utf-8",
     )
     author_result = _author_result(

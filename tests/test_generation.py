@@ -343,12 +343,12 @@ def test_renderer_copies_only_sanitized_minimal_course_assets(tmp_path: Path) ->
         assert not image.getexif()
     assert source.is_file()
     assert "assets/observed-state.png" in (target / "sources.md").read_text(encoding="utf-8")
-    assert "![Observed before and after state]" not in (
-        target / "sources.md"
-    ).read_text(encoding="utf-8")
-    assert "do not preload the `assets/` directory" in (
-        target / "SKILL.md"
-    ).read_text(encoding="utf-8")
+    assert "![Observed before and after state]" not in (target / "sources.md").read_text(
+        encoding="utf-8"
+    )
+    assert "do not preload the `assets/` directory" in (target / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
     provenance = json.loads((target / "provenance.json").read_text(encoding="utf-8"))
     assert provenance["assets"][0]["candidate_id"] == "observed-state"
     assert provenance["assets"][0]["source_sha256"] == hash_file(source)

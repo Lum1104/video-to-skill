@@ -456,7 +456,9 @@ class AuthorResult(OrchestrationModel):
                 raise ValueError("visual assets reference unknown artifact paths")
             if not set(asset.claim_ids) <= known_claims:
                 raise ValueError("visual assets reference unknown claims")
-            if any(claims_by_id[claim_id].file not in asset.used_by for claim_id in asset.claim_ids):
+            if any(
+                claims_by_id[claim_id].file not in asset.used_by for claim_id in asset.claim_ids
+            ):
                 raise ValueError("visual asset claims must belong to artifacts that use the asset")
         core_claim_ids = {item.claim_id for item in self.core_principles}
         if not core_claim_ids <= set(claim_ids):

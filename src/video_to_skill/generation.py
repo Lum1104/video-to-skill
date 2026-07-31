@@ -910,9 +910,8 @@ class CourseSkillBlueprint(GenerationModel):
                 if linked_claim.file not in asset.used_by:
                     continue
                 for evidence in linked_claim.evidence:
-                    if (
-                        evidence.source_id == asset.source_id
-                        and {"visual", "temporal"} & set(evidence.modalities)
+                    if evidence.source_id == asset.source_id and {"visual", "temporal"} & set(
+                        evidence.modalities
                     ):
                         grounded_evidence_ids.update(evidence.evidence_ids)
                         grounded_unit_ids.update(linked_claim.semantic_unit_ids)
@@ -1711,9 +1710,7 @@ def render_sources_markdown(blueprint: CourseSkillBlueprint) -> str:
         lines.extend(["", "## Included visual evidence", ""])
         for asset in blueprint.assets:
             claim_ids = ", ".join(f"`{claim_id}`" for claim_id in asset.claim_ids)
-            lines.append(
-                f"- [Visual: {asset.description}]({asset.path}) (supports {claim_ids})"
-            )
+            lines.append(f"- [Visual: {asset.description}]({asset.path}) (supports {claim_ids})")
     lines.append("")
     return "\n".join(lines)
 

@@ -215,7 +215,9 @@ def canonical_visual_asset_candidates(
             or not manifest_path.is_file()
             or hash_file(manifest_path) != manifest_record.digest
         ):
-            raise ProcessingError("Canonical visual asset candidate manifest failed its digest check")
+            raise ProcessingError(
+                "Canonical visual asset candidate manifest failed its digest check"
+            )
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
         if not isinstance(payload, list):
             raise ProcessingError("Canonical visual asset candidate manifest must be a list")

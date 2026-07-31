@@ -463,10 +463,7 @@ def submit_analyze_result(
         ("semantic-coverage", record_id, coverage_path),
         ("semantic-conflicts", record_id, conflicts_path),
         ("visual-asset-candidates", record_id, visual_assets_path),
-        *[
-            ("visual-asset-image", item.image_record_id, path)
-            for item, path in materialized_assets
-        ],
+        *[("visual-asset-image", item.image_record_id, path) for item, path in materialized_assets],
     ]
     accepted, _records = workspace.accept_work_result(
         task_id=task_id,
