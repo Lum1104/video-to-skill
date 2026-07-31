@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import secrets
+import shutil
 import sqlite3
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
@@ -802,7 +803,6 @@ class Workspace:
         source = source_path.resolve()
         if not source.is_file() or source.is_symlink() or not is_within(source, self.root):
             raise ProcessingError("Canonical record source must be a regular workspace file")
-        digest = hash_file(source)
         now = datetime.now(UTC)
         with self.connect() as connection:
             task = connection.execute(
@@ -819,7 +819,25 @@ class Workspace:
                 (kind, record_id),
             ).fetchone()
             revision = (int(head["revision"]) + 1) if head is not None else 1
-            relative = source.relative_to(self.root)
+            suffix = source.suffix if source.suffix in {".json", ".md"} else ".data"
+            record_directory = (
+                self.analysis_dir
+                / "records"
+                / stable_hash(kind, length=20)
+                / stable_hash(record_id, length=20)
+            )
+            destination = record_directory / f"r{revision}{suffix}"
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if destination.exists():
+                raise ProcessingError(f"Canonical record revision already exists: {destination}")
+            temporary = destination.with_name(f".{destination.name}.{secrets.token_hex(8)}.tmp")
+            try:
+                shutil.copyfile(source, temporary)
+                temporary.replace(destination)
+            finally:
+                temporary.unlink(missing_ok=True)
+            digest = hash_file(destination)
+            relative = destination.relative_to(self.root)
             connection.execute(
                 """
                 INSERT INTO canonical_records(
@@ -856,6 +874,184 @@ class Workspace:
             snapshot_digest=snapshot_digest,
             created_at=now,
         )
+
+    def accept_work_result(
+        self,
+        *,
+        task_id: str,
+        lease_token: str,
+        result_path: Path,
+        producer: dict[str, Any],
+        canonical_outputs: Iterable[tuple[str, str, Path]] = (),
+    ) -> tuple[WorkItem, list[CanonicalRecord]]:
+        """Atomically accept a validated result and advance canonical record heads."""
+
+        item = self.get_work_item(task_id)
+        result = result_path.resolve()
+        task_output = (self.tasks_dir / task_id / "output").resolve()
+        if (
+            not result.is_file()
+            or result.is_symlink()
+            or not is_within(result, task_output)
+            or any(parent.is_symlink() for parent in [result, *result.parents[:2]])
+        ):
+            raise ProcessingError("Task result must be a regular file in its task output directory")
+        result_digest = hash_file(result)
+        now = datetime.now(UTC)
+        if item.state == WorkState.COMPLETE:
+            if item.result_digest == result_digest:
+                return item, []
+            raise ProcessingError(f"Task already completed with a different result: {task_id}")
+        if item.state != WorkState.LEASED:
+            raise ProcessingError(f"Task is not leased: {task_id}")
+        if item.lease_expires_at is None or item.lease_expires_at <= now:
+            raise ProcessingError(f"Task lease has expired: {task_id}")
+        if self.workspace_snapshot_digest() != item.snapshot_digest:
+            raise ProcessingError(f"Workspace snapshot changed while task was leased: {task_id}")
+        output_specs = list(canonical_outputs)
+        for _kind, _record_id, source_path in output_specs:
+            source = source_path.resolve()
+            if (
+                not source.is_file()
+                or source.is_symlink()
+                or not is_within(source, task_output)
+            ):
+                raise ProcessingError(
+                    "Canonical outputs must be regular files in the task output directory"
+                )
+        token_hash = sha256(lease_token.encode("utf-8")).hexdigest()
+        accepted_result = self.analysis_dir / "results" / f"{task_id}.json"
+        accepted_result.parent.mkdir(parents=True, exist_ok=True)
+        temporary_result = accepted_result.with_name(
+            f".{accepted_result.name}.{secrets.token_hex(8)}.tmp"
+        )
+        prepared_records: list[CanonicalRecord] = []
+        prepared_paths: list[Path] = []
+        try:
+            shutil.copyfile(result, temporary_result)
+            temporary_result.replace(accepted_result)
+            with self.connect() as connection:
+                row = connection.execute(
+                    """
+                    SELECT state, lease_token_hash, lease_expires_at, snapshot_digest
+                    FROM work_items WHERE id=?
+                    """,
+                    (task_id,),
+                ).fetchone()
+                if row is None:
+                    raise ProcessingError(f"Unknown workspace task: {task_id}")
+                if row["state"] != WorkState.LEASED.value:
+                    raise ProcessingError(f"Task is not leased: {task_id}")
+                if not secrets.compare_digest(str(row["lease_token_hash"] or ""), token_hash):
+                    raise ProcessingError(f"Task lease token is invalid: {task_id}")
+                expires = datetime.fromisoformat(str(row["lease_expires_at"]))
+                if expires <= now:
+                    raise ProcessingError(f"Task lease has expired: {task_id}")
+                for kind, record_id, source_path in output_specs:
+                    head = connection.execute(
+                        """
+                        SELECT revision FROM canonical_heads
+                        WHERE kind=? AND record_id=?
+                        """,
+                        (kind, record_id),
+                    ).fetchone()
+                    revision = int(head["revision"]) + 1 if head is not None else 1
+                    suffix = source_path.suffix if source_path.suffix in {".json", ".md"} else ".data"
+                    destination = (
+                        self.analysis_dir
+                        / "records"
+                        / stable_hash(kind, length=20)
+                        / stable_hash(record_id, length=20)
+                        / f"r{revision}{suffix}"
+                    )
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    if destination.exists():
+                        raise ProcessingError(
+                            f"Canonical record revision already exists: {destination}"
+                        )
+                    temporary = destination.with_name(
+                        f".{destination.name}.{secrets.token_hex(8)}.tmp"
+                    )
+                    try:
+                        shutil.copyfile(source_path, temporary)
+                        temporary.replace(destination)
+                    finally:
+                        temporary.unlink(missing_ok=True)
+                    prepared_paths.append(destination)
+                    record = CanonicalRecord(
+                        kind=kind,
+                        record_id=record_id,
+                        revision=revision,
+                        path=destination.relative_to(self.root),
+                        digest=hash_file(destination),
+                        producer_task_id=task_id,
+                        snapshot_digest=item.snapshot_digest,
+                        created_at=now,
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO canonical_records(
+                            kind, record_id, revision, path, digest, producer_task_id,
+                            snapshot_digest, created_at
+                        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            record.kind,
+                            record.record_id,
+                            record.revision,
+                            str(record.path),
+                            record.digest,
+                            record.producer_task_id,
+                            record.snapshot_digest,
+                            record.created_at.isoformat(),
+                        ),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO canonical_heads(kind, record_id, revision)
+                        VALUES(?, ?, ?)
+                        ON CONFLICT(kind, record_id) DO UPDATE SET revision=excluded.revision
+                        """,
+                        (record.kind, record.record_id, record.revision),
+                    )
+                    prepared_records.append(record)
+                connection.execute(
+                    """
+                    INSERT INTO work_results(
+                        task_id, result_path, result_digest, producer_json, created_at
+                    ) VALUES(?, ?, ?, ?, ?)
+                    """,
+                    (
+                        task_id,
+                        str(accepted_result.relative_to(self.root)),
+                        result_digest,
+                        json.dumps(producer, ensure_ascii=False, sort_keys=True),
+                        now.isoformat(),
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE work_items
+                    SET state='complete', result_path=?, result_digest=?,
+                        lease_token_hash=NULL, lease_owner=NULL, lease_expires_at=NULL,
+                        failure_reason=NULL, updated_at=?
+                    WHERE id=?
+                    """,
+                    (
+                        str(accepted_result.relative_to(self.root)),
+                        result_digest,
+                        now.isoformat(),
+                        task_id,
+                    ),
+                )
+        except Exception:
+            for path in prepared_paths:
+                path.unlink(missing_ok=True)
+            accepted_result.unlink(missing_ok=True)
+            raise
+        finally:
+            temporary_result.unlink(missing_ok=True)
+        return self.get_work_item(task_id), prepared_records
 
     def canonical_record(self, kind: str, record_id: str = "default") -> CanonicalRecord | None:
         with self.connect() as connection:

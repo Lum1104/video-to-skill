@@ -135,6 +135,8 @@ def test_canonical_records_keep_immutable_revisions(tmp_path: Path) -> None:
 
     assert (first.revision, second.revision) == (1, 2)
     assert first.digest != second.digest
+    assert first.path != second.path
+    assert (workspace.root / first.path).read_text(encoding="utf-8").find('"revision": 1') >= 0
     assert workspace.canonical_record("artifact-spec", "guide") == second
     with sqlite3.connect(workspace.database_path) as connection:
         count = connection.execute(
