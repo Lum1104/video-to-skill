@@ -136,6 +136,8 @@ Preserve questions, claims, reasons, examples, analogies, definitions, distincti
 
 Use speech-first packets for interviews and talking heads. Inspect slides, code, UI, diagrams, or physical state only when visual evidence is material. For long courses, accept section-group tasks and then perform a dependent integration Analyze task without deleting source-specific semantic units.
 
+The engine supplies the visual evidence index: first frame, scene-change frames, periodic fallback frames, perceptual-hash deduplication, OCR and type hints, plus bounded dense windows requested during investigation. Analyze supplies the semantic decision: propose at most 24 non-duplicate teaching candidates, each as one frame, one normalized crop, or an ordered two-to-four-frame sequence, only when it materially improves teaching or verification. Analyze never edits pixels or supplies an arbitrary image path; the engine validates the evidence IDs and deterministically materializes sanitized PNG candidates.
+
 Every semantic unit needs a stable ID, source and time range, kind, compact summary, materiality, disposition, modality, evidence IDs, observed-versus-inferred status, confidence, and uncertainty. Merged, context-only, and omitted material needs an explicit reason.
 
 ### Author
@@ -150,11 +152,13 @@ Mark each affordance `provided`, `unsupported`, or `not-applicable` with a ratio
 
 Give every artifact a stable ID, user job, supported behaviors, normal or after-attempt disclosure, independent loading reason, semantic-unit links, affordance links, destination path, draft path, and digest. Keep solutions and answer-bearing rubrics separate and after-attempt.
 
+Select only from the verified visual candidates in the Author packet. Retain a visual only when a specific artifact needs it, link the PNG from every `used_by` artifact, and bind it to claims that preserve the same visual or temporal evidence. Leave decorative, redundant, illegible, private, or text-recoverable candidates unused.
+
 ### Review
 
 Use a fresh senior Agent Skill critic who is independent of the Author producer. Review the actual canonical drafts and records, not an author-supplied summary.
 
-Audit source-meaning retention and instructional-affordance retention separately, then grounding, uncertainty, disclosure, empty invocation, runtime behavior, safety, scope, source failures, and shareability.
+Audit source-meaning retention and instructional-affordance retention separately, then grounding, uncertainty, disclosure, empty invocation, runtime behavior, safety, scope, source failures, and shareability. Inspect every selected teaching visual for necessity, legibility, context, ordering, privacy, evidence grounding, and on-demand loading.
 
 A failed Review completes its execution task but creates a new immutable Author revision and a fresh independent Review. Allow at most three repair cycles. Never weaken a capability claim merely to hide an affordance the evidence supports and the product needs.
 
@@ -212,7 +216,7 @@ The portable package and raw workspace must be separate trees. Every generated c
     └── <indispensable-image>.png
 ```
 
-The five fixed root records are unconditional; the remaining entries illustrate supported artifact shapes rather than a directory quota. Use `chapters/` for independently loadable teaching units, `exercises/` for practice, `solutions/` for after-attempt answers and answer-bearing rubrics, `playbooks/` for operational application, `reference/` and the allowed root reference files for fast lookup, and `assets/` only for indispensable images. A capable source should normally produce several substantial artifacts across the behaviors it genuinely supports, while a compact source may justify fewer.
+The five fixed root records are unconditional; the remaining entries illustrate supported artifact shapes rather than a directory quota. Use `chapters/` for independently loadable teaching units, `exercises/` for practice, `solutions/` for after-attempt answers and answer-bearing rubrics, `playbooks/` for operational application, `reference/` and the allowed root reference files for fast lookup, and `assets/` only for indispensable evidence-grounded PNGs. Generated Skill instructions must tell the runtime agent to open only the visual linked by the currently relevant artifact and never preload the asset directory. A capable source should normally produce several substantial artifacts across the behaviors it genuinely supports, while a compact source may justify fewer.
 
 Do not manufacture symmetrical directories, split files that always load together, or omit useful material merely to keep the package small. Every included artifact needs evidence links, covered affordances, and an independent loading reason. Never include raw video, audio, complete subtitles, transcripts, databases, cookies, caches, or decorative frame collections.
 

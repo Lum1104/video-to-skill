@@ -166,7 +166,11 @@ Short interviews and compact courses use one integrated Analyze task. Long cours
 
 Talking-head sections are speech-first. Slides, code, UI, diagrams, and physical procedures use multimodal packets only where visual evidence is material.
 
-Analyze submissions validate source scope, timestamps, packet evidence IDs, semantic relation endpoints, merge chains, capability evidence, and coverage totals before becoming canonical.
+Frame discovery remains deterministic engine work. Baseline extraction retains the first frame, frames above the configurable scene-change threshold, and periodic fallback frames, then removes near-duplicates with perceptual hashes and adds OCR and visual-type hints. If a semantic action or state is ambiguous, an Analyze worker may request a dense window, but the engine enforces 0.1–30 FPS, at most 300 seconds, at most 1,800 sampled frames, bounded dimensions, workspace-only paths, and perceptual deduplication.
+
+Analyze decides teaching value rather than pixel output. It may propose at most 24 non-duplicate candidates, each grounded in one source and one or more semantic units, using one complete frame, one normalized crop, or an ordered sequence of two to four frames. A candidate must explain why text is insufficient; Analyze cannot provide an arbitrary image path or mutate pixels.
+
+Analyze submissions validate source scope, timestamps, packet evidence IDs, semantic relation endpoints, merge chains, capability evidence, coverage totals, and candidate-to-visual grounding before becoming canonical. The engine then decodes the referenced evidence, applies the normalized crop, composes ordered sequences, strips metadata, writes deterministic PNGs, records dimensions and SHA-256 digests, and publishes immutable candidate records. This adds no engine-side LLM call.
 
 ### Author
 
@@ -180,7 +184,7 @@ It produces:
 - artifact specifications;
 - task-owned Markdown drafts;
 - claims and provenance;
-- assets and limitations; and
+- selections from verified visual candidates and limitations; and
 - a complete instructional-affordance ledger.
 
 The instructional ledger is separate from semantic coverage. It records learning objectives, misconceptions, retrieval and transfer prompts, focused exercises, success criteria, scoring, progressive hints, retry, capstone synthesis, operational playbooks, expected states, validation, recovery, quick reference, and decision rules.
@@ -189,13 +193,15 @@ Every ledger entry is `provided`, `unsupported`, or `not-applicable` with a rati
 
 Artifact bodies remain Markdown files. Artifact metadata stores a task-output-relative draft path and SHA-256 digest. Submission copies accepted drafts into immutable canonical revisions.
 
+Author receives candidate metadata and verified workspace-relative PNG paths. It selects only visuals that a specific artifact needs, assigns a portable `assets/*.png` destination, links each selected image from every `used_by` Markdown artifact, and binds it to claims that retain the candidate's visual or temporal evidence. Submission rejects unknown candidates, invented derivations, missing Markdown links, unrelated semantic units, and claims that dropped the underlying frame IDs.
+
 ### Review
 
 Review must use a producer identity independent of the Author producer.
 
-The review snapshot includes semantic records, curriculum, interaction, capability profile, artifact plan, instructional-affordance ledger, claims, assets, and every canonical draft digest.
+The review snapshot includes semantic records, curriculum, interaction, capability profile, artifact plan, instructional-affordance ledger, claims, assets, every canonical draft digest, the visual-candidate manifest, and selected image digests.
 
-Review audits semantic retention and instructional-affordance retention separately, followed by grounding, disclosure, runtime behavior, safety, scope, and shareability.
+Review audits semantic retention and instructional-affordance retention separately, followed by grounding, disclosure, runtime behavior, safety, scope, and shareability. For every selected visual, Review checks necessity, legibility, retained context, temporal ordering, privacy, claim grounding, and whether the generated Skill opens it only on demand.
 
 A pass requires no blocking findings and no failed behavior checks. A fail requires a blocking finding or failed behavior check.
 
@@ -209,7 +215,7 @@ The compiler:
 
 1. verifies every canonical record digest;
 2. loads the workspace-derived source and coverage ledger;
-3. validates semantic, curriculum, affordance, claim, asset, and artifact records;
+3. validates semantic, curriculum, affordance, claim, asset, candidate-image, and artifact records and their digests;
 4. resolves artifact drafts by canonical path and digest;
 5. constructs the strict `CourseSkillBlueprint` in memory;
 6. revalidates source inventory and coverage against the workspace;

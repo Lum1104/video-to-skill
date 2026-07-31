@@ -798,6 +798,8 @@ Preserve original proper names and technical terms. Distinguish paraphrase from 
 
 Raw visual evidence belongs in the workspace. Indispensable teaching visuals belong in the Skill.
 
+Responsibility is deliberately split. The engine extracts a high-recall baseline index from the first frame, scene changes, and periodic fallback sampling, deduplicates it perceptually, and attaches OCR and visual-type hints. Analyze decides whether any indexed frame has independent teaching value and may request a bounded dense window when an action or state transition remains ambiguous. Analyze returns evidence IDs and a normalized crop or ordered sequence specification; the engine performs all decoding, cropping, composition, sanitation, hashing, and file writes. Author can only select from those materialized candidates, and Review independently checks the selections. The teaching-asset pipeline introduces no new engine-side LLM call.
+
 Include a visual asset only when text cannot reliably preserve an important visual or temporal claim:
 
 - a meaningful chart or slide;
@@ -811,20 +813,20 @@ Do not require a minimum or fixed maximum per chapter. A pure interview may need
 
 Every asset records:
 
-- stable asset ID;
-- source window;
-- role;
-- supported claims;
-- source frames;
-- crop, composition, or re-encoding transformation;
-- accessible description; and
-- why text is insufficient.
+- stable candidate and portable destination IDs;
+- source ID and exact visual evidence IDs;
+- semantic-unit and claim IDs;
+- one-frame, normalized-crop, or ordered-sequence presentation;
+- normalized crop coordinates when applicable;
+- source-image SHA-256 digest;
+- accessible description and consuming artifacts; and
+- the Analyze rationale for why text is insufficient in the private candidate manifest.
 
 Static state may use one crop. A transition normally requires ordered before/action/after evidence, commonly rendered as a portable contact strip.
 
 Prefer recoverable text for code when it is legible and accurate. Use a screenshot when visual state is part of the evidence or exact text remains uncertain.
 
-Validation checks that the asset is linked, legible enough for its claim, correctly ordered, grounded in visual or temporal evidence, non-decorative, and free of unrelated private information.
+Validation checks that the selected asset came from an immutable integrated Analyze candidate, its digest and derivation match, every consuming artifact links it, its claims retain the same visual or temporal evidence, and it is legible, correctly ordered, non-decorative, and free of unrelated private information. `sources.md` exposes ordinary links rather than embedded images, and generated `SKILL.md` instructs the runtime agent to open only the visual required by the current artifact instead of preloading `assets/`.
 
 ## Build manifest and reproducibility
 
