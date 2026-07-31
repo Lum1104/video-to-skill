@@ -2,6 +2,10 @@
 
 Turn a video, playlist, or course into an evidence-grounded Skill that Claude Code or Codex can teach from, quiz you on, use as a reference, and apply to real work.
 
+<p align="center">
+  <img src="docs/video2skill-hero.png" alt="Video to Skill — Turn video courses into evidence-grounded, reusable AI skills" width="800" />
+</p>
+
 ## Install
 
 Paste this request into Claude Code or Codex:
