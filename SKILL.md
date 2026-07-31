@@ -154,7 +154,7 @@ Treat cookies, headers, tokens, expiring URLs, and browser snapshots as runtime 
 
 ## Generated Skill contract
 
-The portable package and raw workspace must be separate trees. Every generated course Skill contains:
+The portable package and raw workspace must be separate trees. Every generated course Skill contains five fixed root records and at least one authored Markdown artifact. A representative evidence-justified package can contain:
 
 ```text
 <course-skill>/
@@ -162,10 +162,28 @@ The portable package and raw workspace must be separate trees. Every generated c
 ├── source-map.md
 ├── sources.md
 ├── provenance.json
-└── build-manifest.json
+├── build-manifest.json
+├── chapters/
+│   └── <topic>.md
+├── exercises/
+│   └── <exercise>.md
+├── solutions/
+│   └── <exercise>.md
+├── playbooks/
+│   └── <workflow>.md
+├── reference/
+│   └── <decision-aid>.md
+├── learning-path.md
+├── glossary.md
+├── patterns.md
+├── cheatsheet.md
+└── assets/
+    └── <indispensable-image>.png
 ```
 
-Add teaching material, application guides, exercises, separate solutions, references, and indispensable images only when evidence and independent loading boundaries justify them. Never include raw video, audio, complete subtitles, transcripts, databases, cookies, caches, or decorative frame collections.
+The five fixed root records are unconditional; the remaining entries illustrate supported artifact shapes rather than a directory quota. Use `chapters/` for independently loadable teaching units, `exercises/` for practice, `solutions/` for after-attempt answers and answer-bearing rubrics, `playbooks/` for operational application, `reference/` and the allowed root reference files for fast lookup, and `assets/` only for indispensable images. A capable source should normally produce several substantial artifacts across the behaviors it genuinely supports, while a compact source may justify fewer.
+
+Do not manufacture symmetrical directories, split files that always load together, or omit useful material merely to keep the package small. Every included artifact needs evidence links, covered affordances, and an independent loading reason. Never include raw video, audio, complete subtitles, transcripts, databases, cookies, caches, or decorative frame collections.
 
 Mark generated Skills with:
 

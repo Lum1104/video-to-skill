@@ -101,7 +101,7 @@ It preserves important questions, claims, reasons, examples, analogies, definiti
 
 The generated Skill is a portable knowledge product. It contains the operating contract and the smallest set of independently useful course artifacts.
 
-Every V2 package contains:
+Every V2 package contains five fixed root records and at least one authored Markdown artifact. A representative evidence-justified package can contain:
 
 ```text
 <course-skill>/
@@ -109,10 +109,28 @@ Every V2 package contains:
 ├── source-map.md
 ├── sources.md
 ├── provenance.json
-└── build-manifest.json
+├── build-manifest.json
+├── chapters/
+│   └── <topic>.md
+├── exercises/
+│   └── <exercise>.md
+├── solutions/
+│   └── <exercise>.md
+├── playbooks/
+│   └── <workflow>.md
+├── reference/
+│   └── <decision-aid>.md
+├── learning-path.md
+├── glossary.md
+├── patterns.md
+├── cheatsheet.md
+└── assets/
+    └── <indispensable-image>.png
 ```
 
-Content, learning paths, applications, exercises, solutions, references, and assets are evidence-driven and optional.
+The five fixed root records are unconditional. The remaining entries are supported artifact shapes, not required directories: `chapters/` holds independently loadable teaching units, `exercises/` holds practice, `solutions/` holds after-attempt answers and answer-bearing rubrics, `playbooks/` holds operational application, `reference/` and the allowed root reference files support fast lookup, and `assets/` holds only indispensable images.
+
+Content, learning paths, applications, exercises, solutions, references, and assets are driven by semantic coverage, capability ceilings, instructional-affordance coverage, and independent loading boundaries. “Optional” means “not manufactured when unsupported,” not “prefer a thin package.”
 
 ## End-to-end workflow
 
@@ -539,28 +557,28 @@ Possible package sizes:
 Compact
   SKILL.md
   source-map.md
-  course.md
   sources.md
   provenance.json
   build-manifest.json
+  learning-path.md or another allowed root artifact
 
 Standard
   SKILL.md
   source-map.md
-  content/
-  learning-paths/
-  optional exercises/ and solutions/
-  optional application/
   sources.md
   provenance.json
   build-manifest.json
+  chapters/
+  exercises/ and after-attempt solutions/ when practice is supported
+  playbooks/ when operational application is supported
+  reference/ or an allowed root reference artifact when fast lookup is supported
+  indispensable assets/ when visual evidence needs to travel with the Skill
 
 Large course
-  Multiple independently useful content, practice, application, and reference
-  artifacts justified by the semantic and learning structure.
+  Multiple independently useful content, practice, application, and reference artifacts justified by the semantic and learning structure.
 ```
 
-Do not require fixed directories. Exercises with answers always keep solutions separate with an explicit `after-attempt` disclosure policy. The renderer uses that policy, not a directory name, to keep them unindexed until an attempt or explicit request.
+Do not require optional directories or target a file count. Exercises with answers always keep solutions separate with an explicit `after-attempt` disclosure policy. The renderer uses that policy, not a directory name, to keep them unindexed until an attempt or explicit request.
 
 ## Capability profile
 
