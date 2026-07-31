@@ -24,7 +24,11 @@ Ask only when a material boundary cannot be inferred safely: credentials are nee
 
 Never ask the user to run internal commands, supervise extraction, select frame parameters, copy task payloads, or invoke a second tutor Skill. Never request an account password.
 
+Resolve the complete expected source set before treating acquisition as complete. Preserve playlist order and explicit complete, partial, failed, skipped, inaccessible, or retired states. Continue through isolated source failures when useful material remains, never silently omit an expected item, and report how missing material limits the generated Skill.
+
 The engine is model-agnostic and never calls an LLM. The host main agent dispatches native workers for semantic, multimodal, pedagogical, and critical judgment; deterministic code owns acquisition, bounded packets, task state, validation, compilation, rendering, and installation.
+
+This workspace-centered release supports new conversions and deterministic resume. Update or fold-in of new evidence into an existing generated Skill is not implemented. Never present regeneration as a safe update, overwrite an existing different Skill, or discard human edits; retain the new workspace or staged output and state that update remains unsupported.
 
 ## Start the engine
 
@@ -48,6 +52,8 @@ V2S_ENGINE="$SKILL_DIR/scripts/video-to-skill"
 ```
 
 On Windows, use `scripts\video-to-skill.cmd`. The launcher owns first-use bootstrap, its private Python runtime, bounded repair, and optional capability installation. Do not activate an environment, invoke a package manager, or use `eval`.
+
+If the launcher is missing, report that the installed generator Skill is incomplete. If bootstrap reports a missing supported Python, network failure, or a compact bundle whose recorded runtime no longer exists, report that exact condition and request repair or reinstallation. Do not improvise a replacement environment or claim extraction occurred.
 
 Choose a durable workspace outside the generated output and installed Skill. Use the current host without asking when it is known.
 
@@ -95,7 +101,28 @@ After all dispatched workers finish, call `run --workspace WORKSPACE` again. Rep
 
 Report the installed Skill name and path, invocation, workspace path and retention, processed and failed source counts, source and semantic coverage, instructional-affordance coverage, critic repair count, build ID, and validation results.
 
+Make partial, inaccessible, skipped, retired, and failed sources visible in the completion summary. Distinguish source-acquisition coverage from semantic coverage and state any capability limits caused by missing evidence.
+
+End with one or two concrete next actions using the installed name:
+
+```text
+/<course-skill> start                         # Claude Code
+$<course-skill> help me apply this to my work # Codex
+```
+
 Do not claim completion from a worker message. Only the engine's `complete` envelope proves that canonical state compiled, validated, and installed.
+
+## Failure and recovery
+
+Keep the workspace after success or failure. Never delete it merely to recover from an interrupted source, worker, review, validation, rendering, or installation stage.
+
+Resume the same workspace after interruption. Reuse its immutable configuration, source snapshot, task directories, accepted canonical records, and completed work. Do not retransmit sources, choose a new output path, or create a replacement workspace to bypass a rejected task or conflict.
+
+When a submission is rejected, preserve the task output and report the exact schema, lease, digest, evidence-scope, or snapshot error. Correct or redispatch only the affected durable task. Do not copy its large packet or result through the main-agent conversation.
+
+When a source fails, continue the remaining accessible sources and let the coverage ledger carry the loss. When all useful sources are inaccessible, stop after persisting the acquisition state and explain what authorization or source change is required.
+
+When validation or compilation fails, retain the workspace and any safe staging artifact, report the failing gate, and resume after repair. When generated or installed content conflicts with the requested name, use the coordinator's durable `ask-user` naming decision. Never overwrite different content.
 
 ## Worker roles
 
@@ -148,7 +175,11 @@ Use native host multimodal inspection before any hosted vision provider. Keep ho
 
 ## Authentication and secrets
 
-When a source needs login, negotiate authentication once for the run: a named browser/profile, a local Netscape `cookies.txt`, or public items only. Set `VIDEO_TO_SKILL_COOKIES_FROM_BROWSER` only for the engine invocation.
+When a source needs login, negotiate authentication once for the complete run. Offer a named browser/profile, a local Netscape `cookies.txt`, or public items only. Set `VIDEO_TO_SKILL_COOKIES_FROM_BROWSER` only for the engine invocation and never request an account password.
+
+When browser authentication is authorized, let the engine decrypt browser cookies once, create a private temporary snapshot, and reuse isolated copies for source inspection and concurrent workers. A supplied cookie file is snapshotted rather than modified in place. The engine removes its temporary snapshots when the authentication session exits.
+
+On macOS, a browser keychain prompt may appear once. Repeated prompts during one engine invocation indicate a failed authentication session; stop and report the failure instead of repeatedly asking the user to approve access.
 
 Treat cookies, headers, tokens, expiring URLs, and browser snapshots as runtime secrets. Never quote them back, place them in task packets or logs, persist them in the workspace, or include them in the generated Skill.
 
@@ -185,15 +216,35 @@ The five fixed root records are unconditional; the remaining entries illustrate 
 
 Do not manufacture symmetrical directories, split files that always load together, or omit useful material merely to keep the package small. Every included artifact needs evidence links, covered affordances, and an independent loading reason. Never include raw video, audio, complete subtitles, transcripts, databases, cookies, caches, or decorative frame collections.
 
+### Content quality floor
+
+Generate a reusable capability product, not a transcript summary or a collection of thin index files. Preserve named frameworks, actionable principles, demonstrated techniques, source reasoning, examples, qualifications, counterpoints, warnings, failure modes, decision rules, and material open questions when the evidence contains them.
+
+Make every independently loaded teaching artifact useful on its own. Give it a clear user job, the necessary source-grounded explanation, a concrete example when supported, and an appropriate retrieval or transfer prompt. Do not repeat the same shallow summary across `SKILL.md`, chapters, reference files, and playbooks.
+
+For practice capability, include focused tasks, success criteria, progressive hints, retry, and a scored rubric at the depth supported by the source. Keep answers and answer-bearing rubrics separate and `after-attempt`.
+
+For application capability, include assumptions, decision points, operational steps, expected states, observable validation, and recovery guidance when the source supports them. Label generator-created adaptations, exercises, and conceptual workflows as inference rather than pretending the source demonstrated them.
+
+For reference capability, prioritize compact decision rules, trade-offs, thresholds, defaults, tells, smells, and source pointers over a glossary-only surface. A glossary defines terms; a reference aid helps the user decide or act.
+
+Strong capability claims require their full instructional-affordance surface. Medium and light claims may be smaller but must remain useful. Mark unsupported or not-applicable affordances honestly instead of lowering a capability claim to hide missing product work.
+
 Mark generated Skills with:
 
 ```html
 <!-- video-to-skill:course-skill:v2 -->
 ```
 
-Keep the resident `SKILL.md` concise and operational. On empty invocation it offers `start`, loads no supporting file, inspects no project, runs no command, creates no file, and waits. During use it adapts naturally across learning, practice, application, and reference without presenting a mode menu.
+Keep the resident `SKILL.md` concise and operational. On empty invocation it gives a course-specific welcome of no more than two short sentences, offers `start`, loads no supporting file, inspects no project, runs no command, creates no file, and waits.
+
+After the user begins, ask only missing course-specific context, using no more than three starter questions in one turn and at most one next-step question per later turn. Skip intake when the user already supplied enough context or asked a precise question.
+
+During use, adapt naturally across learning, practice, application, and reference without presenting a mode menu. Teach one useful cognitive move at a time, avoid dumping whole chapters unless asked, withhold solutions until an attempt or explicit request, and load only the smallest artifact needed.
 
 Use source-grounded material first, label generator-created exercises or adaptations as inference, distinguish outside or current knowledge, answer in the user's language, and preserve honest uncertainty.
+
+Keep learner progress in the active conversation or host memory, never in the portable package. Keep failed and partial sources visible in `sources.md`, consequential claims traceable through `provenance.json`, and private local paths out of every shareable file.
 
 The compiler derives the strict blueprint from canonical workspace state, reads artifact bodies by verified relative path and digest, renders outside the workspace, validates structure and behavior, and installs without overwriting different same-name content.
 
