@@ -17,6 +17,7 @@ from video_to_skill.config import Settings
 from video_to_skill.errors import ProcessingError
 from video_to_skill.models import (
     AgentObservation,
+    AnalysisDepthContract,
     EvidenceGap,
     EvidenceGapType,
     InspectionCompleteness,
@@ -31,6 +32,7 @@ from video_to_skill.models import (
     TranscriptSegment,
     VisualEvent,
     VisualOrigin,
+    VisualRetentionReport,
     WarningRecord,
 )
 from video_to_skill.utils import atomic_write_json, hash_file, is_within, stable_hash
@@ -462,6 +464,44 @@ class Workspace:
         manifest.updated_at = datetime.now(UTC)
         atomic_write_json(self.manifest_path, manifest)
 
+    def analysis_depth_contract(self) -> AnalysisDepthContract | None:
+        return self.load_manifest().analysis_depth
+
+    def save_analysis_depth_contract(self, contract: AnalysisDepthContract) -> None:
+        manifest = self.load_manifest()
+        manifest.analysis_depth = contract
+        self.save_manifest(manifest)
+
+    def save_visual_retention_report(self, report: VisualRetentionReport) -> Path:
+        path = self.source_directory(report.source_id) / "visual-retention.json"
+        atomic_write_json(path, report)
+        return path
+
+    def visual_retention_report(self, source_id: str) -> VisualRetentionReport | None:
+        path = self.source_directory(source_id) / "visual-retention.json"
+        if not path.exists():
+            return None
+        try:
+            if path.is_symlink() or not path.is_file() or path.stat().st_size > 1024 * 1024:
+                raise ProcessingError("Visual retention report must be a bounded regular file")
+            report = VisualRetentionReport.model_validate_json(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            if isinstance(exc, ProcessingError):
+                raise
+            raise ProcessingError(
+                f"Invalid visual retention report for {source_id}: {exc}"
+            ) from exc
+        if report.source_id != source_id:
+            raise ProcessingError("Visual retention report belongs to a different source")
+        return report
+
+    def visual_retention_reports(self) -> list[VisualRetentionReport]:
+        return [
+            report
+            for source in self.list_sources()
+            if (report := self.visual_retention_report(source.id)) is not None
+        ]
+
     def workspace_snapshot_digest(self) -> str:
         """Return a compact identity for task inputs without loading evidence bodies."""
 
@@ -485,12 +525,40 @@ class Workspace:
             {
                 "job_id": manifest.job_id,
                 "configuration": manifest.configuration_hash,
+                "analysis_depth_budget": (
+                    manifest.analysis_depth.budget_digest
+                    if manifest.analysis_depth is not None
+                    else None
+                ),
                 "sources": [dict(row) for row in rows],
                 "stages": [dict(row) for row in stage_rows],
             }
         )
 
-    def create_analysis_run(self, snapshot_digest: str | None = None) -> AnalysisRun:
+    def create_analysis_run(
+        self,
+        snapshot_digest: str | None = None,
+        *,
+        settings: Settings | None = None,
+    ) -> AnalysisRun:
+        manifest = self.load_manifest()
+        if manifest.analysis_depth is None:
+            # Legacy and programmatically assembled workspaces did not persist this
+            # contract. Resolve a marked compatibility contract before snapshotting so
+            # all newly planned work is bound to one durable budget.
+            from video_to_skill.analysis_depth import resolve_analysis_depth
+
+            manifest.analysis_depth = resolve_analysis_depth(
+                self.list_sources(),
+                self.inspection_reports(),
+                settings or Settings(),
+                legacy_compatibility=True,
+            )
+            self.save_manifest(manifest)
+        else:
+            from video_to_skill.analysis_depth import verify_analysis_depth_contract
+
+            verify_analysis_depth_contract(manifest.analysis_depth, settings=settings)
         snapshot = snapshot_digest or self.workspace_snapshot_digest()
         run_id = f"run-{stable_hash({'job': self.load_manifest().job_id, 'snapshot': snapshot}, length=24)}"
         now = datetime.now(UTC)
@@ -2017,6 +2085,51 @@ class Workspace:
             ).fetchall()
         return [AgentObservation.model_validate_json(row["data_json"]) for row in rows]
 
+    def analysis_evidence_counts(
+        self,
+        source_id: str,
+        *,
+        start: float,
+        end: float,
+    ) -> dict[str, int]:
+        """Return exact packet-category counts for one semantic interval."""
+
+        with self.connect() as connection:
+            transcript_count = connection.execute(
+                """
+                SELECT COUNT(*) AS count FROM transcript_segments
+                WHERE source_id=? AND end>=? AND start<=?
+                """,
+                (source_id, start, end),
+            ).fetchone()
+            visual_count = connection.execute(
+                """
+                SELECT COUNT(*) AS count FROM visual_events
+                WHERE source_id=? AND timestamp>=? AND timestamp<=?
+                """,
+                (source_id, start, end),
+            ).fetchone()
+            observation_count = connection.execute(
+                """
+                SELECT COUNT(*) AS count FROM agent_observations
+                WHERE source_id=? AND end>=? AND start<=?
+                """,
+                (source_id, start, end),
+            ).fetchone()
+            gap_count = connection.execute(
+                """
+                SELECT COUNT(*) AS count FROM evidence_gaps
+                WHERE source_id=? AND end>=? AND start<=?
+                """,
+                (source_id, start, end),
+            ).fetchone()
+        return {
+            "transcripts": int(transcript_count["count"]),
+            "visuals": int(visual_count["count"]),
+            "observations": int(observation_count["count"]),
+            "gaps": int(gap_count["count"]),
+        }
+
     def list_observations(
         self,
         source_id: str,
@@ -2180,6 +2293,8 @@ class Workspace:
         *,
         gap_type: EvidenceGapType | None = None,
         resolved: bool | None = None,
+        start: float | None = None,
+        end: float | None = None,
         limit: int | None = 1000,
     ) -> list[EvidenceGap]:
         if limit is not None and limit < 1:
@@ -2195,6 +2310,12 @@ class Workspace:
         if resolved is not None:
             where.append("resolved=?")
             params.append(int(resolved))
+        if start is not None:
+            where.append("end>=?")
+            params.append(start)
+        if end is not None:
+            where.append("start<=?")
+            params.append(end)
         query = "SELECT data_json FROM evidence_gaps"
         if where:
             query += " WHERE " + " AND ".join(where)

@@ -9,6 +9,7 @@ from typing import Any, cast
 
 from pydantic import ValidationError as PydanticValidationError
 
+from video_to_skill.analysis_depth import verify_analysis_depth_contract
 from video_to_skill.errors import ProcessingError
 from video_to_skill.generation import SemanticUnit
 from video_to_skill.models import VisualEvent, VisualOrigin
@@ -21,6 +22,7 @@ from video_to_skill.workspace import Workspace
 MAX_ANALYZE_SECTIONS_PER_TASK = 8
 MAX_ANALYZE_PACKET_ITEMS = 3_000
 SHORT_COURSE_SECONDS = 60 * 60
+_PACKET_CATEGORIES = ("transcripts", "visuals", "observations", "gaps")
 
 ANALYZE_PERSONA = (
     "You are a senior multimodal evidence and semantic-analysis engineer with deep "
@@ -30,7 +32,14 @@ ANALYZE_PERSONA = (
 )
 
 
-def _section_packet(workspace: Workspace, source_id: str, ordinal: int) -> dict[str, Any]:
+def _section_packet(
+    workspace: Workspace,
+    source_id: str,
+    ordinal: int,
+    *,
+    allocations: dict[str, int],
+    available: dict[str, int],
+) -> dict[str, Any]:
     section = next(
         (item for item in workspace.semantic_segments(source_id) if item.ordinal == ordinal),
         None,
@@ -41,25 +50,37 @@ def _section_packet(workspace: Workspace, source_id: str, ordinal: int) -> dict[
         source_id,
         start=section.start,
         end=section.end,
-        limit=MAX_ANALYZE_PACKET_ITEMS,
+        limit=allocations["transcripts"],
     )
     visuals = workspace.visuals(
         source_id,
         start=section.start,
         end=section.end,
-        limit=MAX_ANALYZE_PACKET_ITEMS,
+        limit=allocations["visuals"],
     )
     observations = workspace.observations(
         source_id,
         start=section.start,
         end=section.end,
-        limit=MAX_ANALYZE_PACKET_ITEMS,
+        limit=allocations["observations"],
     )
-    gaps = [
-        gap
-        for gap in workspace.gaps(source_id, resolved=None)
-        if gap.end >= section.start and gap.start <= section.end
-    ]
+    gaps = workspace.gaps(
+        source_id,
+        resolved=None,
+        start=section.start,
+        end=section.end,
+        limit=allocations["gaps"],
+    )
+    included = {
+        "transcripts": len(transcripts),
+        "visuals": len(visuals),
+        "observations": len(observations),
+        "gaps": len(gaps),
+    }
+    if included != allocations:
+        raise ProcessingError(
+            f"Evidence changed while Analyze packet section {source_id}/{ordinal} was planned"
+        )
     visually_material = any(
         visual.kind.value in {"slide", "code", "ui", "physical"} or visual.ocr_text
         for visual in visuals
@@ -71,6 +92,20 @@ def _section_packet(workspace: Workspace, source_id: str, ordinal: int) -> dict[
         "visuals": [item.model_dump(mode="json") for item in visuals],
         "observations": [item.model_dump(mode="json") for item in observations],
         "gaps": [item.model_dump(mode="json") for item in gaps],
+        "evidence_coverage": {
+            "categories": {
+                category: {
+                    "available": available[category],
+                    "included": included[category],
+                    "truncated": available[category] - included[category],
+                }
+                for category in _PACKET_CATEGORIES
+            },
+            "available": sum(available.values()),
+            "included": sum(included.values()),
+            "truncated": sum(available.values()) - sum(included.values()),
+            "complete": available == included,
+        },
     }
 
 
@@ -79,7 +114,39 @@ def _chunks(values: list[int], size: int) -> Iterable[list[int]]:
         yield values[index : index + size]
 
 
+def _fair_packet_allocations(
+    available: list[dict[str, int]],
+    *,
+    limit: int,
+) -> list[dict[str, int]]:
+    """Round-robin one item per section/category until the task-wide cap is spent."""
+
+    allocations = [{category: 0 for category in _PACKET_CATEGORIES} for _ in available]
+    remaining = min(limit, MAX_ANALYZE_PACKET_ITEMS)
+    while remaining > 0:
+        progressed = False
+        for index, counts in enumerate(available):
+            for category in _PACKET_CATEGORIES:
+                if allocations[index][category] >= counts[category]:
+                    continue
+                allocations[index][category] += 1
+                remaining -= 1
+                progressed = True
+                if remaining == 0:
+                    break
+            if remaining == 0:
+                break
+        if not progressed:
+            break
+    return allocations
+
+
 def plan_analyze_tasks(workspace: Workspace, run: AnalysisRun) -> list[WorkItem]:
+    analysis_depth = workspace.analysis_depth_contract()
+    if analysis_depth is None:
+        raise ProcessingError("Analyze planning requires a persisted analysis-depth contract")
+    verify_analysis_depth_contract(analysis_depth)
+    budget = analysis_depth.budget
     sources = workspace.list_sources()
     sections_by_source = {
         source.id: [section.ordinal for section in workspace.semantic_segments(source.id)]
@@ -88,9 +155,13 @@ def plan_analyze_tasks(workspace: Workspace, run: AnalysisRun) -> list[WorkItem]
     total_duration = sum(source.duration or 0 for source in sources)
     total_sections = sum(len(sections) for sections in sections_by_source.values())
     short_course = (
-        len(sources) <= 3
-        and total_duration <= SHORT_COURSE_SECONDS
-        and total_sections <= MAX_ANALYZE_SECTIONS_PER_TASK * 3
+        len(sources) <= budget.integrated_course_max_sources
+        and total_duration
+        <= min(
+            SHORT_COURSE_SECONDS,
+            budget.integrated_course_max_seconds,
+        )
+        and total_sections <= budget.integrated_course_max_sections
     )
     scopes: list[dict[str, object]] = []
     if short_course:
@@ -105,7 +176,7 @@ def plan_analyze_tasks(workspace: Workspace, run: AnalysisRun) -> list[WorkItem]
         for source in sources:
             for ordinals in _chunks(
                 sections_by_source[source.id],
-                MAX_ANALYZE_SECTIONS_PER_TASK,
+                min(MAX_ANALYZE_SECTIONS_PER_TASK, budget.analyze_sections_per_task),
             ):
                 scopes.append(
                     {
@@ -117,11 +188,52 @@ def plan_analyze_tasks(workspace: Workspace, run: AnalysisRun) -> list[WorkItem]
     tasks: list[WorkItem] = []
     for scope in scopes:
         source_sections = cast(dict[str, list[int]], scope["source_sections"])
-        section_packets = [
-            _section_packet(workspace, source_id, ordinal)
+        section_keys = [
+            (source_id, ordinal)
             for source_id, ordinals in source_sections.items()
             for ordinal in ordinals
         ]
+        available = []
+        for source_id, ordinal in section_keys:
+            section = next(
+                (
+                    item
+                    for item in workspace.semantic_segments(source_id)
+                    if item.ordinal == ordinal
+                ),
+                None,
+            )
+            if section is None:
+                raise ProcessingError(f"Unknown semantic section {ordinal} for source {source_id}")
+            available.append(
+                workspace.analysis_evidence_counts(
+                    source_id,
+                    start=section.start,
+                    end=section.end,
+                )
+            )
+        allocations = _fair_packet_allocations(
+            available,
+            limit=min(budget.analyze_packet_item_limit, MAX_ANALYZE_PACKET_ITEMS),
+        )
+        section_packets = [
+            _section_packet(
+                workspace,
+                source_id,
+                ordinal,
+                allocations=allocation,
+                available=counts,
+            )
+            for (source_id, ordinal), allocation, counts in zip(
+                section_keys,
+                allocations,
+                available,
+                strict=True,
+            )
+        ]
+        available_total = sum(sum(counts.values()) for counts in available)
+        included_total = sum(sum(counts.values()) for counts in allocations)
+        packet_limit = min(budget.analyze_packet_item_limit, MAX_ANALYZE_PACKET_ITEMS)
         allowed_evidence_ids = sorted(
             {
                 str(item["id"])
@@ -142,10 +254,14 @@ def plan_analyze_tasks(workspace: Workspace, run: AnalysisRun) -> list[WorkItem]
                 }
             )
         packet = {
+            "analysis_depth": analysis_depth.model_dump(mode="json"),
             "instructions": (
                 "Perform high-recall extraction, terminology normalization, relation linking, "
                 "materiality review, and capability-ceiling analysis. Do not design a curriculum. "
-                "Use only evidence IDs in allowed_evidence_ids and record uncertainty. Propose "
+                "Use only evidence IDs in allowed_evidence_ids and record uncertainty. The "
+                "task-wide evidence_budget and each section's evidence_coverage explicitly "
+                "report engine truncation; treat any truncation as partial packet coverage and "
+                "do not infer that omitted evidence was reviewed. Propose "
                 "visual asset candidates only when a frame, focused crop, or two-to-four-frame "
                 "sequence materially improves teaching or preserves visible evidence that text "
                 "cannot replace. Give normalized crop coordinates; never edit image pixels."
@@ -156,10 +272,22 @@ def plan_analyze_tasks(workspace: Workspace, run: AnalysisRun) -> list[WorkItem]
             "sections": section_packets,
             "allowed_evidence_ids": allowed_evidence_ids,
             "allowed_evidence_by_source": allowed_evidence_by_source,
+            "evidence_budget": {
+                "profile_limit": budget.analyze_packet_item_limit,
+                "absolute_safety_limit": MAX_ANALYZE_PACKET_ITEMS,
+                "effective_limit": packet_limit,
+                "allocation": "deterministic-section-category-round-robin",
+                "available": available_total,
+                "included": included_total,
+                "truncated": available_total - included_total,
+                "complete": available_total == included_total,
+            },
             "investigation_policy": {
                 "commands": ["context", "contact-sheet", "frames", "query", "gaps"],
                 "dynamic_visual_origin": VisualOrigin.INVESTIGATION.value,
                 "scope": "source-sections",
+                "max_window_seconds": budget.investigation_window_seconds,
+                "max_frames_per_window": budget.investigation_max_frames_per_window,
             },
         }
         tasks.append(
@@ -181,6 +309,10 @@ def plan_analyze_integration_task(
     run: AnalysisRun,
     shard_tasks: list[WorkItem],
 ) -> WorkItem:
+    analysis_depth = workspace.analysis_depth_contract()
+    if analysis_depth is None:
+        raise ProcessingError("Analyze integration requires a persisted analysis-depth contract")
+    verify_analysis_depth_contract(analysis_depth)
     if not shard_tasks or any(item.role != WorkRole.ANALYZE for item in shard_tasks):
         raise ProcessingError("Analyze integration requires Analyze shard tasks")
     shard_results: list[AnalyzeResult] = []
@@ -199,6 +331,7 @@ def plan_analyze_integration_task(
         shard_results.append(_load_analyze_result(path))
         shard_result_paths.append(str(item.result_path))
     packet = {
+        "analysis_depth": analysis_depth.model_dump(mode="json"),
         "instructions": (
             "Integrate the completed shard results without deleting source-specific semantic "
             "units. Normalize terminology only where equivalence is supported, adjudicate or "

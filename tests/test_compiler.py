@@ -205,10 +205,26 @@ def test_compiler_uses_digest_references_in_workspace_receipt(tmp_path: Path) ->
     assert receipt.artifact_language == "English"
     assert receipt.requested_output_language == "English"
     assert receipt.artifact_language_declaration_state == "legacy-agent-declared"
+    assert receipt.analysis_depth_contract.requested == "auto"
+    assert receipt.analysis_depth_contract.effective in {"standard", "deep"}
+    assert receipt.analysis_depth_contract.budget.profile_version.startswith(
+        "analysis-depth-budget-"
+    )
     assert "Observe both the action and its result" not in receipt_text
     assert all(
         reference.draft_path.is_relative_to(Path("analysis")) for reference in receipt.artifacts
     )
+
+
+def test_compiler_rejects_analysis_depth_budget_digest_tampering(tmp_path: Path) -> None:
+    workspace = _compiled_workspace(tmp_path)
+    manifest = workspace.load_manifest()
+    assert manifest.analysis_depth is not None
+    manifest.analysis_depth = manifest.analysis_depth.model_copy(update={"budget_digest": "0" * 64})
+    workspace.save_manifest(manifest)
+
+    with pytest.raises(ProcessingError, match="budget failed its digest check"):
+        compile_workspace_blueprint(workspace)
 
 
 @pytest.mark.parametrize("source_languages", [["en"], ["en", "zh-Hans"]])

@@ -8,6 +8,7 @@ from pathlib import Path
 
 from pydantic import ValidationError as PydanticValidationError
 
+from video_to_skill.analysis_depth import verify_analysis_depth_contract
 from video_to_skill.analyze import (
     plan_analyze_integration_task,
     plan_analyze_tasks,
@@ -33,6 +34,7 @@ from video_to_skill.curriculum import (
 from video_to_skill.errors import ProcessingError
 from video_to_skill.generation import CurriculumDesign
 from video_to_skill.installation import SkillHost, host_skill_root
+from video_to_skill.models import AnalysisDepthContract
 from video_to_skill.orchestration import (
     CurriculumSelection,
     DecisionResult,
@@ -75,6 +77,7 @@ def _run_configuration(
     run_official_validation: bool,
     settings: Settings,
     output_language_override: str | None,
+    refresh: bool,
 ) -> dict[str, object]:
     path = workspace.analysis_dir / "run-config.json"
     if path.exists():
@@ -89,6 +92,39 @@ def _run_configuration(
             raise ProcessingError("Resume output differs from the workspace run configuration")
         if project is not None and project != bool(existing["project"]):
             raise ProcessingError("Resume installation scope differs from the workspace")
+        analysis_depth = workspace.analysis_depth_contract()
+        if analysis_depth is None:
+            raise ProcessingError("Workspace is missing its analysis-depth contract")
+        verify_analysis_depth_contract(analysis_depth, settings=settings)
+        analysis_depth_digest = stable_hash(
+            analysis_depth.model_dump(mode="json"),
+            length=64,
+        )
+        embedded_depth = existing.get("analysis_depth_contract")
+        embedded_depth_digest = existing.get("analysis_depth_contract_digest")
+        if embedded_depth is None and embedded_depth_digest is None:
+            existing["analysis_depth_contract"] = analysis_depth.model_dump(mode="json")
+            existing["analysis_depth_contract_digest"] = analysis_depth_digest
+            atomic_write_json(path, existing)
+        else:
+            try:
+                validated_depth = AnalysisDepthContract.model_validate(embedded_depth)
+            except PydanticValidationError as exc:
+                raise ProcessingError(f"Invalid persisted analysis-depth contract: {exc}") from exc
+            if validated_depth != analysis_depth or embedded_depth_digest != analysis_depth_digest:
+                inventory_refreshed = (
+                    refresh
+                    and validated_depth.requested == analysis_depth.requested
+                    and validated_depth.characteristics.inventory_digest
+                    != analysis_depth.characteristics.inventory_digest
+                )
+                if not inventory_refreshed:
+                    raise ProcessingError(
+                        "Run configuration analysis-depth contract failed its digest check"
+                    )
+                existing["analysis_depth_contract"] = analysis_depth.model_dump(mode="json")
+                existing["analysis_depth_contract_digest"] = analysis_depth_digest
+                atomic_write_json(path, existing)
         persisted_contract, persisted_digest = ensure_artifact_language_contract(
             workspace,
             output_language_override,
@@ -128,6 +164,10 @@ def _run_configuration(
         requested_output_language,
         verify_source_resolution=True,
     )
+    analysis_depth = workspace.analysis_depth_contract()
+    if analysis_depth is None:
+        raise ProcessingError("Workspace is missing its analysis-depth contract")
+    verify_analysis_depth_contract(analysis_depth, settings=settings)
     configuration: dict[str, object] = {
         "host": host.value,
         "output": str(resolved_output),
@@ -138,6 +178,11 @@ def _run_configuration(
         "run_official_validation": run_official_validation,
         "artifact_language_contract": artifact_contract.model_dump(mode="json"),
         "artifact_language_contract_digest": artifact_contract_digest,
+        "analysis_depth_contract": analysis_depth.model_dump(mode="json"),
+        "analysis_depth_contract_digest": stable_hash(
+            analysis_depth.model_dump(mode="json"),
+            length=64,
+        ),
     }
     atomic_write_json(path, configuration)
     return configuration
@@ -581,7 +626,26 @@ def _completion_payload(
         raise ProcessingError("Completion requires canonical coverage records")
     semantic_coverage = _load_json(workspace.root / semantic_record.path)
     affordances = _load_json(workspace.root / affordance_record.path)
+    coverage_path = workspace.root / "coverage.json"
+    if coverage_path.is_file():
+        coverage = _load_json(coverage_path)
+    else:
+        retention_reports = workspace.visual_retention_reports()
+        candidate_count = sum(report.candidate_count for report in retention_reports)
+        retained_count = sum(report.retained_count for report in retention_reports)
+        dropped_count = sum(report.dropped_count for report in retention_reports)
+        coverage = {
+            "visual_evidence": {
+                "complete": not any(report.truncated for report in retention_reports),
+                "candidate_count": candidate_count,
+                "retained_count": retained_count,
+                "dropped_count": dropped_count,
+                "reports": [report.model_dump(mode="json") for report in retention_reports],
+            }
+        }
     assert isinstance(affordances, list)
+    if not isinstance(coverage, dict):
+        raise ProcessingError("Completion requires a valid coverage report")
     affordance_summary = {
         status: sum(isinstance(item, dict) and item.get("status") == status for item in affordances)
         for status in ("provided", "unsupported", "not-applicable")
@@ -594,10 +658,21 @@ def _completion_payload(
         "processed_sources": len(workspace.list_sources()),
         "failed_sources": len(manifest.failed_sources),
         "semantic_coverage": semantic_coverage,
+        "visual_evidence_coverage": coverage.get("visual_evidence", {}),
+        "visual_retention_warnings": [
+            warning.model_dump(mode="json")
+            for warning in workspace.list_warnings()
+            if warning.code == "visual-retention-truncated"
+        ],
         "instructional_affordance_coverage": affordance_summary,
         "critic_repairs": max(
             (int(item.scope.get("repair_cycle", 0)) for item in review_tasks),
             default=0,
+        ),
+        "analysis_depth_contract": (
+            manifest.analysis_depth.model_dump(mode="json")
+            if manifest.analysis_depth is not None
+            else None
         ),
         "invocation": f"{prefix}{result.name}",
     }
@@ -626,8 +701,18 @@ def advance_run(
             progress=progress,
             refresh=refresh,
         )
+    elif refresh:
+        retained = Workspace.open(workspace_path)
+        workspace, _manifest = extract_sources(
+            retained.load_manifest().inputs,
+            settings,
+            workspace_path=workspace_path,
+            progress=progress,
+            refresh=True,
+        )
     else:
         workspace = Workspace.open(workspace_path)
+    run = workspace.create_analysis_run(settings=settings)
     configuration = _run_configuration(
         workspace,
         host=host,
@@ -638,8 +723,8 @@ def advance_run(
         run_official_validation=run_official_validation,
         settings=settings,
         output_language_override=output_language_override,
+        refresh=refresh,
     )
-    run = workspace.create_analysis_run()
     for _transition in range(100):
         workspace.ready_work_items(run.id)
         analyze_tasks = workspace.list_work_items(run.id, role=WorkRole.ANALYZE)
@@ -764,6 +849,13 @@ def advance_run(
             "artifact_language_contract_digest",
             "artifact_language_declaration_digest",
         )
+        current_analysis_depth = workspace.analysis_depth_contract()
+        if current_analysis_depth is None:
+            raise ProcessingError("Review requires a persisted analysis-depth contract")
+        current_analysis_depth_digest = stable_hash(
+            current_analysis_depth.model_dump(mode="json"),
+            length=64,
+        )
         expected_review_dependencies = sorted(
             {
                 author_task.id,
@@ -782,6 +874,7 @@ def advance_run(
             and item.scope.get("author_task_id") == author_task.id
             and item.scope.get("repair_cycle") == repair_cycle
             and all(item.scope.get(key) == trial_contract.get(key) for key in review_contract_keys)
+            and item.scope.get("analysis_depth_contract_digest") == current_analysis_depth_digest
             and item.dependencies == expected_review_dependencies
         ]
         if not reviews:

@@ -19,7 +19,14 @@ from PIL import Image, UnidentifiedImageError
 
 from video_to_skill.config import Settings
 from video_to_skill.errors import DependencyError, ProcessingError
-from video_to_skill.models import MaterializedSource, VisualEvent, VisualKind
+from video_to_skill.models import (
+    AnalysisBudgetSummary,
+    MaterializedSource,
+    VisualEvent,
+    VisualKind,
+    VisualRetentionInterval,
+    VisualRetentionReport,
+)
 from video_to_skill.utils import run_command, stable_hash
 
 MAX_EXTRACTED_FRAME_WIDTH = 3_840
@@ -160,6 +167,9 @@ def extract_candidate_frames(
     destination: Path,
     source_id: str,
     settings: Settings,
+    *,
+    budget: AnalysisBudgetSummary | None = None,
+    visual_event_limit: int | None = None,
 ) -> list[VisualEvent]:
     destination.mkdir(parents=True, exist_ok=True)
     scene_pattern = destination / "scene-%06d.jpg"
@@ -245,6 +255,10 @@ def extract_candidate_frames(
             )
         )
 
+    same_moment_distance = budget.visual_same_moment_dedup_distance if budget is not None else 5
+    sequential_distance = budget.visual_sequential_dedup_distance if budget is not None else 3
+    assert same_moment_distance is not None
+    assert sequential_distance is not None
     unique: list[VisualEvent] = []
     for event in sorted(candidates, key=lambda item: (item.timestamp, item.kind.value)):
         event.perceptual_hash = difference_hash(event.path)
@@ -259,7 +273,8 @@ def extract_candidate_frames(
         if (
             same_moment
             and same_moment.perceptual_hash
-            and hash_distance(same_moment.perceptual_hash, event.perceptual_hash) <= 5
+            and hash_distance(same_moment.perceptual_hash, event.perceptual_hash)
+            <= same_moment_distance
         ):
             if event.scene_score and not same_moment.scene_score:
                 same_moment.scene_score = event.scene_score
@@ -268,12 +283,127 @@ def extract_candidate_frames(
         if (
             unique
             and unique[-1].perceptual_hash
-            and hash_distance(unique[-1].perceptual_hash or "", event.perceptual_hash) <= 3
+            and hash_distance(unique[-1].perceptual_hash or "", event.perceptual_hash)
+            <= sequential_distance
         ):
             event.path.unlink(missing_ok=True)
             continue
         unique.append(event)
-    return unique
+    retained, report = _bounded_visual_retention(
+        unique,
+        visual_event_limit,
+        source_id=source_id,
+        budget_digest=stable_hash(
+            budget.model_dump(mode="json") if budget is not None else {"profile": "legacy"},
+            length=64,
+        ),
+    )
+    settings._analysis_visual_retention_report = report
+    return retained
+
+
+def _bounded_visual_retention(
+    events: list[VisualEvent],
+    limit: int | None,
+    *,
+    source_id: str,
+    budget_digest: str,
+) -> tuple[list[VisualEvent], VisualRetentionReport]:
+    """Retain important scene changes plus length-scaled chronological coverage."""
+
+    if limit is None or len(events) <= limit:
+        return events, VisualRetentionReport(
+            source_id=source_id,
+            budget_digest=budget_digest,
+            candidate_count=len(events),
+            retained_count=len(events),
+            dropped_count=0,
+            truncated=False,
+        )
+    if limit <= 0:
+        intervals = (
+            [
+                VisualRetentionInterval(
+                    start=events[0].timestamp,
+                    end=events[-1].timestamp,
+                    dropped_count=len(events),
+                )
+            ]
+            if events
+            else []
+        )
+        for event in events:
+            event.path.unlink(missing_ok=True)
+        return [], VisualRetentionReport(
+            source_id=source_id,
+            budget_digest=budget_digest,
+            candidate_count=len(events),
+            retained_count=0,
+            dropped_count=len(events),
+            truncated=bool(events),
+            affected_intervals=intervals,
+        )
+    priority: list[int] = []
+    for index in (0, len(events) - 1):
+        if index not in priority and len(priority) < limit:
+            priority.append(index)
+    scene_allowance = max(0, limit // 3)
+    ranked_scenes = sorted(
+        range(len(events)),
+        key=lambda index: (
+            events[index].scene_score is not None,
+            events[index].scene_score or 0,
+            -index,
+        ),
+        reverse=True,
+    )
+    for index in ranked_scenes[:scene_allowance]:
+        if index not in priority and len(priority) < limit:
+            priority.append(index)
+    if limit > 1:
+        for position in range(limit):
+            index = round(position * (len(events) - 1) / (limit - 1))
+            if index not in priority and len(priority) < limit:
+                priority.append(index)
+    for index in range(len(events)):
+        if len(priority) >= limit:
+            break
+        if index not in priority:
+            priority.append(index)
+    selected = set(priority)
+    affected_intervals: list[VisualRetentionInterval] = []
+    cursor = 0
+    while cursor < len(events):
+        if cursor in selected:
+            cursor += 1
+            continue
+        first = cursor
+        while cursor + 1 < len(events) and cursor + 1 not in selected:
+            cursor += 1
+        last = cursor
+        affected_intervals.append(
+            VisualRetentionInterval(
+                start=events[first - 1].timestamp if first > 0 else events[first].timestamp,
+                end=(
+                    events[last + 1].timestamp if last + 1 < len(events) else events[last].timestamp
+                ),
+                dropped_count=last - first + 1,
+            )
+        )
+        cursor += 1
+    for index, event in enumerate(events):
+        if index not in selected:
+            event.path.unlink(missing_ok=True)
+    retained = [event for index, event in enumerate(events) if index in selected]
+    return retained, VisualRetentionReport(
+        source_id=source_id,
+        budget_digest=budget_digest,
+        candidate_count=len(events),
+        retained_count=len(retained),
+        dropped_count=len(events) - len(retained),
+        truncated=True,
+        affected_intervals=affected_intervals,
+    )
 
 
 class OCRProvider(ABC):
@@ -494,7 +624,24 @@ def analyze_visuals(
     *,
     ocr: OCRProvider | None = None,
     vision: VisionAnalyzer | None = None,
+    budget: AnalysisBudgetSummary | None = None,
+    visual_event_limit: int | None = None,
 ) -> tuple[list[VisualEvent], list[str]]:
+    if budget is None:
+        budget = settings._analysis_budget
+    if visual_event_limit is None:
+        visual_event_limit = settings._analysis_visual_event_limit
+    settings._analysis_visual_retention_report = VisualRetentionReport(
+        source_id=materialized.source.id,
+        budget_digest=stable_hash(
+            budget.model_dump(mode="json") if budget is not None else {"profile": "legacy"},
+            length=64,
+        ),
+        candidate_count=0,
+        retained_count=0,
+        dropped_count=0,
+        truncated=False,
+    )
     if settings.visual_profile == "transcript":
         return [], ["visual-processing-disabled"]
     media = materialized.media_path
@@ -505,6 +652,8 @@ def analyze_visuals(
         materialized.directory / "frames",
         materialized.source.id,
         settings,
+        budget=budget,
+        visual_event_limit=visual_event_limit,
     )
     warnings: list[str] = []
     ocr_backend = ocr

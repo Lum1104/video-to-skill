@@ -11,6 +11,7 @@ from pathlib import Path
 
 from pydantic import ValidationError as PydanticValidationError
 
+from video_to_skill.analysis_depth import verify_analysis_depth_contract
 from video_to_skill.artifact_language import (
     canonical_artifact_language_state,
     ensure_artifact_language_contract,
@@ -40,6 +41,7 @@ from video_to_skill.generation import (
     course_skill_build_id,
     render_course_skill_review_target,
 )
+from video_to_skill.models import EvidenceGapType
 from video_to_skill.orchestration import (
     ArtifactDraftSpec,
     AuthorResult,
@@ -543,6 +545,14 @@ def plan_review_task(
         workspace,
         expected_author_task_id=author_task.id,
     )
+    analysis_depth = workspace.analysis_depth_contract()
+    if analysis_depth is None:
+        raise ProcessingError("Review requires a persisted analysis-depth contract")
+    verify_analysis_depth_contract(analysis_depth)
+    analysis_depth_digest = stable_hash(
+        analysis_depth.model_dump(mode="json"),
+        length=64,
+    )
     packet = {
         "instructions": (
             "Independently audit source-meaning retention and instructional-affordance "
@@ -563,6 +573,8 @@ def plan_review_task(
         "artifact_language_contract_digest": language_state.contract_digest,
         "artifact_language_declaration": language_state.declaration.model_dump(mode="json"),
         "artifact_language_declaration_digest": language_state.declaration_digest,
+        "analysis_depth_contract": analysis_depth.model_dump(mode="json"),
+        "analysis_depth_contract_digest": analysis_depth_digest,
         "reviewed_snapshot_digest": plan.reviewed_snapshot_digest,
         "canonical": plan.canonical_packet,
         "behavior_catalog": {
@@ -586,6 +598,22 @@ def plan_review_task(
             for scenario_id, (task, _result) in trials.items()
         ],
         "visual_asset_candidates": visual_asset_candidate_packet(workspace),
+        "visual_retention": [
+            report.model_dump(mode="json") for report in workspace.visual_retention_reports()
+        ],
+        "visual_retention_gaps": [
+            gap.model_dump(mode="json")
+            for gap in workspace.gaps(
+                gap_type=EvidenceGapType.VISUAL_RETENTION_TRUNCATED,
+                resolved=None,
+                limit=None,
+            )
+        ],
+        "visual_retention_warnings": [
+            warning.model_dump(mode="json")
+            for warning in workspace.list_warnings()
+            if warning.code == "visual-retention-truncated"
+        ],
         "author_task_id": author_task.id,
         "repair_cycle": repair_cycle,
     }
@@ -605,6 +633,7 @@ def plan_review_task(
             "repair_cycle": repair_cycle,
             "artifact_language_contract_digest": language_state.contract_digest,
             "artifact_language_declaration_digest": language_state.declaration_digest,
+            "analysis_depth_contract_digest": analysis_depth_digest,
         },
         persona_hint=REVIEW_PERSONA,
         packet=packet,
@@ -671,6 +700,14 @@ def submit_review_result(
         workspace,
         expected_author_task_id=author_task.id,
     )
+    analysis_depth = workspace.analysis_depth_contract()
+    if analysis_depth is None:
+        raise ProcessingError("Review requires a persisted analysis-depth contract")
+    verify_analysis_depth_contract(analysis_depth)
+    analysis_depth_digest = stable_hash(
+        analysis_depth.model_dump(mode="json"),
+        length=64,
+    )
     if (
         result.reviewed_snapshot_digest != plan.reviewed_snapshot_digest
         or result.reviewed_snapshot_digest != task.scope.get("reviewed_snapshot_digest")
@@ -685,6 +722,7 @@ def submit_review_result(
         or task.scope.get("artifact_language_contract_digest") != language_state.contract_digest
         or task.scope.get("artifact_language_declaration_digest")
         != language_state.declaration_digest
+        or task.scope.get("analysis_depth_contract_digest") != analysis_depth_digest
     ):
         raise ProcessingError("Review result targets a stale behavior catalog or Skill snapshot")
     packet = _verified_task_packet(workspace, task)
@@ -697,6 +735,8 @@ def submit_review_result(
         or payload.get("artifact_language_declaration")
         != language_state.declaration.model_dump(mode="json")
         or payload.get("artifact_language_declaration_digest") != language_state.declaration_digest
+        or payload.get("analysis_depth_contract") != analysis_depth.model_dump(mode="json")
+        or payload.get("analysis_depth_contract_digest") != analysis_depth_digest
     ):
         raise ProcessingError("Review packet has stale artifact-language state")
     trial_entries = payload.get("behavior_trials") if isinstance(payload, dict) else None

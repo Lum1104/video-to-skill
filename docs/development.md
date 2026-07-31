@@ -309,6 +309,19 @@ Configuration is loaded in this order, with later sources taking precedence:
 
 See [`video-to-skill.toml.example`](../video-to-skill.toml.example) for operational settings. API keys are environment-only and are not serialized into manifests.
 
+Use one product-level setting for evidence recall and retention:
+
+```toml
+[video_to_skill]
+analysis_depth = "auto" # auto | standard | deep | archival
+```
+
+The equivalent environment variable is `VIDEO_TO_SKILL_ANALYSIS_DEPTH`, and `inspect`, `extract`, and `run` accept `--analysis-depth`. `auto` is the default and deterministically selects `standard` or `deep` from inspectable source/course density. `archival` is explicit opt-in. Inspect JSON includes the recommendation, reasons, and effective non-secret budgets before processing begins.
+
+Existing frame and segment settings remain advanced baseline overrides; the selected depth scales them and then applies hard safety maxima. Depth does not select providers or credentials. `visual_profile = "transcript"` still disables visual processing, and `vision_provider = "none"` remains unchanged at every depth.
+
+The requested/effective contract is persisted in `manifest.json` and `analysis/run-config.json`. Resume must match the persisted request and profile version. Use `--refresh` when source inventory or inspectable density has changed; refresh recomputes the contract and affected cache keys. Legacy workspaces are assigned a marked compatibility contract before any new Analyze snapshot.
+
 The default safety limits include 500 course items, eight hours per source, 20 GiB per local file or download, two concurrent source workers, and a two-hour subprocess timeout. The remote source adapter selects analysis media at up to 720p when media is required.
 
 ### Platform authentication

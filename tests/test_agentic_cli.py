@@ -70,6 +70,7 @@ def _evidence_workspace(tmp_path: Path) -> Workspace:
     workspace.replace_transcripts(source.id, [transcript])
     workspace.replace_visuals(source.id, [visual])
     workspace.replace_semantic_segments(source.id, [segment])
+    workspace.create_analysis_run(settings=Settings(cache_root=tmp_path))
     return workspace
 
 

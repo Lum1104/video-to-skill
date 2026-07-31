@@ -14,7 +14,12 @@ from video_to_skill.config import Settings
 from video_to_skill.errors import ProcessingError
 from video_to_skill.generation import SemanticUnit
 from video_to_skill.models import (
+    AgentObservation,
+    EvidenceGap,
+    EvidenceGapSeverity,
+    EvidenceGapType,
     ObservationProducer,
+    ObservationType,
     SemanticSegment,
     SourceDescriptor,
     SourcePlatform,
@@ -28,7 +33,7 @@ from video_to_skill.orchestration import (
     CapabilityEvidence,
     SemanticCoverage,
 )
-from video_to_skill.utils import atomic_write_json
+from video_to_skill.utils import atomic_write_json, stable_hash
 from video_to_skill.work import WorkState
 from video_to_skill.workspace import Workspace
 
@@ -73,6 +78,79 @@ def _workspace(tmp_path: Path, *, sections: int = 1) -> Workspace:
     workspace.replace_transcripts(source.id, transcripts)
     workspace.replace_semantic_segments(source.id, semantic_sections)
     return workspace
+
+
+def _populate_dense_evidence(
+    workspace: Workspace,
+    *,
+    sections: int,
+    per_category: int = 15,
+) -> None:
+    transcripts: list[TranscriptSegment] = []
+    visuals: list[VisualEvent] = []
+    observations: list[AgentObservation] = []
+    gaps: list[EvidenceGap] = []
+    for ordinal in range(1, sections + 1):
+        base = float((ordinal - 1) * 120)
+        for index in range(per_category):
+            timestamp = base + index + 1
+            transcripts.append(
+                TranscriptSegment(
+                    id=f"transcript-{ordinal}-{index}",
+                    source_id="source",
+                    start=timestamp,
+                    end=timestamp + 0.5,
+                    text=f"Evidence {ordinal}/{index}",
+                    origin=TranscriptOrigin.MANUAL_CAPTION,
+                )
+            )
+            visuals.append(
+                VisualEvent(
+                    id=f"visual-{ordinal}-{index}",
+                    source_id="source",
+                    timestamp=timestamp,
+                    path=workspace.root / "frames" / f"{ordinal}-{index}.jpg",
+                )
+            )
+            observations.append(
+                AgentObservation(
+                    source_id="source",
+                    start=timestamp,
+                    end=timestamp + 0.5,
+                    type=ObservationType.CONCEPT,
+                    claim=f"Observation {ordinal}/{index}",
+                    confidence=0.9,
+                    producer=ObservationProducer(name="dense-test"),
+                )
+            )
+            gaps.append(
+                EvidenceGap(
+                    source_id="source",
+                    gap_type=EvidenceGapType.UNOBSERVED_CLAIM,
+                    severity=EvidenceGapSeverity.WARNING,
+                    message=f"Gap {ordinal}/{index}",
+                    suggested_next_action="Inspect the bounded evidence window.",
+                    start=timestamp,
+                    end=timestamp + 0.5,
+                )
+            )
+    workspace.replace_transcripts("source", transcripts)
+    workspace.replace_visuals("source", visuals)
+    workspace.upsert_observations(observations)
+    workspace.upsert_gaps(gaps)
+
+
+def _set_analyze_packet_limit(workspace: Workspace, limit: int) -> None:
+    manifest = workspace.load_manifest()
+    assert manifest.analysis_depth is not None
+    budget = manifest.analysis_depth.budget.model_copy(update={"analyze_packet_item_limit": limit})
+    manifest.analysis_depth = manifest.analysis_depth.model_copy(
+        update={
+            "budget": budget,
+            "budget_digest": stable_hash(budget.model_dump(mode="json"), length=64),
+        }
+    )
+    workspace.save_manifest(manifest)
 
 
 def _result(
@@ -268,6 +346,99 @@ def test_long_course_analyze_tasks_are_bounded_section_groups(tmp_path: Path) ->
     assert len(tasks) == 4
     assert all(task.scope["kind"] == "section-group" for task in tasks)
     assert max(len(task.scope["source_sections"]["source"]) for task in tasks) <= 8
+
+
+def test_integrated_analyze_packet_enforces_one_fair_task_wide_evidence_budget(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path, sections=2)
+    workspace.create_analysis_run()
+    _populate_dense_evidence(workspace, sections=2)
+    _set_analyze_packet_limit(workspace, 100)
+    run = workspace.create_analysis_run()
+
+    [task] = plan_analyze_tasks(workspace, run)
+    payload = json.loads((workspace.root / task.packet_path).read_text(encoding="utf-8"))["payload"]
+    budget = payload["evidence_budget"]
+
+    assert budget == {
+        "profile_limit": 100,
+        "absolute_safety_limit": 3000,
+        "effective_limit": 100,
+        "allocation": "deterministic-section-category-round-robin",
+        "available": 120,
+        "included": 100,
+        "truncated": 20,
+        "complete": False,
+    }
+    included_from_sections = 0
+    section_included: list[int] = []
+    for section in payload["sections"]:
+        coverage = section["evidence_coverage"]
+        assert coverage["available"] == 60
+        assert 48 <= coverage["included"] <= 52
+        assert coverage["truncated"] == 60 - coverage["included"]
+        assert coverage["complete"] is False
+        assert all(
+            category["available"] == 15 and category["included"] > 0 and category["truncated"] >= 0
+            for category in coverage["categories"].values()
+        )
+        included_from_sections += sum(
+            len(section[name]) for name in ("transcripts", "visuals", "observations", "gaps")
+        )
+        section_included.append(coverage["included"])
+    assert included_from_sections == budget["included"]
+    assert max(section_included) - min(section_included) <= 4
+
+
+def test_sharded_analyze_packets_each_enforce_the_task_wide_cap(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path, sections=25)
+    workspace.create_analysis_run()
+    _populate_dense_evidence(workspace, sections=25)
+    _set_analyze_packet_limit(workspace, 100)
+    run = workspace.create_analysis_run()
+
+    tasks = plan_analyze_tasks(workspace, run)
+
+    assert len(tasks) == 4
+    for task in tasks:
+        payload = json.loads((workspace.root / task.packet_path).read_text(encoding="utf-8"))[
+            "payload"
+        ]
+        budget = payload["evidence_budget"]
+        included = sum(
+            len(section[name])
+            for section in payload["sections"]
+            for name in ("transcripts", "visuals", "observations", "gaps")
+        )
+        assert included == budget["included"]
+        assert included <= 100
+        assert budget["effective_limit"] == 100
+        assert budget["available"] == 60 * len(payload["sections"])
+        assert budget["truncated"] == budget["available"] - included
+        assert all(
+            category["included"] > 0
+            for section in payload["sections"]
+            for category in section["evidence_coverage"]["categories"].values()
+        )
+
+
+def test_deep_contract_increases_analyze_fanout_and_binds_task_packet(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path, sections=25)
+    run = workspace.create_analysis_run(settings=Settings(analysis_depth="deep"))
+
+    tasks = plan_analyze_tasks(workspace, run)
+
+    assert len(tasks) == 5
+    assert max(len(task.scope["source_sections"]["source"]) for task in tasks) <= 6
+    packet = json.loads((workspace.root / tasks[0].packet_path).read_text(encoding="utf-8"))[
+        "payload"
+    ]
+    assert packet["analysis_depth"]["requested"] == "deep"
+    assert packet["analysis_depth"]["effective"] == "deep"
+    assert packet["analysis_depth"]["budget"]["analyze_packet_item_limit"] == 2400
+    assert packet["investigation_policy"]["max_window_seconds"] == 180
+    assert packet["investigation_policy"]["max_frames_per_window"] == 360
 
 
 def test_analyze_integration_reuses_only_shard_evidence(tmp_path: Path) -> None:

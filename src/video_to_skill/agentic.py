@@ -25,6 +25,7 @@ from video_to_skill.models import (
     TranscriptSegment,
     VisualEvent,
     VisualKind,
+    VisualRetentionReport,
 )
 from video_to_skill.workspace import Workspace
 
@@ -69,6 +70,33 @@ _VISUAL_TO_OBSERVATION_TYPE = {
     VisualKind.UI: ObservationType.UI,
     VisualKind.PHYSICAL: ObservationType.PHYSICAL,
 }
+
+
+def visual_retention_gaps(report: VisualRetentionReport) -> list[EvidenceGap]:
+    """Project durable baseline-retention loss into actionable evidence gaps."""
+
+    if not report.truncated:
+        return []
+    return [
+        EvidenceGap(
+            source_id=report.source_id,
+            gap_type=EvidenceGapType.VISUAL_RETENTION_TRUNCATED,
+            severity=EvidenceGapSeverity.WARNING,
+            message=(
+                f"Baseline visual retention dropped {interval.dropped_count} candidate(s) "
+                f"in {interval.start:g}-{interval.end:g}s under the persisted "
+                "analysis-depth cap; visual coverage is partial."
+            ),
+            suggested_next_action=(
+                f"Use bounded frame investigation within {interval.start:g}-"
+                f"{interval.end:g}s only if the interval is material, or create a new "
+                "workspace with a deeper explicit profile."
+            ),
+            start=interval.start,
+            end=interval.end,
+        )
+        for interval in report.affected_intervals
+    ]
 
 
 def _bounded_interval(
@@ -515,6 +543,9 @@ def detect_evidence_gaps(
         transcript_by_id = {item.id: item for item in transcripts}
         visual_by_id = {item.id: item for item in visuals}
         segments = workspace.semantic_segments(source.id)
+        retention = workspace.visual_retention_report(source.id)
+        if retention is not None:
+            gaps.extend(visual_retention_gaps(retention))
         for segment in segments:
             segment_transcripts = _segment_transcripts(segment, transcript_by_id)
             segment_visuals = _segment_visuals(segment, visual_by_id)

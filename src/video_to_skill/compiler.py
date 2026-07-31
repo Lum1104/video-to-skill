@@ -12,6 +12,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic import ValidationError as PydanticValidationError
 
+from video_to_skill.analysis_depth import verify_analysis_depth_contract
 from video_to_skill.artifact_language import (
     ArtifactLanguageDeclarationState,
     ArtifactLanguageResolution,
@@ -58,6 +59,7 @@ from video_to_skill.installation import (
     host_skill_root,
     install_generated_skill,
 )
+from video_to_skill.models import AnalysisDepthContract
 from video_to_skill.orchestration import (
     ArtifactDraftSpec,
     BehaviorReport,
@@ -101,6 +103,7 @@ class WorkspaceBuildReceipt(CompileModel):
     artifact_language_declaration_state: ArtifactLanguageDeclarationState
     artifact_language_contract_digest: str
     artifact_language_declaration_digest: str
+    analysis_depth_contract: AnalysisDepthContract
     semantic_map_digest: str
     curriculum_digest: str
     curriculum_options_digest: str | None = None
@@ -758,6 +761,36 @@ def assemble_workspace_blueprint(workspace: Workspace) -> WorkspaceBlueprintProj
 def compile_workspace_blueprint(
     workspace: Workspace,
 ) -> tuple[CourseSkillBlueprint, WorkspaceBuildReceipt, Path]:
+    analysis_depth = workspace.analysis_depth_contract()
+    if analysis_depth is None:
+        raise ProcessingError("Compilation requires a persisted analysis-depth contract")
+    verify_analysis_depth_contract(analysis_depth)
+    semantic_record = workspace.canonical_record("semantic-map")
+    if semantic_record is not None:
+        producer = workspace.get_work_item(semantic_record.producer_task_id)
+        if producer.role == WorkRole.ANALYZE:
+            packet_path = workspace.root / producer.packet_path
+            if (
+                not packet_path.is_file()
+                or packet_path.is_symlink()
+                or packet_path.stat().st_size > 8 * 1024 * 1024
+            ):
+                raise ProcessingError("Canonical Analyze packet failed its digest check")
+            try:
+                packet = json.loads(packet_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ProcessingError(f"Invalid canonical Analyze packet: {exc}") from exc
+            if stable_hash(packet, length=64) != producer.packet_digest:
+                raise ProcessingError("Canonical Analyze packet failed its digest check")
+            if not isinstance(packet, dict):
+                raise ProcessingError("Canonical Analyze packet must be a JSON object")
+            payload = packet.get("payload")
+            if not isinstance(payload, dict) or payload.get(
+                "analysis_depth"
+            ) != analysis_depth.model_dump(mode="json"):
+                raise ProcessingError(
+                    "Canonical Analyze result is not bound to the persisted analysis-depth contract"
+                )
     projection = assemble_workspace_blueprint(workspace)
     critic_digest, behavior_digest = _quality_gate(workspace, projection)
     blueprint = projection.blueprint
@@ -772,6 +805,7 @@ def compile_workspace_blueprint(
         artifact_language_declaration_state=projection.artifact_language_declaration_state,
         artifact_language_contract_digest=projection.artifact_language_contract_digest,
         artifact_language_declaration_digest=projection.artifact_language_declaration_digest,
+        analysis_depth_contract=analysis_depth,
         semantic_map_digest=projection.semantic_map_digest,
         curriculum_digest=projection.curriculum_digest,
         curriculum_options_digest=projection.curriculum_options_digest,

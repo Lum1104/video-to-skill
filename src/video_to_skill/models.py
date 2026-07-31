@@ -37,6 +37,15 @@ class JobState(StrEnum):
     FAILED = "failed"
 
 
+class AnalysisDepth(StrEnum):
+    """Product-level evidence recall and retention intent."""
+
+    AUTO = "auto"
+    STANDARD = "standard"
+    DEEP = "deep"
+    ARCHIVAL = "archival"
+
+
 class ProcessingStage(StrEnum):
     INSPECT = "inspect"
     ACQUIRE = "acquire"
@@ -98,6 +107,7 @@ class EvidenceGapType(StrEnum):
     UNOBSERVED_CLAIM = "unobserved-claim"
     UNGROUNDED_OBSERVATION = "ungrounded-observation"
     WEAK_VISUAL_COVERAGE = "weak-visual-coverage"
+    VISUAL_RETENTION_TRUNCATED = "visual-retention-truncated"
 
 
 class EvidenceGapSeverity(StrEnum):
@@ -622,6 +632,129 @@ class WarningRecord(StrictModel):
     stage: ProcessingStage | None = None
 
 
+class VisualRetentionInterval(StrictModel):
+    start: float = Field(ge=0, allow_inf_nan=False)
+    end: float = Field(ge=0, allow_inf_nan=False)
+    dropped_count: int = Field(ge=1)
+
+    @model_validator(mode="after")
+    def coherent_interval(self) -> VisualRetentionInterval:
+        if self.end < self.start:
+            raise ValueError("visual retention interval end must be after start")
+        return self
+
+
+class VisualRetentionReport(StrictModel):
+    schema_version: str = "visual-retention-v1"
+    source_id: str
+    budget_digest: str
+    candidate_count: int = Field(ge=0)
+    retained_count: int = Field(ge=0)
+    dropped_count: int = Field(ge=0)
+    truncated: bool
+    affected_intervals: list[VisualRetentionInterval] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def coherent_counts(self) -> VisualRetentionReport:
+        if self.candidate_count != self.retained_count + self.dropped_count:
+            raise ValueError("visual retention candidate count must equal retained plus dropped")
+        if self.truncated != (self.dropped_count > 0):
+            raise ValueError("visual retention truncation flag disagrees with dropped count")
+        if self.truncated != bool(self.affected_intervals):
+            raise ValueError("visual retention intervals must appear exactly when truncated")
+        if sum(item.dropped_count for item in self.affected_intervals) != self.dropped_count:
+            raise ValueError("visual retention intervals must account for every dropped candidate")
+        return self
+
+
+class AnalysisDepthCharacteristics(StrictModel):
+    """Inspectable inputs used by the deterministic depth recommendation."""
+
+    inventory_digest: str
+    total_duration_seconds: float = Field(ge=0)
+    unknown_duration_sources: int = Field(ge=0)
+    source_count: int = Field(ge=0)
+    expected_item_count: int | None = Field(default=None, ge=0)
+    captioned_source_count: int = Field(ge=0)
+    chapter_count: int = Field(ge=0)
+    chapter_density_per_hour: float = Field(ge=0)
+    course_source_count: int = Field(ge=0)
+    visual_signal_source_count: int = Field(ge=0)
+    semantic_density_score: int = Field(ge=0, le=12)
+
+
+class AnalysisBudgetSummary(StrictModel):
+    """Non-secret effective budgets consumed by extraction and Analyze planning."""
+
+    profile_version: str
+    visual_profile: str
+    vision_provider: str
+    visual_sampling_enabled: bool
+    periodic_frame_interval_seconds: int | None = Field(default=None, ge=5, le=600)
+    scene_threshold: float | None = Field(default=None, ge=0, le=1)
+    frame_width: int | None = Field(default=None, ge=320, le=3840)
+    visual_same_moment_dedup_distance: int | None = Field(default=None, ge=0, le=16)
+    visual_sequential_dedup_distance: int | None = Field(default=None, ge=0, le=16)
+    visual_events_per_hour_soft_limit: int = Field(ge=0)
+    source_visual_event_limits: dict[str, int] = Field(default_factory=dict)
+    min_segment_seconds: int = Field(ge=10, le=600)
+    target_segment_seconds: int = Field(ge=30, le=1800)
+    max_segment_seconds: int = Field(ge=60, le=3600)
+    analyze_sections_per_task: int = Field(ge=1, le=32)
+    analyze_packet_item_limit: int = Field(ge=100, le=3000)
+    integrated_course_max_seconds: int = Field(ge=0)
+    integrated_course_max_sources: int = Field(ge=1)
+    integrated_course_max_sections: int = Field(ge=1)
+    investigation_window_seconds: int = Field(ge=1, le=300)
+    investigation_max_frames_per_window: int = Field(ge=1, le=1800)
+    context_window_seconds: int = Field(ge=1, le=600)
+    context_max_items_per_kind: int = Field(ge=1, le=1000)
+    safety_maxima: dict[str, int | float] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def coherent_segments(self) -> AnalysisBudgetSummary:
+        if not self.min_segment_seconds <= self.target_segment_seconds <= self.max_segment_seconds:
+            raise ValueError("analysis segment budgets must satisfy minimum <= target <= maximum")
+        if not self.visual_sampling_enabled and any(
+            value is not None
+            for value in (
+                self.periodic_frame_interval_seconds,
+                self.scene_threshold,
+                self.frame_width,
+                self.visual_same_moment_dedup_distance,
+                self.visual_sequential_dedup_distance,
+            )
+        ):
+            raise ValueError("disabled visual sampling cannot retain visual extraction budgets")
+        return self
+
+
+class AnalysisDepthContract(StrictModel):
+    """Versioned, durable statement of the evidence-processing contract."""
+
+    schema_version: str = "analysis-depth-contract-v1"
+    requested: AnalysisDepth
+    recommended: AnalysisDepth
+    effective: AnalysisDepth
+    recommendation_reasons: list[str]
+    characteristics: AnalysisDepthCharacteristics
+    budget: AnalysisBudgetSummary
+    budget_digest: str
+    legacy_compatibility: bool = False
+
+    @model_validator(mode="after")
+    def coherent_resolution(self) -> AnalysisDepthContract:
+        if self.recommended not in {AnalysisDepth.STANDARD, AnalysisDepth.DEEP}:
+            raise ValueError("automatic recommendation must resolve to standard or deep")
+        if self.effective == AnalysisDepth.AUTO:
+            raise ValueError("effective analysis depth must be concrete")
+        if self.requested == AnalysisDepth.AUTO and self.effective != self.recommended:
+            raise ValueError("auto analysis depth must use the deterministic recommendation")
+        if not self.recommendation_reasons:
+            raise ValueError("analysis depth recommendation requires at least one reason")
+        return self
+
+
 class JobManifest(StrictModel):
     schema_version: int = 1
     job_id: str
@@ -632,6 +765,7 @@ class JobManifest(StrictModel):
     workspace: Path
     configuration_hash: str
     output_language: str = "source"
+    analysis_depth: AnalysisDepthContract | None = None
     sources: list[SourceDescriptor] = Field(default_factory=list)
     warnings: list[WarningRecord] = Field(default_factory=list)
     failed_sources: list[str] = Field(default_factory=list)

@@ -258,7 +258,11 @@ If a safety limit is reached while material gaps remain:
 2. mark the affected coverage partial; or
 3. ask to expand the budget only when the extra time, storage, paid service, or privacy boundary is material.
 
-For product-level control, expose `standard`, `deep`, and `archival` analysis depth rather than FPS, OCR thresholds, or FFmpeg flags. Recommend the level from source density and publishing intent.
+For product-level control, expose one `analysis-depth` contract: `auto`, `standard`, `deep`, or `archival`, rather than FPS, OCR thresholds, or FFmpeg flags. `auto` deterministically recommends `standard` or `deep` from inspectable duration, item count, creator chapters, caption coverage, course structure, and visual/content signals. `archival` is never an implicit default; selecting it is an explicit preservation/publishing decision because its private storage and review boundary is material.
+
+Resolve and persist requested, recommended, and effective depth plus recommendation reasons and a versioned non-secret budget summary before affected evidence processing. The profile must materially control multiple scaled budgets: visual cadence and scene sensitivity, deduplication and duration-scaled retention, semantic segment size, Analyze packet/fanout limits, and bounded investigation affordances. Fixed maxima remain safety valves. Resume reuses the exact profile and rejects conflicts or drift; an explicit refresh recomputes it when the inspectable inventory or density changes. Legacy workspaces receive a marked compatibility resolution before new task snapshots.
+
+Depth is not authorization. It cannot enable hosted vision, paid services, credentials, private-media egress, or redistribution, and it cannot override `visual_profile=transcript`. The generated Skill consumes semantic and provenance outputs, never raw engine knobs.
 
 ## Canonical semantic map
 

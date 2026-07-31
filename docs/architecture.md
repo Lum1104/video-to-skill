@@ -46,6 +46,12 @@ Teaching-asset selection is a separate publication pipeline. Analyze proposes an
 
 `coverage.json` schema version 2 aggregates the persisted inspection reports into a course-completeness proof, count totals, disclaimers, active source coverage, retired-source tombstones, and warnings. Completeness remains unproven when the expected count is unknown or any expected entry is inaccessible or failed.
 
+`manifest.json` also owns the analysis-depth contract. Inspection deterministically summarizes duration, active and expected item counts, chapters, caption coverage, course structure, and visible content signals. `auto` resolves to `standard` or `deep`; `archival` is explicit because its storage and review boundary is material. The versioned budget summary controls frame cadence, scene sensitivity, width, perceptual deduplication, duration-scaled frame retention, semantic segment size, Analyze packet limits and fanout, and investigation affordances. Absolute course, media, packet, frame, and investigation maxima remain hard safety caps.
+
+The contract is resolved before affected extraction stages, included in their cache keys, and copied into Analyze packets, `analysis/run-config.json`, workspace compiler receipts, and completion records. Resume reuses it and rejects a conflicting requested depth, corrupted digest, or profile-version drift. `--refresh` is the only normal path that recomputes it after inspectable inventory or density changes. A legacy workspace receives a marked compatibility contract before new analysis tasks are snapshotted.
+
+Depth never changes `visual_profile`, ASR/OCR/vision providers, API-key requirements, authentication, network authorization, or redistribution policy. In particular, `visual_profile=transcript` produces zero visual-extraction budgets at every depth, and a deeper profile never enables hosted vision.
+
 Media and frames are private, reproducible cache artifacts. `clean` removes those files but not the database, captions, manifests, or generated skill.
 
 ## Source lifecycle

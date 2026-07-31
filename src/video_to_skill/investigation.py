@@ -12,6 +12,10 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps, UnidentifiedImageError
 
+from video_to_skill.analysis_depth import (
+    effective_source_settings,
+    verify_analysis_depth_contract,
+)
 from video_to_skill.config import Settings
 from video_to_skill.errors import ProcessingError
 from video_to_skill.models import VisualEvent, VisualKind, VisualOrigin
@@ -728,6 +732,33 @@ def extract_workspace_window_frames(
     """Extract a dense window from a workspace source's materialized local media."""
 
     workspace.get_source(source_id)
+    contract = workspace.analysis_depth_contract()
+    if contract is None:
+        raise ProcessingError("Frame investigation requires a persisted analysis-depth contract")
+    verify_analysis_depth_contract(contract, settings=settings)
+    budget = contract.budget
+    if not budget.visual_sampling_enabled:
+        raise ProcessingError(
+            "Frame investigation is disabled by the persisted transcript-only visual profile"
+        )
+    duration = end - start
+    if duration > budget.investigation_window_seconds + 1e-9:
+        raise ProcessingError(
+            f"Requested frame window is {duration:g}s; {contract.effective.value} depth "
+            f"allows at most {budget.investigation_window_seconds}s"
+        )
+    requested_frames = math.ceil(duration * fps)
+    if requested_frames > budget.investigation_max_frames_per_window:
+        raise ProcessingError(
+            f"Requested frame window would sample {requested_frames} frames; "
+            f"{contract.effective.value} depth allows at most "
+            f"{budget.investigation_max_frames_per_window}"
+        )
+    effective_settings = effective_source_settings(
+        settings,
+        contract,
+        source_id=source_id,
+    )
     record = workspace.materialization_record(source_id)
     if record is None or not record["media_path"]:
         raise ProcessingError(f"Source {source_id} has no materialized media file")
@@ -740,7 +771,7 @@ def extract_workspace_window_frames(
         Path(record["media_path"]),
         output_directory,
         source_id,
-        settings,
+        effective_settings,
         start=start,
         end=end,
         fps=fps,

@@ -28,6 +28,8 @@ Never ask the user to run internal commands, supervise extraction, select frame 
 
 Resolve the complete expected source set before treating acquisition as complete. Preserve playlist order and explicit complete, partial, failed, skipped, inaccessible, or retired states. Continue through isolated source failures when useful material remains, never silently omit an expected item, and report how missing material limits the generated Skill.
 
+Use the engine's product-level analysis-depth contract instead of choosing frame or task knobs. `auto` deterministically recommends `standard` or `deep` from inspected duration, item count, chapters, caption coverage, and content signals. Use an explicit `standard` or `deep` when the user requests it. Use `archival` only when the user explicitly accepts its materially higher private storage and review boundary; it is never an implicit default. Analysis depth cannot authorize hosted vision, a paid provider, credentials, media redistribution, or visual processing disabled by `visual_profile=transcript`.
+
 The engine is model-agnostic and never calls an LLM. The host main agent dispatches native workers for semantic, multimodal, pedagogical, and critical judgment; deterministic code owns acquisition, bounded packets, task state, validation, compilation, rendering, and installation.
 
 This workspace-centered release supports new conversions and deterministic resume. Update or fold-in of new evidence into an existing generated Skill is not implemented. Never present regeneration as a safe update, overwrite an existing different Skill, or discard human edits; retain the new workspace or staged output and state that update remains unsupported.
@@ -64,8 +66,8 @@ Choose a durable workspace outside the generated output and installed Skill. Use
 Start a new conversion:
 
 ```bash
-"$V2S_ENGINE" run SOURCES... --workspace WORKSPACE --host codex --output-language LANGUAGE
-"$V2S_ENGINE" run SOURCES... --workspace WORKSPACE --host claude --output-language LANGUAGE
+"$V2S_ENGINE" run SOURCES... --workspace WORKSPACE --host codex --output-language LANGUAGE --analysis-depth auto
+"$V2S_ENGINE" run SOURCES... --workspace WORKSPACE --host claude --output-language LANGUAGE --analysis-depth auto
 ```
 
 Always pass the inferred or explicit artifact `LANGUAGE` on a new run. Use `source` only when the user specifically wants artifacts in the source language. `--language` is a separate optional preference for source captions and ASR and never controls generated prose. If `source` evidence is uniformly known, the engine resolves it deterministically; mixed or incomplete source-language evidence requires the bounded curriculum agent to declare one canonical language under the persisted contract.
@@ -77,6 +79,8 @@ Add `--project` only when the user requested project-local installation. Add `--
 ```
 
 On resume, omit `--output-language` and reuse the persisted value. Never silently change it; an explicit conflicting resume override is rejected.
+
+Also omit `--analysis-depth` on resume and reuse the persisted requested/effective depth and versioned budget profile. A conflicting request or profile drift is rejected. `--refresh` re-inspects the inventory; when duration, items, chapters, captions, or density signals change, the engine deterministically refreshes the contract and invalidates only affected stage/task snapshots.
 
 `run` performs every available deterministic transition and emits one JSON envelope.
 
@@ -108,6 +112,8 @@ After all dispatched workers finish, call `run --workspace WORKSPACE` again. Rep
 Report the installed Skill name and path, invocation, workspace path and retention, processed and failed source counts, source and semantic coverage, instructional-affordance coverage, critic repair count, build ID, and validation results.
 
 Also report the requested output-language intent, resolved canonical artifact language, resolution state, and whether it was deterministically resolved or agent-declared.
+
+Report requested, recommended, and effective analysis depth, the recommendation reasons, and the versioned non-secret budget summary from the completion envelope.
 
 Make partial, inaccessible, skipped, retired, and failed sources visible in the completion summary. Distinguish source-acquisition coverage from semantic coverage and state any capability limits caused by missing evidence.
 

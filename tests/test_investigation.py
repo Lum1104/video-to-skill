@@ -270,6 +270,7 @@ def test_workspace_window_default_destination_rejects_symlink_escape(
         media_path=media,
         caption_paths=[],
     )
+    workspace.create_analysis_run(settings=Settings(cache_root=tmp_path))
 
     outside = tmp_path / "outside"
     outside.mkdir()
@@ -292,6 +293,123 @@ def test_workspace_window_default_destination_rejects_symlink_escape(
             fps=1,
         )
     assert list(outside.iterdir()) == []
+
+
+def _bounded_window_workspace(
+    tmp_path: Path,
+    *,
+    depth: str,
+    visual_profile: str = "adaptive",
+) -> tuple[Workspace, Settings]:
+    settings = Settings(
+        cache_root=tmp_path,
+        analysis_depth=depth,
+        visual_profile=visual_profile,
+    )
+    workspace = Workspace.create(
+        root=tmp_path / "workspace",
+        inputs=["demo"],
+        settings=settings,
+    )
+    source = SourceDescriptor(
+        id="source",
+        platform=SourcePlatform.LOCAL,
+        locator="/tmp/demo.mp4",
+        title="Investigation demo",
+        duration=2_000,
+    )
+    workspace.upsert_sources([source])
+    source_directory = workspace.source_directory(source.id)
+    media = source_directory / "media.mp4"
+    media.write_bytes(b"bounded test media")
+    workspace.update_materialization(
+        source.id,
+        content_hash="content",
+        source_dir=source_directory,
+        media_path=media,
+        caption_paths=[],
+    )
+    workspace.create_analysis_run(settings=settings)
+    return workspace, settings
+
+
+@pytest.mark.parametrize(
+    ("depth", "max_seconds", "max_frames"),
+    [
+        ("standard", 90, 90),
+        ("deep", 180, 360),
+        ("archival", 300, 1_200),
+    ],
+)
+def test_workspace_frame_investigation_enforces_persisted_depth_limits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    depth: str,
+    max_seconds: int,
+    max_frames: int,
+) -> None:
+    workspace, settings = _bounded_window_workspace(tmp_path, depth=depth)
+    captured: list[tuple[float, float, float]] = []
+
+    def fake_extract(
+        _media: Path,
+        _destination: Path,
+        _source_id: str,
+        _settings: Settings,
+        **kwargs: Any,
+    ) -> list[VisualEvent]:
+        captured.append((kwargs["start"], kwargs["end"], kwargs["fps"]))
+        return []
+
+    monkeypatch.setattr(investigation, "extract_window_frames", fake_extract)
+
+    extract_workspace_window_frames(
+        workspace,
+        "source",
+        settings,
+        start=0,
+        end=max_seconds,
+        fps=max_frames / max_seconds,
+    )
+    assert captured == [(0, max_seconds, max_frames / max_seconds)]
+
+    with pytest.raises(ProcessingError, match=f"allows at most {max_seconds}s"):
+        extract_workspace_window_frames(
+            workspace,
+            "source",
+            settings,
+            start=0,
+            end=max_seconds + 1,
+            fps=0.1,
+        )
+    with pytest.raises(ProcessingError, match=f"allows at most {max_frames}"):
+        extract_workspace_window_frames(
+            workspace,
+            "source",
+            settings,
+            start=0,
+            end=max_seconds,
+            fps=(max_frames + 1) / max_seconds,
+        )
+    assert len(captured) == 1
+
+
+def test_transcript_profile_mechanically_disables_frame_investigation(tmp_path: Path) -> None:
+    workspace, settings = _bounded_window_workspace(
+        tmp_path,
+        depth="archival",
+        visual_profile="transcript",
+    )
+
+    with pytest.raises(ProcessingError, match="transcript-only"):
+        extract_workspace_window_frames(
+            workspace,
+            "source",
+            settings,
+            start=0,
+            end=1,
+            fps=1,
+        )
 
 
 @pytest.mark.skipif(not shutil.which("ffmpeg"), reason="FFmpeg unavailable")

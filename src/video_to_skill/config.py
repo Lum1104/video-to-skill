@@ -19,6 +19,7 @@ from pydantic import (
 )
 
 from video_to_skill.errors import ConfigurationError
+from video_to_skill.models import AnalysisDepth
 from video_to_skill.utils import stable_hash
 
 
@@ -26,6 +27,9 @@ class Settings(BaseModel):
     model_config = ConfigDict(extra="forbid")
     _authentication_cache_key: str | None = PrivateAttr(default=None)
     _cookie_session_root: Path | None = PrivateAttr(default=None)
+    _analysis_budget: Any | None = PrivateAttr(default=None)
+    _analysis_visual_event_limit: int | None = PrivateAttr(default=None)
+    _analysis_visual_retention_report: Any | None = PrivateAttr(default=None)
 
     cache_root: Path = Field(default_factory=lambda: user_cache_path("video-to-skill") / "jobs")
     ffmpeg: str = "ffmpeg"
@@ -35,6 +39,7 @@ class Settings(BaseModel):
     cookies_file: Path | None = None
     language: str = "auto"
     output_language: str = "source"
+    analysis_depth: AnalysisDepth = AnalysisDepth.AUTO
     visual_profile: Literal["adaptive", "always", "transcript"] = "adaptive"
     ocr_provider: str = "auto"
     vision_provider: str = "none"
@@ -89,10 +94,24 @@ class Settings(BaseModel):
         return "public"
 
     @property
+    def analysis_depth_explicit(self) -> bool:
+        """Whether configuration, environment, CLI, or a caller selected depth."""
+
+        return "analysis_depth" in self.model_fields_set
+
+    @property
     def configuration_hash(self) -> str:
         payload = self.model_dump(
             mode="json",
-            exclude={"cache_root", "cookies_from_browser", "cookies_file"},
+            exclude={
+                "cache_root",
+                "cookies_from_browser",
+                "cookies_file",
+                # Depth has its own inspectable, persisted resume contract. Keeping it out
+                # of the legacy hash lets pre-contract workspaces migrate safely while the
+                # contract itself rejects requested/effective depth conflicts.
+                "analysis_depth",
+            },
         )
         payload["authentication"] = self.authentication_cache_key
         return stable_hash(payload, length=20)
@@ -199,6 +218,7 @@ def load_settings(config_path: Path | None = None, **overrides: Any) -> Settings
         "VIDEO_TO_SKILL_CACHE_ROOT": ("cache_root", Path),
         "VIDEO_TO_SKILL_LANGUAGE": ("language", str),
         "VIDEO_TO_SKILL_OUTPUT_LANGUAGE": ("output_language", str),
+        "VIDEO_TO_SKILL_ANALYSIS_DEPTH": ("analysis_depth", str),
         "VIDEO_TO_SKILL_VISUAL_PROFILE": ("visual_profile", str),
         "VIDEO_TO_SKILL_ASR_MODEL": ("asr_model", str),
         "VIDEO_TO_SKILL_DIARIZE": (

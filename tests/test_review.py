@@ -8,10 +8,16 @@ from test_author import _analyzed_workspace, _author_result, _plan_course_author
 
 import video_to_skill.behavior as behavior_module
 import video_to_skill.review as review_module
+from video_to_skill.agentic import visual_retention_gaps
 from video_to_skill.author import submit_author_result
 from video_to_skill.behavior import snapshot_behavior_target
 from video_to_skill.errors import ProcessingError
-from video_to_skill.models import ObservationProducer
+from video_to_skill.models import (
+    ObservationProducer,
+    VisualRetentionInterval,
+    VisualRetentionReport,
+    WarningRecord,
+)
 from video_to_skill.orchestration import (
     BehaviorArtifactAccess,
     BehaviorCheck,
@@ -331,6 +337,41 @@ def test_review_rejects_wrong_engine_execution_context(tmp_path: Path) -> None:
 
     with pytest.raises(ProcessingError, match="does not belong to this task snapshot"):
         submit_review_result(workspace, review.id, result_path)
+
+
+def test_review_packet_binds_exact_analysis_depth_contract(tmp_path: Path) -> None:
+    workspace, run, author = _authored_workspace(tmp_path)
+    contract = workspace.load_manifest().analysis_depth
+    assert contract is not None
+    retention = VisualRetentionReport(
+        source_id="source",
+        budget_digest=contract.budget_digest,
+        candidate_count=9,
+        retained_count=4,
+        dropped_count=5,
+        truncated=True,
+        affected_intervals=[VisualRetentionInterval(start=10, end=20, dropped_count=5)],
+    )
+    workspace.save_visual_retention_report(retention)
+    workspace.upsert_gaps(visual_retention_gaps(retention))
+    workspace.add_warning(
+        WarningRecord(
+            code="visual-retention-truncated",
+            message="Visual coverage is partial because five candidates were dropped.",
+            source_id="source",
+        )
+    )
+    review = _plan_review(workspace, run, author)
+    packet = json.loads((workspace.root / review.packet_path).read_text(encoding="utf-8"))[
+        "payload"
+    ]
+    assert packet["analysis_depth_contract"] == contract.model_dump(mode="json")
+    assert (
+        packet["analysis_depth_contract_digest"] == review.scope["analysis_depth_contract_digest"]
+    )
+    assert packet["visual_retention"][0]["dropped_count"] == 5
+    assert packet["visual_retention_gaps"][0]["gap_type"] == "visual-retention-truncated"
+    assert packet["visual_retention_warnings"][0]["code"] == "visual-retention-truncated"
 
 
 def test_behavior_preview_cache_is_revalidated_against_fresh_render(tmp_path: Path) -> None:

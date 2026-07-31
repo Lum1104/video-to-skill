@@ -14,7 +14,17 @@ from video_to_skill.config import Settings
 from video_to_skill.coordinator import advance_run, submit_workspace_result
 from video_to_skill.errors import ProcessingError
 from video_to_skill.installation import SkillHost
-from video_to_skill.models import ObservationProducer
+from video_to_skill.models import (
+    ObservationProducer,
+    SemanticSegment,
+    SourceDescriptor,
+    SourcePlatform,
+    TranscriptOrigin,
+    TranscriptSegment,
+    VisualRetentionInterval,
+    VisualRetentionReport,
+    WarningRecord,
+)
 from video_to_skill.orchestration import (
     BehaviorArtifactAccess,
     BehaviorTrialResult,
@@ -37,6 +47,47 @@ def _resume(
         settings=settings,
         host=None,
     )
+
+
+def _depth_workspace(tmp_path: Path, depth: str) -> Workspace:
+    workspace = Workspace.create(
+        root=tmp_path / "workspace",
+        inputs=["demo"],
+        settings=Settings(cache_root=tmp_path),
+    )
+    source = SourceDescriptor(
+        id="source",
+        platform=SourcePlatform.LOCAL,
+        locator="/tmp/demo.mp4",
+        title="Analysis depth demo",
+        duration=120,
+    )
+    transcript = TranscriptSegment(
+        id="transcript",
+        source_id=source.id,
+        start=0,
+        end=60,
+        text="Use persisted evidence budgets when resuming the run.",
+        origin=TranscriptOrigin.MANUAL_CAPTION,
+    )
+    workspace.upsert_sources([source])
+    workspace.replace_transcripts(source.id, [transcript])
+    workspace.replace_semantic_segments(
+        source.id,
+        [
+            SemanticSegment(
+                id="section",
+                source_id=source.id,
+                ordinal=1,
+                title="Resume",
+                start=0,
+                end=120,
+                transcript_ids=[transcript.id],
+            )
+        ],
+    )
+    workspace.create_analysis_run(settings=Settings(cache_root=tmp_path, analysis_depth=depth))
+    return workspace
 
 
 def _submit_trial_envelope(
@@ -230,6 +281,26 @@ def test_run_and_submit_complete_without_main_agent_data_forwarding(
     tmp_path: Path,
 ) -> None:
     workspace, settings, _output, _skill_root = _reviewed_workspace(tmp_path)
+    contract = workspace.load_manifest().analysis_depth
+    assert contract is not None
+    workspace.save_visual_retention_report(
+        VisualRetentionReport(
+            source_id="source",
+            budget_digest=contract.budget_digest,
+            candidate_count=8,
+            retained_count=3,
+            dropped_count=5,
+            truncated=True,
+            affected_intervals=[VisualRetentionInterval(start=20, end=40, dropped_count=5)],
+        )
+    )
+    workspace.add_warning(
+        WarningRecord(
+            code="visual-retention-truncated",
+            message="Visual coverage is partial because five candidates were dropped.",
+            source_id="source",
+        )
+    )
 
     complete = _resume(workspace, settings)
 
@@ -241,6 +312,22 @@ def test_run_and_submit_complete_without_main_agent_data_forwarding(
     assert complete.completion["requested_output_language"] == "source"
     assert complete.completion["artifact_language"] == "English"
     assert complete.completion["artifact_language_declaration_state"] == "agent-declared"
+    assert complete.completion["analysis_depth_contract"]["requested"] == "auto"
+    assert complete.completion["analysis_depth_contract"]["budget"]["profile_version"].startswith(
+        "analysis-depth-budget-"
+    )
+    assert complete.completion["visual_evidence_coverage"]["complete"] is False
+    assert complete.completion["visual_evidence_coverage"]["dropped_count"] == 5
+    assert complete.completion["visual_retention_warnings"][0]["code"] == (
+        "visual-retention-truncated"
+    )
+    run_config = json.loads(
+        (workspace.analysis_dir / "run-config.json").read_text(encoding="utf-8")
+    )
+    assert (
+        run_config["analysis_depth_contract_digest"]
+        and run_config["analysis_depth_contract"] == complete.completion["analysis_depth_contract"]
+    )
     resumed = _resume(workspace, settings)
     assert resumed.status == "complete"
     assert resumed.completion is not None
@@ -248,6 +335,46 @@ def test_run_and_submit_complete_without_main_agent_data_forwarding(
     assert resumed.completion["generated_path"] == complete.completion["generated_path"]
     assert resumed.completion["installed_path"] == complete.completion["installed_path"]
     assert resumed.completion["installation_status"] == "unchanged"
+
+
+@pytest.mark.parametrize(
+    ("persisted", "conflicting"),
+    [
+        ("standard", "deep"),
+        ("deep", "archival"),
+        ("archival", "standard"),
+    ],
+)
+def test_resume_reuses_omitted_analysis_depth_and_rejects_explicit_conflicts(
+    tmp_path: Path,
+    persisted: str,
+    conflicting: str,
+) -> None:
+    workspace = _depth_workspace(tmp_path, persisted)
+
+    resumed = advance_run(
+        sources=[],
+        workspace_path=workspace.root,
+        settings=Settings(cache_root=tmp_path),
+        host=SkillHost.CODEX,
+        output=tmp_path / "generated" / "depth-demo",
+        skill_root=tmp_path / "skills",
+        run_official_validation=False,
+    )
+
+    assert resumed.status == "actions-required"
+    contract = workspace.load_manifest().analysis_depth
+    assert contract is not None
+    assert contract.requested.value == persisted
+    assert contract.effective.value == persisted
+
+    with pytest.raises(ProcessingError, match="conflicts with persisted request"):
+        advance_run(
+            sources=[],
+            workspace_path=workspace.root,
+            settings=Settings(cache_root=tmp_path, analysis_depth=conflicting),
+            host=None,
+        )
 
 
 def test_material_curriculum_decision_precedes_artifact_authoring(tmp_path: Path) -> None:

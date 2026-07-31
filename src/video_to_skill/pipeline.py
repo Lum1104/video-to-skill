@@ -7,6 +7,11 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+from video_to_skill.agentic import visual_retention_gaps
+from video_to_skill.analysis_depth import (
+    effective_source_settings,
+    resolve_workspace_analysis_depth,
+)
 from video_to_skill.authentication import (
     browser_cookie_session,
     cookie_settings_for_worker,
@@ -14,6 +19,8 @@ from video_to_skill.authentication import (
 from video_to_skill.config import Settings
 from video_to_skill.errors import DependencyError, ProcessingError, VideoToSkillError
 from video_to_skill.models import (
+    AnalysisDepthContract,
+    EvidenceGapType,
     InspectionBatch,
     InspectionCompleteness,
     InspectionEntry,
@@ -24,6 +31,7 @@ from video_to_skill.models import (
     ProcessingStage,
     SourceDescriptor,
     SourcePlatform,
+    VisualRetentionReport,
     WarningRecord,
     WarningSeverity,
 )
@@ -46,7 +54,7 @@ ProgressCallback = Callable[[str], None]
 STAGE_REVISIONS = {
     ProcessingStage.ACQUIRE: 1,
     ProcessingStage.TRANSCRIBE: 2,
-    ProcessingStage.VISUALS: 3,
+    ProcessingStage.VISUALS: 4,
     ProcessingStage.SEGMENT: 2,
 }
 
@@ -134,6 +142,7 @@ def _process_source(
     settings: Settings,
     registry: SourceRegistry,
     progress: ProgressCallback,
+    analysis_depth: AnalysisDepthContract,
 ) -> None:
     source_dir = workspace.source_directory(source.id)
     if not source.captions and source.platform != SourcePlatform.LOCAL:
@@ -242,6 +251,10 @@ def _process_source(
             "ocr": settings.ocr_provider,
             "vision": settings.vision_provider,
             "vision_model": settings.vision_model,
+            "analysis_depth_budget": analysis_depth.budget_digest,
+            "source_visual_limit": analysis_depth.budget.source_visual_event_limits.get(
+                source.id, 0
+            ),
         }
     )
     if not workspace.stage_complete(source.id, ProcessingStage.VISUALS, visual_key):
@@ -249,6 +262,23 @@ def _process_source(
         workspace.start_stage(source.id, ProcessingStage.VISUALS, visual_key)
         try:
             visuals, warnings = analyze_visuals(materialized, settings)
+            retention = settings._analysis_visual_retention_report
+            if isinstance(retention, VisualRetentionReport):
+                if (
+                    retention.source_id != source.id
+                    or retention.budget_digest != analysis_depth.budget_digest
+                ):
+                    raise ProcessingError(
+                        "Visual retention report disagrees with the persisted depth contract"
+                    )
+                workspace.save_visual_retention_report(retention)
+                for prior in workspace.gaps(
+                    source.id,
+                    gap_type=EvidenceGapType.VISUAL_RETENTION_TRUNCATED,
+                    limit=None,
+                ):
+                    workspace.delete_gap(prior.id)
+                workspace.upsert_gaps(visual_retention_gaps(retention))
             workspace.replace_visuals(source.id, visuals)
             for warning in warnings:
                 _record_warning(
@@ -258,6 +288,21 @@ def _process_source(
                     source_id=source.id,
                     stage=ProcessingStage.VISUALS,
                     severity=WarningSeverity.INFO,
+                )
+            if isinstance(retention, VisualRetentionReport) and retention.truncated:
+                _record_warning(
+                    workspace,
+                    code="visual-retention-truncated",
+                    message=(
+                        f"Visual evidence for '{source.title}' is partial: retained "
+                        f"{retention.retained_count}/{retention.candidate_count} candidates "
+                        f"under {analysis_depth.effective.value} depth; "
+                        f"{retention.dropped_count} candidate(s) were dropped across "
+                        f"{len(retention.affected_intervals)} interval(s)."
+                    ),
+                    source_id=source.id,
+                    stage=ProcessingStage.VISUALS,
+                    severity=WarningSeverity.WARNING,
                 )
             workspace.complete_stage(source.id, ProcessingStage.VISUALS, visual_key)
         except Exception as exc:
@@ -283,6 +328,7 @@ def _process_source(
             "minimum": settings.min_segment_seconds,
             "target": settings.target_segment_seconds,
             "maximum": settings.max_segment_seconds,
+            "analysis_depth_budget": analysis_depth.budget_digest,
         }
     )
     if not workspace.stage_complete(source.id, ProcessingStage.SEGMENT, segment_key):
@@ -336,6 +382,7 @@ def _write_coverage_report(workspace: Workspace) -> Path:
         disclaimers.append(
             "No persisted input inspection report is available; course completeness is unknown."
         )
+    visual_retention = workspace.visual_retention_reports()
     atomic_write_json(
         path,
         {
@@ -351,6 +398,13 @@ def _write_coverage_report(workspace: Workspace) -> Path:
                 "inspections": [item.model_dump(mode="json") for item in inspections],
             },
             "sources": records,
+            "visual_evidence": {
+                "complete": not any(item.truncated for item in visual_retention),
+                "candidate_count": sum(item.candidate_count for item in visual_retention),
+                "retained_count": sum(item.retained_count for item in visual_retention),
+                "dropped_count": sum(item.dropped_count for item in visual_retention),
+                "reports": [item.model_dump(mode="json") for item in visual_retention],
+            },
             "retired_sources": [item.model_dump(mode="json") for item in retired],
             "warnings": [item.model_dump(mode="json") for item in workspace.list_warnings()],
         },
@@ -418,6 +472,7 @@ def _extract_sources_authenticated(
     workspace.set_job_state(JobState.RUNNING)
 
     sources = workspace.list_sources()
+    resumed_existing_inventory = bool(sources)
     inspected_current_inputs = False
     if refresh or not sources:
         progress("Inspecting sources")
@@ -464,6 +519,16 @@ def _extract_sources_authenticated(
         workspace.set_job_state(JobState.FAILED)
         raise ProcessingError("No processable videos were found")
 
+    analysis_depth = resolve_workspace_analysis_depth(
+        workspace.analysis_depth_contract(),
+        sources,
+        workspace.inspection_reports(),
+        settings,
+        refresh=refresh or inspected_current_inputs,
+        legacy_compatibility_if_missing=resumed_existing_inventory,
+    )
+    if workspace.analysis_depth_contract() != analysis_depth:
+        workspace.save_analysis_depth_contract(analysis_depth)
     failures: dict[str, str] = {}
     with ThreadPoolExecutor(max_workers=min(settings.max_workers, len(sources))) as executor:
         futures = {
@@ -471,9 +536,17 @@ def _extract_sources_authenticated(
                 _process_source,
                 source,
                 workspace,
-                cookie_settings_for_worker(settings, source.id),
+                cookie_settings_for_worker(
+                    effective_source_settings(
+                        settings,
+                        analysis_depth,
+                        source_id=source.id,
+                    ),
+                    source.id,
+                ),
                 registry,
                 progress,
+                analysis_depth,
             ): source
             for source in sources
         }
@@ -515,7 +588,14 @@ def _extract_sources_authenticated(
     inspection_incomplete = any(
         not report.completeness_proven for report in workspace.inspection_reports()
     )
-    state = JobState.PARTIAL if failures or inspection_incomplete else JobState.COMPLETE
+    visual_retention_incomplete = any(
+        report.truncated for report in workspace.visual_retention_reports()
+    )
+    state = (
+        JobState.PARTIAL
+        if failures or inspection_incomplete or visual_retention_incomplete
+        else JobState.COMPLETE
+    )
     manifest = workspace.set_job_state(state, failed_sources=list(failures))
     return workspace, manifest
 
