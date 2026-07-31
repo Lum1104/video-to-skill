@@ -237,6 +237,19 @@ Treat cookies, headers, tokens, expiring URLs, and browser snapshots as runtime 
 
 Let the engine record tool provenance directly at its subprocess and provider boundaries. It stores stable logical runs, attempts, failures, cache reuse, normalized non-secret arguments, input digests, and workspace-relative output digests in SQLite; do not ask workers or the main agent to reconstruct or relay this data. Use `tool-runs WORKSPACE` only when a maintainer needs the canonical sanitized JSONL under `WORKSPACE/logs/`. Raw stdout, stderr, environment variables, credentials, signed URLs, private absolute paths, and tool records themselves never enter the portable generated Skill.
 
+## Export evidence bundles
+
+Export evidence only when the user asks for a reproducibility or preservation artifact. The engine assembles and verifies bundles directly from canonical workspace state; no LLM reads, rewrites, or transports their contents.
+
+```bash
+"$V2S_ENGINE" evidence-bundle WORKSPACE --mode compact --output /path/to/course-evidence.v2sbundle
+"$V2S_ENGINE" verify-evidence-bundle /path/to/course-evidence.v2sbundle
+```
+
+A compact bundle is a deterministic shareable evidence derivative, not a generated Skill. It contains sanitized source metadata, canonical semantic/design/review records when present, observations and gaps, selected teaching visuals and contact sheets, sanitized tool-run records, and a content-addressed manifest. It never contains raw video or audio, the workspace database, caches, credentials, host paths, or a rendered generated Skill. Transcript and caption text stays excluded unless the user has explicitly authorized redistribution; only then add `--authorize-transcript-redistribution`. Add `--edition EDITION-NAME` when exporting one named edition's downstream lineage.
+
+An archival bundle is private and sensitive. Use `--mode archival --confirm-private-archival` only after the user deliberately accepts that boundary. It may contain raw media, audio, frames, transcripts, canonical intermediates, and a consistent evidence-database snapshot, but still excludes cookies, credentials, authentication files, caches, locks, task leases, and rendered generated Skills. Keep its mode `0600`, outside the workspace, installed Skill, and ordinary Git history. Bundle mode is independent of `--analysis-depth archival`; neither option implies the other.
+
 ## Generated Skill contract
 
 The portable package and raw workspace must be separate trees. Every generated course Skill contains five fixed root records and at least one authored Markdown artifact. A representative evidence-justified package can contain:

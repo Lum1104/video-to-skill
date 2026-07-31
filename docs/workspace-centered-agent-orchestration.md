@@ -107,6 +107,8 @@ This deliberately replaces the earlier proposal for many phase-specific tables. 
 
 `tool_runs` is a separate engine-owned observability surface, not an agent result channel. Shared subprocess instrumentation and explicit non-subprocess provider wrappers persist one sanitized logical identity with immutable generation-numbered attempts, retained failures, cache reuse, status, timing, tool version, normalized arguments, input SHA-256 values, workspace-relative file digests, and verifiable typed semantic outputs. The main agent never transports these records; `tool-runs WORKSPACE` deterministically creates a no-clobber export under `logs/` in the private raw workspace when needed.
 
+Evidence-bundle assembly follows the same ownership rule. `evidence-bundle` reads canonical files and SQLite directly, synthesizes sanitized metadata and tool records in code, copies only policy-allowed regular files, computes the manifest, writes and verifies a deterministic `.v2sbundle`, and publishes it atomically without sending archive contents through the main agent or another LLM. Compact mode is a shareable allowlist with transcript redistribution disabled by default; confirmed archival mode is a mode-`0600` private preservation artifact with raw evidence but no secrets, caches, task leases, behavior targets, or generated Skill. Neither mode changes Analyze budgets or the generated Skill tree.
+
 Each canonical revision records:
 
 - kind and logical record ID;

@@ -205,24 +205,23 @@ Default. Preserve the complete workspace for later criticism, redesign, or regen
 
 #### Compact portable bundle
 
-Create an optional archive containing:
+`evidence-bundle WORKSPACE --mode compact --output FILE.v2sbundle` creates an optional deterministic shareable archive containing:
 
-- source metadata;
-- captions and normalized transcript when redistribution is appropriate;
+- sanitized source metadata and source/depth/edition lineage;
 - semantic map and relations;
-- selected keyframes and contact sheets;
+- selected teaching visuals and retained contact sheets;
 - observations and gaps;
-- curriculum designs and blueprint;
-- critic and validation reports; and
+- curriculum designs, artifact plans, and available build receipts;
+- critic, behavior, and validation reports; and
 - sanitized tool records.
 
-Do not include complete source video or audio.
+Do not include complete source video or audio, the evidence database, caches, task data, behavior targets, credentials, signed URLs, host paths, or generated Skill files. Captions and normalized transcripts are excluded by default and enter only after explicit redistribution authorization with `--authorize-transcript-redistribution`.
 
 #### Archival local bundle
 
-Create an optional private archive that may additionally include analysis-quality media, audio, all extracted frames, and the evidence database.
+`evidence-bundle WORKSPACE --mode archival --confirm-private-archival --output FILE.v2sbundle` creates an explicitly private archive that may additionally include analysis-quality media, audio, all extracted frames and captions, broader canonical intermediates, and a consistent evidence-database snapshot. It still excludes cookies, credentials, authentication artifacts, caches, locks, temporary files, task leases, behavior targets, and rendered generated Skills; workspace and edition manifests are sanitized before packaging.
 
-The archive is not a normal Skill dependency and is not committed to ordinary Git history.
+Both bundle modes use sorted safe paths, fixed ZIP metadata, SHA-256 and byte sizes for every member, a content-derived identity, no symlinks or special files, self-verification, mode `0600`, and atomic create-only publication outside the source workspace. Existing output is accepted only when byte-for-byte identical, and `verify-evidence-bundle` checks identity, membership, sizes, and checksums without extraction. Bundle retention mode is independent of `analysis_depth`; an archival depth does not authorize archival export or transcript redistribution. An archival bundle is not a normal Skill dependency and is not committed to ordinary Git history.
 
 ## Adaptive analysis depth
 

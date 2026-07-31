@@ -177,6 +177,25 @@ video-to-skill tool-runs ./video_skill_work
 
 The command creates `logs/tool-runs.jsonl` inside the private workspace and reports its SHA-256 digest. It accepts an existing export only when the bytes are identical and never overwrites a different file. Records have stable logical IDs, immutable generation-numbered attempt histories, cache-hit counts, status and duration, tool versions when resolvable, normalized non-secret arguments, input SHA-256 values, workspace-relative file digests, and verified semantic digests for typed ASR, OCR, and vision records. They never contain raw stdout, stderr, environment variables, cookies, authorization values, expiring URLs, or private absolute paths, and they are not copied into generated Skills.
 
+### Export or verify evidence bundles
+
+Create a compact reproducibility bundle outside the workspace:
+
+```bash
+video-to-skill evidence-bundle ./video_skill_work --mode compact --output ./video_skill_work-evidence.v2sbundle
+video-to-skill verify-evidence-bundle ./video_skill_work-evidence.v2sbundle
+```
+
+Compact export is a code-owned allowlist and is independent of generated Skill compilation and `analysis_depth`. It includes sanitized source metadata, available canonical Analyze/design/review records, observations, gaps, selected visual derivatives and contact sheets, build reports, and the deterministic sanitized tool-run JSONL. It omits raw video/audio, SQLite, caches, task data, rendered Skill previews, credentials, signed URLs, and private absolute paths. Transcript and caption content is omitted by default; add `--authorize-transcript-redistribution` only after confirming that redistribution is permitted. Use `--edition EDITION-NAME` to bind the export to that edition's immutable downstream lineage.
+
+Private archival export requires a deliberate acknowledgement:
+
+```bash
+video-to-skill evidence-bundle ./video_skill_work --mode archival --confirm-private-archival --output ./video_skill_work-private.v2sbundle
+```
+
+The archival bundle may include raw media/audio, all retained frames and captions, canonical intermediates, and a consistent SQLite backup for future reanalysis. It still excludes cookies, authentication and credential files, caches, locks, temporary downloads, task leases, rendered behavior targets, and generated Skill files; sanitized workspace and edition metadata never exposes output, project, install, or host paths. The file is created with mode `0600`, must stay outside the workspace and normal Git/Skill distribution, and is never overwritten. Stable ZIP metadata, sorted members, and content digests make unchanged exports byte-identical, while atomic create-only publication makes concurrent writers safe. Verification rejects symlinks, special members, duplicates, traversal names, unexpected members, identity drift, size mismatches, and checksum failures without extracting the bundle.
+
 ### Query bounded evidence
 
 List the course inventory and semantic sections:

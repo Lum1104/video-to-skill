@@ -23,11 +23,17 @@ from video_to_skill.analysis_depth import (
 from video_to_skill.config import Settings, load_settings
 from video_to_skill.coordinator import advance_run, submit_workspace_result
 from video_to_skill.doctor import diagnostics_ok, run_diagnostics
+from video_to_skill.editions import load_edition_state
 from video_to_skill.errors import ProcessingError, VideoToSkillError
 from video_to_skill.evaluation import (
     evaluate_workspace,
     load_labels,
     render_evaluation_report,
+)
+from video_to_skill.evidence_bundles import (
+    EvidenceBundleMode,
+    export_evidence_bundle,
+    verify_evidence_bundle,
 )
 from video_to_skill.installation import (
     SkillHost,
@@ -993,6 +999,90 @@ def tool_runs(
         typer.echo(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
     else:
         typer.echo(f"Tool runs: {report['records']} · {report['path']} · sha256={report['sha256']}")
+
+
+@app.command("evidence-bundle")
+def evidence_bundle(
+    workspace: Annotated[Path, typer.Argument(help="Evidence workspace.")],
+    output: Annotated[
+        Path,
+        typer.Option(
+            "--output",
+            help="Create-only .v2sbundle path outside the evidence workspace.",
+        ),
+    ],
+    mode: Annotated[
+        str,
+        typer.Option("--mode", help="Bundle policy: compact or archival."),
+    ] = EvidenceBundleMode.COMPACT.value,
+    edition: Annotated[
+        str | None,
+        typer.Option("--edition", help="Named edition whose downstream evidence to include."),
+    ] = None,
+    authorize_transcript_redistribution: Annotated[
+        bool,
+        typer.Option(
+            "--authorize-transcript-redistribution",
+            help="Include transcript/caption text in a compact shareable bundle.",
+        ),
+    ] = False,
+    confirm_private_archival: Annotated[
+        bool,
+        typer.Option(
+            "--confirm-private-archival",
+            help="Acknowledge that an archival bundle is private and sensitive.",
+        ),
+    ] = False,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Export deterministic compact or private archival evidence."""
+
+    try:
+        base = Workspace.open(workspace)
+        evidence = base
+        if edition is not None:
+            state = load_edition_state(base, edition)
+            evidence = base.for_edition(state.configuration.edition_id)
+        report = export_evidence_bundle(
+            evidence,
+            output,
+            mode=mode,
+            authorize_transcript_redistribution=authorize_transcript_redistribution,
+            confirm_private_archival=confirm_private_archival,
+        )
+    except VideoToSkillError as exc:
+        typer.echo(f"ERROR: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    if report.warning is not None:
+        typer.echo(report.warning, err=True)
+    if as_json:
+        typer.echo(report.model_dump_json(indent=2))
+    else:
+        typer.echo(
+            f"Evidence bundle: {report.mode.value} · {report.files} files · "
+            f"{report.path} · sha256={report.sha256}"
+        )
+
+
+@app.command("verify-evidence-bundle")
+def verify_bundle(
+    bundle: Annotated[Path, typer.Argument(help="Evidence .v2sbundle file.")],
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Verify an evidence bundle without extracting it."""
+
+    try:
+        report = verify_evidence_bundle(bundle)
+    except VideoToSkillError as exc:
+        typer.echo(f"ERROR: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    if as_json:
+        typer.echo(report.model_dump_json(indent=2))
+    else:
+        typer.echo(
+            f"Verified evidence bundle: {report.bundle_id} · {report.files} files · "
+            f"sha256={report.sha256}"
+        )
 
 
 @app.command()
