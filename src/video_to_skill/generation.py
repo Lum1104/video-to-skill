@@ -1778,6 +1778,12 @@ def _build_id(blueprint: CourseSkillBlueprint) -> str:
     return f"v2s-{hashlib.sha256(encoded).hexdigest()[:20]}"
 
 
+def course_skill_build_id(blueprint: CourseSkillBlueprint) -> str:
+    """Return the stable public build identity for a compiled blueprint."""
+
+    return _build_id(blueprint)
+
+
 def _file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
