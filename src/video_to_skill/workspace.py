@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import secrets
 import sqlite3
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from pathlib import Path
-from typing import Protocol, cast
+from typing import Any, Protocol, cast
 
 from video_to_skill.config import Settings
 from video_to_skill.errors import ProcessingError
@@ -30,9 +32,17 @@ from video_to_skill.models import (
     VisualOrigin,
     WarningRecord,
 )
-from video_to_skill.utils import atomic_write_json, is_within, stable_hash
+from video_to_skill.utils import atomic_write_json, hash_file, is_within, stable_hash
+from video_to_skill.work import (
+    AnalysisRun,
+    CanonicalRecord,
+    WorkItem,
+    WorkLease,
+    WorkRole,
+    WorkState,
+)
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 _AGENT_EVIDENCE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS agent_observations (
@@ -80,6 +90,75 @@ CREATE TABLE IF NOT EXISTS inspection_reports (
 );
 """
 
+_ORCHESTRATION_SCHEMA = """
+CREATE TABLE IF NOT EXISTS analysis_runs (
+    id TEXT PRIMARY KEY,
+    snapshot_digest TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS work_items (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    scope_json TEXT NOT NULL,
+    persona_hint TEXT NOT NULL,
+    packet_path TEXT NOT NULL,
+    packet_digest TEXT NOT NULL,
+    result_schema_path TEXT NOT NULL,
+    snapshot_digest TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('pending', 'leased', 'complete', 'failed')),
+    lease_token_hash TEXT,
+    lease_owner TEXT,
+    lease_expires_at TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    result_path TEXT,
+    result_digest TEXT,
+    failure_reason TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES analysis_runs(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS work_item_run_state
+    ON work_items(run_id, state, created_at);
+CREATE TABLE IF NOT EXISTS work_item_dependencies (
+    task_id TEXT NOT NULL,
+    dependency_id TEXT NOT NULL,
+    PRIMARY KEY (task_id, dependency_id),
+    FOREIGN KEY (task_id) REFERENCES work_items(id) ON DELETE CASCADE,
+    FOREIGN KEY (dependency_id) REFERENCES work_items(id) ON DELETE RESTRICT,
+    CHECK(task_id != dependency_id)
+);
+CREATE TABLE IF NOT EXISTS work_results (
+    task_id TEXT PRIMARY KEY,
+    result_path TEXT NOT NULL,
+    result_digest TEXT NOT NULL,
+    producer_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (task_id) REFERENCES work_items(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS canonical_records (
+    kind TEXT NOT NULL,
+    record_id TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK(revision >= 1),
+    path TEXT NOT NULL,
+    digest TEXT NOT NULL,
+    producer_task_id TEXT NOT NULL,
+    snapshot_digest TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (kind, record_id, revision),
+    FOREIGN KEY (producer_task_id) REFERENCES work_items(id) ON DELETE RESTRICT
+);
+CREATE TABLE IF NOT EXISTS canonical_heads (
+    kind TEXT NOT NULL,
+    record_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    PRIMARY KEY (kind, record_id),
+    FOREIGN KEY (kind, record_id, revision)
+        REFERENCES canonical_records(kind, record_id, revision) ON DELETE RESTRICT
+);
+"""
+
 _SQL_REFERENCE_BATCH_SIZE = 500
 
 
@@ -96,6 +175,8 @@ class Workspace:
         self.database_path = self.root / "evidence.sqlite3"
         self.manifest_path = self.root / "manifest.json"
         self.sources_dir = self.root / "sources"
+        self.analysis_dir = self.root / "analysis"
+        self.tasks_dir = self.analysis_dir / "tasks"
 
     @classmethod
     def create(
@@ -112,6 +193,7 @@ class Workspace:
         workspace = cls(root)
         workspace.root.mkdir(parents=True, exist_ok=True)
         workspace.sources_dir.mkdir(parents=True, exist_ok=True)
+        workspace.tasks_dir.mkdir(parents=True, exist_ok=True)
         workspace._initialize_database()
         if not workspace.manifest_path.exists():
             manifest = JobManifest(
@@ -260,6 +342,7 @@ class Workspace:
             )
             connection.executescript(_AGENT_EVIDENCE_SCHEMA)
             connection.executescript(_INSPECTION_SCHEMA)
+            connection.executescript(_ORCHESTRATION_SCHEMA)
             if existing_version is None:
                 connection.execute(
                     "INSERT INTO metadata(key, value) VALUES('schema_version', ?)",
@@ -324,6 +407,8 @@ class Workspace:
                 ON visual_events(source_id, origin, timestamp)
                 """
             )
+        if version < 5:
+            connection.executescript(_ORCHESTRATION_SCHEMA)
         connection.execute(
             "UPDATE metadata SET value=? WHERE key='schema_version'",
             (str(SCHEMA_VERSION),),
@@ -359,6 +444,445 @@ class Workspace:
     def save_manifest(self, manifest: JobManifest) -> None:
         manifest.updated_at = datetime.now(UTC)
         atomic_write_json(self.manifest_path, manifest)
+
+    def workspace_snapshot_digest(self) -> str:
+        """Return a compact identity for task inputs without loading evidence bodies."""
+
+        manifest = self.load_manifest()
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, active, content_hash, updated_at
+                FROM sources
+                ORDER BY ordinal, id
+                """
+            ).fetchall()
+            stage_rows = connection.execute(
+                """
+                SELECT source_id, stage, state, cache_key, completed_at
+                FROM stages
+                ORDER BY source_id, stage
+                """
+            ).fetchall()
+        return stable_hash(
+            {
+                "job_id": manifest.job_id,
+                "configuration": manifest.configuration_hash,
+                "sources": [dict(row) for row in rows],
+                "stages": [dict(row) for row in stage_rows],
+            }
+        )
+
+    def create_analysis_run(self, snapshot_digest: str | None = None) -> AnalysisRun:
+        snapshot = snapshot_digest or self.workspace_snapshot_digest()
+        run_id = f"run-{stable_hash({'job': self.load_manifest().job_id, 'snapshot': snapshot}, length=24)}"
+        now = datetime.now(UTC)
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO analysis_runs(id, snapshot_digest, created_at, updated_at)
+                VALUES(?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET updated_at=excluded.updated_at
+                """,
+                (run_id, snapshot, now.isoformat(), now.isoformat()),
+            )
+            row = connection.execute(
+                "SELECT * FROM analysis_runs WHERE id=?",
+                (run_id,),
+            ).fetchone()
+        assert row is not None
+        return AnalysisRun(
+            id=str(row["id"]),
+            snapshot_digest=str(row["snapshot_digest"]),
+            created_at=datetime.fromisoformat(str(row["created_at"])),
+            updated_at=datetime.fromisoformat(str(row["updated_at"])),
+        )
+
+    @staticmethod
+    def _row_to_work_item(
+        row: sqlite3.Row,
+        dependencies: list[str],
+    ) -> WorkItem:
+        return WorkItem(
+            id=str(row["id"]),
+            run_id=str(row["run_id"]),
+            role=WorkRole(str(row["role"])),
+            scope=json.loads(str(row["scope_json"])),
+            persona_hint=str(row["persona_hint"]),
+            packet_path=Path(str(row["packet_path"])),
+            packet_digest=str(row["packet_digest"]),
+            result_schema_path=Path(str(row["result_schema_path"])),
+            snapshot_digest=str(row["snapshot_digest"]),
+            state=WorkState(str(row["state"])),
+            dependencies=dependencies,
+            lease_owner=cast(str | None, row["lease_owner"]),
+            lease_expires_at=(
+                datetime.fromisoformat(str(row["lease_expires_at"]))
+                if row["lease_expires_at"]
+                else None
+            ),
+            attempt_count=int(row["attempt_count"]),
+            result_path=Path(str(row["result_path"])) if row["result_path"] else None,
+            result_digest=cast(str | None, row["result_digest"]),
+            failure_reason=cast(str | None, row["failure_reason"]),
+            created_at=datetime.fromisoformat(str(row["created_at"])),
+            updated_at=datetime.fromisoformat(str(row["updated_at"])),
+        )
+
+    def get_work_item(self, task_id: str) -> WorkItem:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM work_items WHERE id=?",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                raise ProcessingError(f"Unknown workspace task: {task_id}")
+            dependencies = [
+                str(item["dependency_id"])
+                for item in connection.execute(
+                    """
+                    SELECT dependency_id
+                    FROM work_item_dependencies
+                    WHERE task_id=?
+                    ORDER BY dependency_id
+                    """,
+                    (task_id,),
+                ).fetchall()
+            ]
+        return self._row_to_work_item(row, dependencies)
+
+    def ensure_work_item(
+        self,
+        *,
+        run_id: str,
+        role: WorkRole,
+        scope: dict[str, Any],
+        persona_hint: str,
+        packet: dict[str, Any],
+        result_schema: dict[str, Any],
+        dependencies: Iterable[str] = (),
+        snapshot_digest: str | None = None,
+    ) -> WorkItem:
+        dependency_ids = sorted(set(dependencies))
+        snapshot = snapshot_digest or self.workspace_snapshot_digest()
+        task_id = f"task-{role.value}-{stable_hash({'run': run_id, 'role': role, 'scope': scope, 'dependencies': dependency_ids, 'snapshot': snapshot}, length=20)}"
+        task_directory = self.tasks_dir / task_id
+        packet_path = task_directory / "packet.json"
+        result_schema_path = task_directory / "result-schema.json"
+        output_directory = task_directory / "output"
+        task_directory.mkdir(parents=True, exist_ok=True)
+        output_directory.mkdir(parents=True, exist_ok=True)
+        if any(path.is_symlink() for path in (task_directory, output_directory)):
+            raise ProcessingError(f"Task directory cannot be a symlink: {task_directory}")
+        packet_payload = {
+            "task_id": task_id,
+            "run_id": run_id,
+            "role": role.value,
+            "scope": scope,
+            "snapshot_digest": snapshot,
+            "dependencies": dependency_ids,
+            "output_directory": str(output_directory),
+            "payload": packet,
+        }
+        schema_payload = {
+            "task_id": task_id,
+            "role": role.value,
+            "snapshot_digest": snapshot,
+            "schema": result_schema,
+        }
+        packet_digest = stable_hash(packet_payload, length=64)
+        atomic_write_json(packet_path, packet_payload)
+        atomic_write_json(result_schema_path, schema_payload)
+        now = datetime.now(UTC)
+        with self.connect() as connection:
+            if (
+                connection.execute(
+                    "SELECT 1 FROM analysis_runs WHERE id=?",
+                    (run_id,),
+                ).fetchone()
+                is None
+            ):
+                raise ProcessingError(f"Unknown analysis run: {run_id}")
+            missing_dependencies = [
+                dependency
+                for dependency in dependency_ids
+                if connection.execute(
+                    "SELECT 1 FROM work_items WHERE id=? AND run_id=?",
+                    (dependency, run_id),
+                ).fetchone()
+                is None
+            ]
+            if missing_dependencies:
+                raise ProcessingError(
+                    "Task dependencies are unknown or belong to another run: "
+                    + ", ".join(missing_dependencies)
+                )
+            connection.execute(
+                """
+                INSERT INTO work_items(
+                    id, run_id, role, scope_json, persona_hint, packet_path,
+                    packet_digest, result_schema_path, snapshot_digest, state,
+                    created_at, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                ON CONFLICT(id) DO NOTHING
+                """,
+                (
+                    task_id,
+                    run_id,
+                    role.value,
+                    json.dumps(scope, ensure_ascii=False, sort_keys=True),
+                    " ".join(persona_hint.split()),
+                    str(packet_path.relative_to(self.root)),
+                    packet_digest,
+                    str(result_schema_path.relative_to(self.root)),
+                    snapshot,
+                    now.isoformat(),
+                    now.isoformat(),
+                ),
+            )
+            for dependency in dependency_ids:
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO work_item_dependencies(task_id, dependency_id)
+                    VALUES(?, ?)
+                    """,
+                    (task_id, dependency),
+                )
+        atomic_write_json(
+            task_directory / "task.json",
+            {
+                "task_id": task_id,
+                "role": role.value,
+                "persona_hint": " ".join(persona_hint.split()),
+                "packet_path": str(packet_path),
+                "result_schema_path": str(result_schema_path),
+                "output_directory": str(output_directory),
+            },
+        )
+        return self.get_work_item(task_id)
+
+    def ready_work_items(self, run_id: str, *, role: WorkRole | None = None) -> list[WorkItem]:
+        now = datetime.now(UTC).isoformat()
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE work_items
+                SET state='pending', lease_token_hash=NULL, lease_owner=NULL,
+                    lease_expires_at=NULL, updated_at=?
+                WHERE run_id=? AND state='leased' AND lease_expires_at <= ?
+                """,
+                (now, run_id, now),
+            )
+            parameters: list[object] = [run_id]
+            role_clause = ""
+            if role is not None:
+                role_clause = "AND item.role=?"
+                parameters.append(role.value)
+            rows = connection.execute(
+                f"""
+                SELECT item.*
+                FROM work_items AS item
+                WHERE item.run_id=? AND item.state='pending' {role_clause}
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM work_item_dependencies AS dependency
+                    JOIN work_items AS prerequisite
+                      ON prerequisite.id=dependency.dependency_id
+                    WHERE dependency.task_id=item.id
+                      AND prerequisite.state!='complete'
+                  )
+                ORDER BY item.created_at, item.id
+                """,
+                parameters,
+            ).fetchall()
+            result: list[WorkItem] = []
+            for row in rows:
+                dependencies = [
+                    str(item["dependency_id"])
+                    for item in connection.execute(
+                        """
+                        SELECT dependency_id FROM work_item_dependencies
+                        WHERE task_id=? ORDER BY dependency_id
+                        """,
+                        (row["id"],),
+                    ).fetchall()
+                ]
+                result.append(self._row_to_work_item(row, dependencies))
+        return result
+
+    def lease_work_item(
+        self,
+        task_id: str,
+        *,
+        owner: str,
+        lease_seconds: int = 3600,
+    ) -> WorkLease:
+        if lease_seconds < 1:
+            raise ProcessingError("Task lease duration must be positive")
+        token = secrets.token_urlsafe(32)
+        token_hash = sha256(token.encode("utf-8")).hexdigest()
+        now = datetime.now(UTC)
+        expires = now + timedelta(seconds=lease_seconds)
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT run_id, state, lease_expires_at FROM work_items WHERE id=?",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                raise ProcessingError(f"Unknown workspace task: {task_id}")
+            if row["state"] == WorkState.LEASED.value and (
+                row["lease_expires_at"] is None
+                or datetime.fromisoformat(str(row["lease_expires_at"])) > now
+            ):
+                raise ProcessingError(f"Task is already leased: {task_id}")
+            if row["state"] not in {WorkState.PENDING.value, WorkState.LEASED.value}:
+                raise ProcessingError(f"Task cannot be leased from state {row['state']}: {task_id}")
+            blocked = connection.execute(
+                """
+                SELECT 1
+                FROM work_item_dependencies AS dependency
+                JOIN work_items AS prerequisite ON prerequisite.id=dependency.dependency_id
+                WHERE dependency.task_id=? AND prerequisite.state!='complete'
+                LIMIT 1
+                """,
+                (task_id,),
+            ).fetchone()
+            if blocked is not None:
+                raise ProcessingError(f"Task dependencies are incomplete: {task_id}")
+            connection.execute(
+                """
+                UPDATE work_items
+                SET state='leased', lease_token_hash=?, lease_owner=?,
+                    lease_expires_at=?, attempt_count=attempt_count + 1, updated_at=?
+                WHERE id=?
+                """,
+                (token_hash, owner, expires.isoformat(), now.isoformat(), task_id),
+            )
+        task_directory = self.tasks_dir / task_id
+        atomic_write_json(
+            task_directory / "lease.json",
+            {
+                "task_id": task_id,
+                "lease_token": token,
+                "owner": owner,
+                "expires_at": expires.isoformat(),
+            },
+        )
+        return WorkLease(
+            item=self.get_work_item(task_id),
+            token=token,
+            output_directory=task_directory / "output",
+        )
+
+    def fail_work_item(self, task_id: str, reason: str) -> WorkItem:
+        now = datetime.now(UTC).isoformat()
+        with self.connect() as connection:
+            updated = connection.execute(
+                """
+                UPDATE work_items
+                SET state='failed', failure_reason=?, lease_token_hash=NULL,
+                    lease_owner=NULL, lease_expires_at=NULL, updated_at=?
+                WHERE id=? AND state IN ('pending', 'leased')
+                """,
+                (" ".join(reason.split())[:2000], now, task_id),
+            ).rowcount
+            if updated != 1:
+                raise ProcessingError(f"Task cannot be failed from its current state: {task_id}")
+        return self.get_work_item(task_id)
+
+    def publish_canonical_record(
+        self,
+        *,
+        kind: str,
+        record_id: str,
+        source_path: Path,
+        producer_task_id: str,
+        snapshot_digest: str,
+    ) -> CanonicalRecord:
+        source = source_path.resolve()
+        if not source.is_file() or source.is_symlink() or not is_within(source, self.root):
+            raise ProcessingError("Canonical record source must be a regular workspace file")
+        digest = hash_file(source)
+        now = datetime.now(UTC)
+        with self.connect() as connection:
+            task = connection.execute(
+                "SELECT state FROM work_items WHERE id=?",
+                (producer_task_id,),
+            ).fetchone()
+            if task is None:
+                raise ProcessingError(f"Unknown producer task: {producer_task_id}")
+            head = connection.execute(
+                """
+                SELECT revision FROM canonical_heads
+                WHERE kind=? AND record_id=?
+                """,
+                (kind, record_id),
+            ).fetchone()
+            revision = (int(head["revision"]) + 1) if head is not None else 1
+            relative = source.relative_to(self.root)
+            connection.execute(
+                """
+                INSERT INTO canonical_records(
+                    kind, record_id, revision, path, digest, producer_task_id,
+                    snapshot_digest, created_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    kind,
+                    record_id,
+                    revision,
+                    str(relative),
+                    digest,
+                    producer_task_id,
+                    snapshot_digest,
+                    now.isoformat(),
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO canonical_heads(kind, record_id, revision)
+                VALUES(?, ?, ?)
+                ON CONFLICT(kind, record_id) DO UPDATE SET revision=excluded.revision
+                """,
+                (kind, record_id, revision),
+            )
+        return CanonicalRecord(
+            kind=kind,
+            record_id=record_id,
+            revision=revision,
+            path=relative,
+            digest=digest,
+            producer_task_id=producer_task_id,
+            snapshot_digest=snapshot_digest,
+            created_at=now,
+        )
+
+    def canonical_record(self, kind: str, record_id: str = "default") -> CanonicalRecord | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT record.*
+                FROM canonical_heads AS head
+                JOIN canonical_records AS record
+                  ON record.kind=head.kind
+                 AND record.record_id=head.record_id
+                 AND record.revision=head.revision
+                WHERE head.kind=? AND head.record_id=?
+                """,
+                (kind, record_id),
+            ).fetchone()
+        if row is None:
+            return None
+        return CanonicalRecord(
+            kind=str(row["kind"]),
+            record_id=str(row["record_id"]),
+            revision=int(row["revision"]),
+            path=Path(str(row["path"])),
+            digest=str(row["digest"]),
+            producer_task_id=str(row["producer_task_id"]),
+            snapshot_digest=str(row["snapshot_digest"]),
+            created_at=datetime.fromisoformat(str(row["created_at"])),
+        )
 
     def set_job_state(
         self,

@@ -20,7 +20,7 @@ from video_to_skill.models import (
     VisualOrigin,
     WarningRecord,
 )
-from video_to_skill.workspace import Workspace
+from video_to_skill.workspace import SCHEMA_VERSION, Workspace
 
 
 def test_workspace_roundtrip_and_fts(tmp_path: Path) -> None:
@@ -315,5 +315,5 @@ def test_v2_workspace_migrates_source_tombstones_and_visual_origins(tmp_path: Pa
         ).fetchone()["value"]
     assert {"active", "removed_at", "removal_reason"} <= source_columns
     assert "origin" in visual_columns
-    assert version == "4"
+    assert version == str(SCHEMA_VERSION)
     assert migrated.get_source(source.id) == source
