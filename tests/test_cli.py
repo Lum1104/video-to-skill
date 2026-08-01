@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import pytest
+from click import unstyle
 from typer.testing import CliRunner
 
 from video_to_skill.cli import app
@@ -245,23 +246,37 @@ def test_cli_exposes_workspace_protocol_without_legacy_authoring_commands() -> N
     assert result.stdout.strip()
 
 
-def test_run_and_extract_explain_distinct_source_and_output_languages() -> None:
+def test_run_and_extract_explain_distinct_source_and_output_languages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    monkeypatch.delenv("NO_COLOR", raising=False)
+
     for command in ("run", "extract"):
-        result = runner.invoke(app, [command, "--help"])
+        result = runner.invoke(app, [command, "--help"], color=True)
         assert result.exit_code == 0, result.output
-        assert "--output-language" in result.output
-        assert "caption/ASR" in result.output
-        assert "artifact language" in result.output
+        visible_output = unstyle(result.output)
+        assert "--output-language" in visible_output
+        assert "caption/ASR" in visible_output
+        assert "artifact language" in visible_output
 
 
-def test_inspect_extract_and_run_expose_one_analysis_depth_option() -> None:
+def test_inspect_extract_and_run_expose_one_analysis_depth_option(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    monkeypatch.delenv("NO_COLOR", raising=False)
+
     for command in ("inspect", "extract", "run"):
-        result = runner.invoke(app, [command, "--help"])
+        result = runner.invoke(app, [command, "--help"], color=True)
         assert result.exit_code == 0, result.output
-        assert "--analysis-depth" in result.output
-        assert "standard" in result.output
-        assert "deep" in result.output
-        assert "archival" in result.output
+        visible_output = unstyle(result.output)
+        assert "--analysis-depth" in visible_output
+        assert "standard" in visible_output
+        assert "deep" in visible_output
+        assert "archival" in visible_output
 
 
 @pytest.mark.parametrize("depth", ["standard", "deep", "archival"])
