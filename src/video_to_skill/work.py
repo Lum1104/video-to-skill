@@ -31,6 +31,7 @@ class WorkState(StrEnum):
 class AnalysisRun(WorkModel):
     id: str
     snapshot_digest: str
+    edition_id: str | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -49,6 +50,7 @@ class WorkItem(WorkModel):
     dependencies: list[str] = Field(default_factory=list)
     lease_owner: str | None = None
     lease_expires_at: datetime | None = None
+    execution_context_id: str | None = None
     attempt_count: int = Field(default=0, ge=0)
     result_path: Path | None = None
     result_digest: str | None = None
@@ -60,6 +62,7 @@ class WorkItem(WorkModel):
 class WorkLease(WorkModel):
     item: WorkItem
     token: str
+    execution_context_id: str
     output_directory: Path
 
 

@@ -8,6 +8,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from video_to_skill.config import normalize_concrete_language
 from video_to_skill.generation import (
     CapabilityLevel,
     CapabilityProfile,
@@ -15,6 +16,7 @@ from video_to_skill.generation import (
     CourseInteraction,
     CourseSkillClaim,
     CurriculumDesign,
+    CurriculumKind,
     SemanticRelation,
     SemanticUnit,
     SkillMode,
@@ -132,6 +134,106 @@ class AnalyzeResult(OrchestrationModel):
         ):
             raise ValueError("material semantic units are not fully accounted for")
         return self
+
+
+class CurriculumPlanPath(OrchestrationModel):
+    id: str = Field(min_length=1, max_length=160)
+    title: str = Field(min_length=1, max_length=300)
+    kind: CurriculumKind
+    use_when: str = Field(min_length=1, max_length=500)
+    unit_sequence: list[str] = Field(min_length=1)
+
+    @field_validator("id", "title", "use_when")
+    @classmethod
+    def compact_text(cls, value: str) -> str:
+        compact = " ".join(value.split())
+        if not compact:
+            raise ValueError("curriculum plan path text cannot be blank")
+        return compact
+
+    @field_validator("unit_sequence")
+    @classmethod
+    def unique_unit_sequence(cls, value: list[str]) -> list[str]:
+        compact = [" ".join(item.split()) for item in value]
+        if not all(compact) or len(compact) != len(set(compact)):
+            raise ValueError("curriculum plan unit sequence must contain unique non-empty ids")
+        return compact
+
+
+class CurriculumPlan(OrchestrationModel):
+    recommended_path_id: str = Field(min_length=1, max_length=160)
+    rationale: str = Field(min_length=1, max_length=1200)
+    paths: list[CurriculumPlanPath] = Field(min_length=1, max_length=3)
+    decision_required: bool = False
+    decision_summary: str | None = Field(default=None, min_length=1, max_length=1200)
+
+    @field_validator("recommended_path_id", "rationale")
+    @classmethod
+    def compact_text(cls, value: str) -> str:
+        compact = " ".join(value.split())
+        if not compact:
+            raise ValueError("curriculum plan text cannot be blank")
+        return compact
+
+    @field_validator("decision_summary")
+    @classmethod
+    def compact_optional_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        compact = " ".join(value.split())
+        if not compact:
+            raise ValueError("curriculum decision summary cannot be blank")
+        return compact
+
+    @model_validator(mode="after")
+    def coherent_paths(self) -> CurriculumPlan:
+        path_ids = [path.id for path in self.paths]
+        if len(path_ids) != len(set(path_ids)):
+            raise ValueError("curriculum plan path ids must be unique")
+        known_paths = set(path_ids)
+        if self.recommended_path_id not in known_paths:
+            raise ValueError("recommended_path_id must identify a curriculum plan path")
+        recommended = next(path for path in self.paths if path.id == self.recommended_path_id)
+        if recommended.kind != "thematic":
+            raise ValueError("the recommended curriculum plan path must be thematic")
+        if self.decision_required != (self.decision_summary is not None):
+            raise ValueError("material curriculum decisions require a concise decision summary")
+        if self.decision_required and len(self.paths) < 2:
+            raise ValueError("material curriculum decisions require at least two paths")
+        signatures = {(path.kind, tuple(path.unit_sequence)) for path in self.paths}
+        if len(self.paths) > 1 and len(signatures) != len(self.paths):
+            raise ValueError("curriculum options must differ in kind or unit sequence")
+        return self
+
+
+class CurriculumPlanResult(OrchestrationModel):
+    schema_version: Literal[1] = 1
+    task_id: str
+    lease_token: str = Field(min_length=20)
+    snapshot_digest: str
+    producer: ObservationProducer
+    artifact_language: str = Field(min_length=2, max_length=80)
+    curriculum: CurriculumPlan
+
+    @field_validator("artifact_language")
+    @classmethod
+    def concrete_artifact_language(cls, value: str) -> str:
+        return normalize_concrete_language(value)
+
+
+class CurriculumSelection(OrchestrationModel):
+    schema_version: Literal[1] = 1
+    curriculum_plan_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    selected_path_id: str = Field(min_length=1, max_length=160)
+    source: Literal["recommended", "user", "edition"]
+
+    @field_validator("selected_path_id")
+    @classmethod
+    def compact_selected_path_id(cls, value: str) -> str:
+        compact = " ".join(value.split())
+        if not compact:
+            raise ValueError("selected curriculum path id cannot be blank")
+        return compact
 
 
 AffordanceKind = Literal[
@@ -369,10 +471,15 @@ class AuthorResult(OrchestrationModel):
     curriculum_decision_required: bool = False
     curriculum_decision_summary: str | None = Field(default=None, max_length=1200)
 
-    @field_validator("title", "description", "scope", "artifact_language")
+    @field_validator("title", "description", "scope")
     @classmethod
     def compact_text(cls, value: str) -> str:
         return " ".join(value.split())
+
+    @field_validator("artifact_language")
+    @classmethod
+    def concrete_artifact_language(cls, value: str) -> str:
+        return normalize_concrete_language(value)
 
     @model_validator(mode="after")
     def coherent_authoring(self) -> AuthorResult:
@@ -478,6 +585,8 @@ ReviewCategory = Literal[
 ]
 ReviewSeverity = Literal["info", "warning", "error"]
 ReviewVerdict = Literal["pass", "fail"]
+BehaviorScenarioCategory = Literal["interaction", "content-pressure"]
+BehaviorApplicability = Literal["required", "not-applicable"]
 
 
 class ReviewFinding(OrchestrationModel):
@@ -497,28 +606,199 @@ class ReviewFinding(OrchestrationModel):
         return self
 
 
+class BehaviorScenario(OrchestrationModel):
+    """One deterministic catalog entry materialized for a canonical Skill snapshot."""
+
+    id: str = Field(
+        min_length=1,
+        max_length=160,
+        pattern=r"^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+    )
+    category: BehaviorScenarioCategory
+    prompt: str = Field(max_length=4000)
+    expected_behavior: str = Field(min_length=1, max_length=2400)
+    applicability: BehaviorApplicability
+    applicability_reason: str = Field(min_length=1, max_length=1200)
+    semantic_unit_ids: list[str] = Field(default_factory=list, max_length=12)
+    scenario_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+    @field_validator("semantic_unit_ids")
+    @classmethod
+    def unique_scenario_units(cls, value: list[str]) -> list[str]:
+        if len(value) != len(set(value)):
+            raise ValueError("behavior scenario semantic unit ids must be unique")
+        return value
+
+    @model_validator(mode="after")
+    def coherent_empty_prompt(self) -> BehaviorScenario:
+        if not self.prompt and self.id != "interaction.empty-invocation":
+            raise ValueError("only empty invocation may use an empty behavior prompt")
+        return self
+
+
+class BehaviorTurn(OrchestrationModel):
+    role: Literal["user", "assistant"]
+    content: str = Field(max_length=32_000)
+
+
+class BehaviorArtifactAccess(OrchestrationModel):
+    path: str = Field(min_length=1, max_length=500)
+    sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    reason: str = Field(min_length=1, max_length=800)
+
+    @field_validator("path")
+    @classmethod
+    def safe_relative_path(cls, value: str) -> str:
+        path = PurePosixPath(value)
+        if path.is_absolute() or ".." in path.parts or "\\" in value:
+            raise ValueError("behavior artifact access must use a safe relative POSIX path")
+        return path.as_posix()
+
+
+class BehaviorSideEffect(OrchestrationModel):
+    kind: Literal["command", "file-create", "project-inspection", "network", "other"]
+    detail: str = Field(min_length=1, max_length=1200)
+
+
+class BehaviorTrialResult(OrchestrationModel):
+    """Raw, non-judgmental evidence from one host-dispatched fresh context."""
+
+    schema_version: Literal[2] = 2
+    task_id: str
+    lease_token: str = Field(min_length=20)
+    execution_context_id: str = Field(pattern=r"^ctx-[A-Za-z0-9_-]{20,}$")
+    snapshot_digest: str
+    producer: ObservationProducer
+    scenario_id: str
+    scenario_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    target_content_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    turns: list[BehaviorTurn] = Field(min_length=2, max_length=2)
+    artifact_accesses: list[BehaviorArtifactAccess] = Field(min_length=1, max_length=100)
+    side_effects: list[BehaviorSideEffect] = Field(default_factory=list, max_length=40)
+    notes: str | None = Field(default=None, max_length=2400)
+
+    @model_validator(mode="after")
+    def fresh_bounded_exchange(self) -> BehaviorTrialResult:
+        if [turn.role for turn in self.turns] != ["user", "assistant"]:
+            raise ValueError("behavior trials require exactly one user turn and one assistant turn")
+        paths = [access.path for access in self.artifact_accesses]
+        if len(paths) != len(set(paths)):
+            raise ValueError("behavior trial artifact accesses must be unique")
+        if "SKILL.md" not in set(paths):
+            raise ValueError("behavior trials must inspect the rendered resident SKILL.md")
+        return self
+
+
 class BehaviorCheck(OrchestrationModel):
+    """Independent judgment bound to one exact catalog scenario and raw trial."""
+
     id: str = Field(min_length=1, max_length=160)
-    scenario: str = Field(min_length=1, max_length=800)
-    passed: bool
+    category: BehaviorScenarioCategory
+    prompt: str = Field(max_length=4000)
+    expected_behavior: str = Field(min_length=1, max_length=2400)
+    applicability: BehaviorApplicability
+    applicability_reason: str = Field(min_length=1, max_length=1200)
+    semantic_unit_ids: list[str] = Field(default_factory=list, max_length=12)
+    scenario_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    passed: bool | None
+    trial_task_id: str | None = None
+    trial_result_digest: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    target_content_digest: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    evidence_turn_indices: list[int] = Field(default_factory=list, max_length=2)
     summary: str = Field(min_length=1, max_length=1200)
+
+    @field_validator("semantic_unit_ids", "evidence_turn_indices")
+    @classmethod
+    def unique_check_lists(cls, value: list[str] | list[int]) -> list[str] | list[int]:
+        if len(value) != len(set(value)):
+            raise ValueError("behavior check references must be unique")
+        return value
+
+    @model_validator(mode="after")
+    def coherent_applicability(self) -> BehaviorCheck:
+        trial_values = (
+            self.trial_task_id,
+            self.trial_result_digest,
+            self.target_content_digest,
+        )
+        if self.applicability == "required":
+            if self.passed is None or not all(trial_values) or not self.evidence_turn_indices:
+                raise ValueError("applicable behavior checks require a verdict and trial evidence")
+            if any(index not in {0, 1} for index in self.evidence_turn_indices):
+                raise ValueError("behavior evidence turn indices are outside the bounded trial")
+        elif self.passed is not None or any(trial_values) or self.evidence_turn_indices:
+            raise ValueError("not-applicable behavior checks cannot claim trial evidence")
+        return self
+
+
+class CriticReport(OrchestrationModel):
+    schema_version: Literal[2] = 2
+    review_task_id: str
+    verdict: ReviewVerdict
+    reviewed_snapshot_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    target_build_id: str = Field(min_length=1, max_length=80)
+    target_content_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    repair_cycle: int = Field(ge=0)
+    findings: list[ReviewFinding] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def coherent_critic_verdict(self) -> CriticReport:
+        has_errors = any(finding.severity == "error" for finding in self.findings)
+        if self.verdict == "pass" and has_errors:
+            raise ValueError("passing critic reports cannot retain blocking findings")
+        return self
+
+
+class BehaviorReport(OrchestrationModel):
+    schema_version: Literal[2] = 2
+    review_task_id: str
+    reviewed_snapshot_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    catalog_version: str = Field(min_length=1, max_length=120)
+    catalog_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    target_build_id: str = Field(min_length=1, max_length=80)
+    target_content_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    passed: bool
+    checks: list[BehaviorCheck] = Field(min_length=1, max_length=32)
+
+    @model_validator(mode="after")
+    def coherent_report(self) -> BehaviorReport:
+        ids = [check.id for check in self.checks]
+        if len(ids) != len(set(ids)):
+            raise ValueError("behavior report scenarios must be accounted for exactly once")
+        actual_pass = all(check.passed is not False for check in self.checks)
+        if self.passed != actual_pass:
+            raise ValueError("behavior report passed flag must match its scenario verdicts")
+        return self
 
 
 class ReviewResult(OrchestrationModel):
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     task_id: str
     lease_token: str = Field(min_length=20)
+    execution_context_id: str = Field(pattern=r"^ctx-[A-Za-z0-9_-]{20,}$")
     snapshot_digest: str
     reviewed_snapshot_digest: str
     producer: ObservationProducer
+    catalog_version: str = Field(min_length=1, max_length=120)
+    catalog_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    target_build_id: str = Field(min_length=1, max_length=80)
+    target_content_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
     verdict: ReviewVerdict
     findings: list[ReviewFinding] = Field(default_factory=list)
-    behavior_checks: list[BehaviorCheck] = Field(min_length=1)
+    behavior_checks: list[BehaviorCheck] = Field(min_length=1, max_length=32)
 
     @model_validator(mode="after")
     def coherent_verdict(self) -> ReviewResult:
+        scenario_ids = [check.id for check in self.behavior_checks]
+        if len(scenario_ids) != len(set(scenario_ids)):
+            raise ValueError("behavior scenarios must be judged exactly once")
+        trial_ids = [
+            check.trial_task_id for check in self.behavior_checks if check.trial_task_id is not None
+        ]
+        if len(trial_ids) != len(set(trial_ids)):
+            raise ValueError("each behavior scenario requires a distinct fresh-context trial")
         has_errors = any(finding.severity == "error" for finding in self.findings)
-        failed_behavior = any(not check.passed for check in self.behavior_checks)
+        failed_behavior = any(check.passed is False for check in self.behavior_checks)
         if self.verdict == "pass" and (has_errors or failed_behavior):
             raise ValueError("passing reviews cannot retain errors or failed behavior checks")
         if self.verdict == "fail" and not (has_errors or failed_behavior):
@@ -545,6 +825,8 @@ class RunAction(OrchestrationModel):
 class RunEnvelope(OrchestrationModel):
     status: RunStatus
     workspace: Path
+    edition_id: str | None = None
+    edition_name: str | None = None
     actions: list[RunAction] = Field(default_factory=list)
     completion: dict[str, object] | None = None
 

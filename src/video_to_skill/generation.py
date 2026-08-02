@@ -24,6 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from pydantic import ValidationError as PydanticValidationError
 
 from video_to_skill import __version__
+from video_to_skill.config import normalize_concrete_language
 from video_to_skill.errors import ProcessingError
 from video_to_skill.models import JobState, SourceDescriptor
 from video_to_skill.url_security import UrlParameterLimitError, has_sensitive_url_parameters
@@ -33,6 +34,7 @@ if TYPE_CHECKING:
     from video_to_skill.workspace import Workspace
 
 COURSE_SKILL_MARKER = "<!-- video-to-skill:course-skill:v2 -->"
+COURSE_SKILL_RENDERER_CONTRACT_VERSION = 1
 _SKILL_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _MARKDOWN_TARGET_RE = re.compile(r"!?\[[^\]]*]\(([^)]+)\)")
 _ROOT_ARTIFACTS = {
@@ -690,6 +692,25 @@ class CourseInteraction(GenerationModel):
         return compact
 
 
+class CourseSkillEditionLineage(GenerationModel):
+    """Portable, path-free proof that a build reused one immutable Analyze lineage."""
+
+    edition_id: str = Field(pattern=r"^edition-[a-f0-9]{20}$")
+    edition_name: str = Field(min_length=1, max_length=64)
+    config_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    analysis_lineage_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    analyze_task_id: str = Field(min_length=1)
+    analysis_snapshot_digest: str = Field(min_length=1)
+    source_snapshot_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    analysis_depth_contract_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    canonical_analyze_digests: dict[str, str]
+    curriculum_source_edition: str | None = None
+    source_curriculum_plan_digest: str | None = None
+    requested_curriculum_path_id: str | None = None
+    identity_family_id: str = Field(pattern=r"^identity-[a-f0-9]{20}$")
+    identity_drift_justification: str | None = None
+
+
 class CourseSkillBlueprint(GenerationModel):
     """The semantic handoff between the generator agent and package renderer."""
 
@@ -712,6 +733,7 @@ class CourseSkillBlueprint(GenerationModel):
     coverage_ledger: CourseCoverageLedger | None = None
     claims: list[CourseSkillClaim] = Field(min_length=1)
     limitations: list[str] = Field(default_factory=list, max_length=30)
+    edition_lineage: CourseSkillEditionLineage | None = None
     parent_build_id: str | None = Field(
         default=None,
         pattern=r"^v2s-[a-f0-9]{20}$",
@@ -724,10 +746,15 @@ class CourseSkillBlueprint(GenerationModel):
             raise ValueError("skill name must use lowercase letters, digits, and hyphens")
         return value
 
-    @field_validator("title", "description", "scope", "artifact_language")
+    @field_validator("title", "description", "scope")
     @classmethod
     def compact_text(cls, value: str) -> str:
         return _compact_required(value)
+
+    @field_validator("artifact_language")
+    @classmethod
+    def concrete_artifact_language(cls, value: str) -> str:
+        return normalize_concrete_language(value)
 
     @field_validator("prerequisites", "limitations")
     @classmethod
@@ -1852,7 +1879,10 @@ def _public_blueprint_payload(blueprint: CourseSkillBlueprint) -> dict[str, obje
 
 
 def _build_id(blueprint: CourseSkillBlueprint) -> str:
-    payload = _public_blueprint_payload(blueprint)
+    payload = {
+        "renderer_contract_version": COURSE_SKILL_RENDERER_CONTRACT_VERSION,
+        "blueprint": _public_blueprint_payload(blueprint),
+    }
     encoded = json.dumps(
         payload,
         ensure_ascii=False,
@@ -1902,9 +1932,15 @@ def build_manifest_payload(
         "schema_version": 2,
         "build_id": _build_id(blueprint),
         "parent_build_id": blueprint.parent_build_id,
+        "edition_lineage": (
+            blueprint.edition_lineage.model_dump(mode="json", exclude_none=True)
+            if blueprint.edition_lineage is not None
+            else None
+        ),
         "generator": {
             "name": "video-to-skill",
             "version": __version__,
+            "renderer_contract_version": COURSE_SKILL_RENDERER_CONTRACT_VERSION,
         },
         "artifact_language": blueprint.artifact_language,
         "curriculum": {
@@ -1930,23 +1966,29 @@ def _overlaps(left: Path, right: Path) -> bool:
     return left == right or left.is_relative_to(right) or right.is_relative_to(left)
 
 
-def render_course_skill_package(
+def _lexical_path_without_symlinks(path: Path, *, label: str) -> Path:
+    lexical = Path(os.path.abspath(os.fspath(path.expanduser())))
+    for component in [lexical, *lexical.parents]:
+        if component.is_symlink():
+            raise ProcessingError(f"{label} cannot contain symlinked path components")
+    return lexical
+
+
+def _render_course_skill_package(
     blueprint: CourseSkillBlueprint,
     destination: Path,
     *,
     workspace_root: Path | None = None,
+    allow_workspace_overlap: bool = False,
 ) -> Path:
-    """Create a new shareable course skill atomically.
-
-    The destination must not already exist. Updates should be rendered to a new
-    sibling staging path and installed only after validation.
-    """
-
-    target = destination.expanduser().resolve()
+    target = _lexical_path_without_symlinks(destination, label="Skill destination")
     workspace: Path | None = None
     if workspace_root is not None:
-        workspace = workspace_root.expanduser().resolve()
-        if _overlaps(target, workspace):
+        workspace = _lexical_path_without_symlinks(
+            workspace_root,
+            label="Evidence workspace",
+        )
+        if not allow_workspace_overlap and _overlaps(target, workspace):
             raise ProcessingError(
                 "The shareable skill and evidence workspace must be separate directories"
             )
@@ -1996,6 +2038,58 @@ def render_course_skill_package(
         shutil.rmtree(staging, ignore_errors=True)
         raise
     return target
+
+
+def render_course_skill_package(
+    blueprint: CourseSkillBlueprint,
+    destination: Path,
+    *,
+    workspace_root: Path | None = None,
+) -> Path:
+    """Create a new shareable course skill atomically.
+
+    The destination must not already exist. Updates should be rendered to a new
+    sibling staging path and installed only after validation.
+    """
+
+    return _render_course_skill_package(
+        blueprint,
+        destination,
+        workspace_root=workspace_root,
+    )
+
+
+def render_course_skill_review_target(
+    blueprint: CourseSkillBlueprint,
+    destination: Path,
+    *,
+    workspace_root: Path,
+    allowed_root: Path | None = None,
+) -> Path:
+    """Render the real package bytes into the one private, allowlisted review area."""
+
+    workspace = _lexical_path_without_symlinks(
+        workspace_root,
+        label="Behavior review workspace",
+    )
+    target = _lexical_path_without_symlinks(
+        destination,
+        label="Behavior review target",
+    )
+    bounded_root = _lexical_path_without_symlinks(
+        allowed_root or workspace / "analysis" / "behavior-targets",
+        label="Behavior review target root",
+    )
+    if not bounded_root.is_relative_to(workspace):
+        raise ProcessingError("Behavior review target root must stay inside the workspace")
+    if target == bounded_root or not target.is_relative_to(bounded_root):
+        raise ProcessingError("Behavior review targets must stay under analysis/behavior-targets")
+    return _render_course_skill_package(
+        blueprint,
+        target,
+        workspace_root=workspace,
+        allow_workspace_overlap=True,
+    )
 
 
 def blueprint_from_json(path: Path) -> CourseSkillBlueprint:

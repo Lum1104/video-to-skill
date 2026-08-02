@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+from click import unstyle
 from typer.testing import CliRunner
 
 from video_to_skill.cli import app
@@ -27,6 +29,7 @@ from video_to_skill.models import (
     SourceDescriptor,
     SourcePlatform,
 )
+from video_to_skill.orchestration import RunEnvelope
 from video_to_skill.workspace import Workspace
 
 runner = CliRunner()
@@ -243,6 +246,88 @@ def test_cli_exposes_workspace_protocol_without_legacy_authoring_commands() -> N
     assert result.stdout.strip()
 
 
+def test_run_and_extract_explain_distinct_source_and_output_languages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    monkeypatch.delenv("NO_COLOR", raising=False)
+
+    for command in ("run", "extract"):
+        result = runner.invoke(app, [command, "--help"], color=True)
+        assert result.exit_code == 0, result.output
+        visible_output = unstyle(result.output)
+        assert "--output-language" in visible_output
+        assert "caption/ASR" in visible_output
+        assert "artifact language" in visible_output
+
+
+def test_inspect_extract_and_run_expose_one_analysis_depth_option(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    monkeypatch.delenv("NO_COLOR", raising=False)
+
+    for command in ("inspect", "extract", "run"):
+        result = runner.invoke(app, [command, "--help"], color=True)
+        assert result.exit_code == 0, result.output
+        visible_output = unstyle(result.output)
+        assert "--analysis-depth" in visible_output
+        assert "standard" in visible_output
+        assert "deep" in visible_output
+        assert "archival" in visible_output
+
+
+@pytest.mark.parametrize("depth", ["standard", "deep", "archival"])
+def test_run_cli_preserves_omitted_vs_explicit_analysis_depth(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    depth: str,
+) -> None:
+    captured: list[Settings] = []
+
+    def fake_advance_run(**kwargs: object) -> RunEnvelope:
+        selected = kwargs["settings"]
+        assert isinstance(selected, Settings)
+        captured.append(selected)
+        return RunEnvelope(
+            status="complete",
+            workspace=tmp_path / "workspace",
+            completion={"ok": True},
+        )
+
+    monkeypatch.setattr("video_to_skill.cli.advance_run", fake_advance_run)
+
+    omitted = runner.invoke(app, ["run", "--workspace", str(tmp_path / "workspace")])
+    explicit = runner.invoke(
+        app,
+        [
+            "run",
+            "--workspace",
+            str(tmp_path / "workspace"),
+            "--analysis-depth",
+            depth,
+        ],
+    )
+
+    assert omitted.exit_code == 0, omitted.output
+    assert explicit.exit_code == 0, explicit.output
+    assert captured[0].analysis_depth_explicit is False
+    assert captured[1].analysis_depth_explicit is True
+    assert captured[1].analysis_depth.value == depth
+
+
+def test_cli_rejects_non_concrete_output_language(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app,
+        ["run", "--workspace", str(tmp_path / "missing"), "--output-language", "und"],
+    )
+
+    assert result.exit_code == 2
+    assert "concrete language or locale" in result.output
+
+
 def test_query_inventory_command(tmp_path: Path) -> None:
     workspace = Workspace.create(
         root=tmp_path / "workspace",
@@ -308,7 +393,13 @@ def test_inspect_json_includes_course_completeness(
 
     result = runner.invoke(
         app,
-        ["inspect", "https://youtube.com/playlist?list=course", "--json"],
+        [
+            "inspect",
+            "https://youtube.com/playlist?list=course",
+            "--analysis-depth",
+            "deep",
+            "--json",
+        ],
     )
 
     assert result.exit_code == 0, result.output
@@ -316,6 +407,11 @@ def test_inspect_json_includes_course_completeness(
     assert payload["sources"][0]["id"] == source.id
     assert payload["completeness"][0]["expected_entries"] == 2
     assert payload["completeness"][0]["completeness_proven"] is False
+    assert payload["analysis_depth"]["requested"] == "deep"
+    assert payload["analysis_depth"]["effective"] == "deep"
+    assert payload["analysis_depth"]["budget"]["profile_version"].startswith(
+        "analysis-depth-budget-"
+    )
 
 
 def test_clean_command_removes_only_cache_artifacts(tmp_path: Path) -> None:

@@ -205,6 +205,14 @@ def test_context_requires_one_finite_bound_and_includes_observations(
             end=240,
             max_window_seconds=60,
         )
+    with pytest.raises(ProcessingError, match="maximum"):
+        assemble_agent_context(
+            workspace,
+            source_id="source",
+            at=120,
+            window=31,
+            max_window_seconds=60,
+        )
 
 
 def test_annotation_ingestion_is_strict_grounded_and_atomic(tmp_path: Path) -> None:

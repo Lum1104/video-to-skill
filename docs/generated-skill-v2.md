@@ -53,36 +53,34 @@ workspace/
 ├── evidence.sqlite3
 ├── sources/
 │   └── <source-id>/
-│       ├── metadata.json
-│       ├── media.*
-│       ├── audio-16khz.wav
-│       ├── captions.*
+│       ├── [media and captions]
+│       ├── [audio-16khz.wav]
 │       ├── frames/
 │       ├── investigation-frames/
 │       └── contact-sheets/
-├── observations/
-│   └── observations.jsonl
 ├── analysis/
-│   ├── semantic-map.json
-│   ├── semantic-relations.json
-│   ├── capability-profile.json
-│   ├── gaps.json
-│   └── semantic-coverage.json
-├── design/
-│   ├── curriculum-options.json
-│   ├── selected-curriculum.json
-│   └── artifact-plan.json
+│   ├── run-config.json
+│   ├── artifact-language.json
+│   ├── tasks/<task-id>/
+│   ├── results/<task-id>.json
+│   ├── records/<kind-hash>/<record-id-hash>/r<revision>.*
+│   └── behavior-targets/<target-id>/
 ├── builds/
 │   └── <build-id>/
 │       ├── blueprint.json
 │       ├── critic-report.json
 │       ├── validation-report.json
-│       └── behavior-report.json
+│       ├── behavior-report.json
+│       └── completion.json
+├── editions/<edition-id>/
+│   ├── edition.json
+│   ├── analysis/
+│   └── builds/
 └── logs/
-    └── tool-runs.jsonl
+    └── [tool-runs.jsonl]
 ```
 
-The default lifecycle keeps this workspace. `clean` remains an explicit user action. Completion reports must show the workspace path and retention state.
+Observations, evidence gaps, work state, canonical heads, identities, and authoritative tool provenance live in SQLite; named files shown under `analysis/` are immutable task and record materializations. `logs/tool-runs.jsonl` exists only after an explicit sanitized export. The default lifecycle keeps this workspace. `clean` remains an explicit user action. Completion reports must show the workspace path and retention state.
 
 ### 2. Canonical semantic map
 
@@ -145,9 +143,11 @@ inspect sources
   → propose curriculum designs
   → select a primary curriculum
   → plan justified artifacts
-  → render a staged Skill
-  → run structural and semantic validation
-  → run independent behavior tests
+  → render an immutable private behavior target
+  → run isolated behavior trials
+  → run independent semantic, product, and behavior review
+  → compile delivery bytes identical to the reviewed target
+  → run structural, grounding, security, shareability, and code-fence validation
   → install without clobbering
 ```
 
@@ -166,8 +166,7 @@ Local workspace
   Keep complete analysis evidence.
 
 Installed Skill
-  Include semantic derivatives, provenance, selected teaching assets, and a
-  build receipt.
+  Include semantic derivatives, provenance, selected teaching assets, and a build receipt.
 
 Git repository
   Commit the Skill, not raw video or full analysis media.
@@ -180,21 +179,22 @@ Never retain cookies, authorization headers, temporary tokens, private absolute 
 
 ### Sanitized tool records
 
-Save reproducibility metadata for deterministic media operations:
+Save reproducibility metadata for deterministic media operations in the raw workspace, not the generated Skill:
 
 ```json
 {
   "tool": "ffmpeg",
-  "version": "7.1",
-  "operation": "extract-dense-window",
+  "tool_version": "7.1",
+  "operation": "extract-investigation-window",
   "source_id": "youtube-ZIaOBAjvc38",
-  "input_sha256": "…",
-  "arguments": ["-ss", "762", "-to", "810", "-vf", "fps=2"],
-  "outputs": ["sources/youtube-ZIaOBAjvc38/investigation-frames/…"]
+  "input_sha256": {"media": "…"},
+  "arguments": {"argv": ["ffmpeg", "-ss", "762", "-to", "810", "-vf", "fps=2"]},
+  "outputs": [{"path": "sources/youtube-ZIaOBAjvc38/investigation-frames/…", "sha256": "…"}],
+  "execution": {"status": "complete", "attempt_count": 1, "cache_hit_count": 0}
 }
 ```
 
-Records use workspace-relative paths and sanitized arguments. They never include credentials or expiring source URLs.
+SQLite is authoritative. The engine captures subprocesses at the shared runner boundary and uses the same operation recorder for ASR, OCR, vision, and retained investigation-frame operations. Stable logical IDs group immutable generation-numbered attempts, concurrent writers use WAL transactions, late completions cannot replace newer state, and cache reuse increments a counter. Typed ASR, OCR, and vision outputs reference workspace records with semantic digests that the export verifies against SQLite. `tool-runs WORKSPACE` creates deterministic ID-ordered JSONL under `logs/` in the raw workspace and accepts an existing target only when its bytes are identical. Records use workspace-relative paths and sanitized arguments; they never include raw stdout or stderr, arbitrary environment variables, credentials, expiring source URLs, or private absolute paths, and they are never copied into the portable Skill.
 
 ### Evidence retention levels
 
@@ -204,24 +204,23 @@ Default. Preserve the complete workspace for later criticism, redesign, or regen
 
 #### Compact portable bundle
 
-Create an optional archive containing:
+`evidence-bundle WORKSPACE --mode compact --output FILE.v2sbundle` creates an optional deterministic shareable archive containing:
 
-- source metadata;
-- captions and normalized transcript when redistribution is appropriate;
+- sanitized source metadata and source/depth/edition lineage;
 - semantic map and relations;
-- selected keyframes and contact sheets;
+- selected teaching visuals and retained contact sheets;
 - observations and gaps;
-- curriculum designs and blueprint;
-- critic and validation reports; and
+- curriculum designs, artifact plans, and available build receipts;
+- critic, behavior, and validation reports; and
 - sanitized tool records.
 
-Do not include complete source video or audio.
+Do not include complete source video or audio, the evidence database, caches, task data, behavior targets, credentials, signed URLs, host paths, or generated Skill files. Captions and normalized transcripts are excluded by default and enter only after explicit redistribution authorization with `--authorize-transcript-redistribution`.
 
 #### Archival local bundle
 
-Create an optional private archive that may additionally include analysis-quality media, audio, all extracted frames, and the evidence database.
+`evidence-bundle WORKSPACE --mode archival --confirm-private-archival --output FILE.v2sbundle` creates an explicitly private archive that may additionally include analysis-quality media, audio, all retained frames, normalized transcript evidence, explicitly declared external local caption sidecars, broader canonical intermediates, and a synthesized evidence-only SQLite database. It still excludes cookies, credentials, authentication artifacts, caches, locks, temporary files, task leases, behavior targets, and rendered generated Skills; workspace and edition manifests are sanitized before packaging.
 
-The archive is not a normal Skill dependency and is not committed to ordinary Git history.
+Both bundle modes use sorted safe paths, fixed ZIP metadata, SHA-256 and byte sizes for every member, a content-derived identity, no symlinks or special files, self-verification, mode `0600`, and atomic create-only publication outside the source workspace. Existing output is accepted only when byte-for-byte identical, and `verify-evidence-bundle` checks identity, membership, sizes, and checksums without extraction. Bundle retention mode is independent of `analysis_depth`; an archival depth does not authorize archival export or transcript redistribution. An archival bundle is not a normal Skill dependency and is not committed to ordinary Git history.
 
 ## Adaptive analysis depth
 
@@ -258,7 +257,11 @@ If a safety limit is reached while material gaps remain:
 2. mark the affected coverage partial; or
 3. ask to expand the budget only when the extra time, storage, paid service, or privacy boundary is material.
 
-For product-level control, expose `standard`, `deep`, and `archival` analysis depth rather than FPS, OCR thresholds, or FFmpeg flags. Recommend the level from source density and publishing intent.
+For product-level control, expose one `analysis-depth` contract: `auto`, `standard`, `deep`, or `archival`, rather than FPS, OCR thresholds, or FFmpeg flags. `auto` deterministically recommends `standard` or `deep` from inspectable duration, item count, creator chapters, caption coverage, course structure, and visual/content signals. `archival` is never an implicit default; selecting it is an explicit preservation/publishing decision because its private storage and review boundary is material.
+
+Resolve and persist requested, recommended, and effective depth plus recommendation reasons and a versioned non-secret budget summary before affected evidence processing. The profile must materially control multiple scaled budgets: visual cadence and scene sensitivity, deduplication and duration-scaled retention, semantic segment size, Analyze packet/fanout limits, and bounded investigation affordances. Fixed maxima remain safety valves. Resume reuses the exact profile and rejects conflicts or drift; an explicit refresh recomputes it when the inspectable inventory or density changes. Legacy workspaces receive a marked compatibility resolution before new task snapshots.
+
+Depth is not authorization. It cannot enable hosted vision, paid services, credentials, private-media egress, or redistribution, and it cannot override `visual_profile=transcript`. The generated Skill consumes semantic and provenance outputs, never raw engine knobs.
 
 ## Canonical semantic map
 
@@ -526,6 +529,8 @@ Canonical semantic map
 
 Changing the selected curriculum later should not require reacquiring or reanalyzing the video.
 
+The implemented same-workspace route is a named edition. `edition WORKSPACE NAME` pins one immutable integrated Analyze lineage and creates namespaced downstream tasks, canonical heads, reports, build receipts, output configuration, and completion. Selecting an existing planned path performs a deterministic checkpoint binding and skips curriculum planning; `--plan-curriculum` redoes only the bounded curriculum checkpoint. Both routes perform fresh full Author, isolated behavior trials, independent Review, compile, validate, and no-clobber install. Existing legacy single-edition heads remain unchanged and independently resumable.
+
 ## Artifact design
 
 Create a file only when at least one condition holds:
@@ -788,9 +793,13 @@ Interaction language
 
 Use one canonical artifact language per build. Respond in the user's language unless requested otherwise.
 
-For ordinary generation, infer artifact language from the user. For a public, international release, recommend English unless the user specifies another audience.
+For ordinary generation, the host infers artifact language from the user's substantive request and passes it as the new-run output-language intent. For a public, international release, recommend English unless the user specifies another audience. Source caption/ASR preference is a separate setting and never controls artifact prose.
+
+The intent is either `source` or an explicit language/locale label. An explicit label is fixed. `source` resolves automatically only when every active source has known selected-transcript language and all observations agree on one normalized value. Mixed source evidence requires a declaration chosen from the observed languages; partly or wholly unknown evidence requires one evidence-informed concrete declaration. The curriculum checkpoint makes that declaration once, and full Author, repair, Review, compilation, build receipts, and completion remain bound to it. Code validates the declaration and its digests; Review audits the actual Markdown language.
 
 Do not duplicate every artifact merely to support multilingual interaction. When a separately published localized edition is needed, render it from the same semantic map with stable semantic-unit, claim, artifact, and timestamp IDs.
+
+Localized editions enforce those logical identities against the selected source-edition baseline. A real curriculum-structure change may carry an explicit immutable identity-drift justification; silent drift is rejected. Editions expose path-free lineage in `build-manifest.json` and do not set `parent_build_id`, because localization or redesign from shared evidence is not an update or fold-in.
 
 Preserve original proper names and technical terms. Distinguish paraphrase from short source quotation, and never turn uncertain captions into confident text through translation.
 
@@ -861,7 +870,7 @@ Every package includes `build-manifest.json`:
 }
 ```
 
-The manifest never exposes a local workspace path. It gives later builds enough information to identify generated ownership and source lineage.
+The manifest never exposes a local workspace path. It records generated ownership and source lineage needed by a future update design, but it does not authorize updates by itself. `parent_build_id` remains `null` in the current workspace compiler.
 
 ## Future update safety
 
@@ -945,7 +954,11 @@ Check:
 
 ### Host-neutral behavior validation
 
-Use realistic prompts in a fresh context:
+The engine owns a deterministic, versioned scenario catalog. Reviewers do not invent or omit scenarios. Render the canonical Author state first as an immutable private preview containing the actual `SKILL.md`, supporting artifacts, provenance, sources, assets, and build manifest. Hash every preview file and bind all behavior evidence to that content digest.
+
+Run each applicable scenario in a separate host-dispatched fresh context. The engine binds every leased trial and judge task to a distinct `execution_context_id` and rejects mismatched results. This binding proves task and lease separation, not operating-system, process, filesystem, or model-context isolation; the host remains responsible for dispatching genuinely independent contexts and applying any required sandbox or read-only mount. A trial packet contains only the immutable preview and one prompt, never the expected answer or Author summary. Its raw result records the exact bounded user/assistant exchange, generated-Skill files read, and observed side effects without grading itself. A subsequent independent Review worker receives the code-owned expectations plus immutable trial paths and digests, judges every catalog entry exactly once, and records explicit not-applicable cases selected from canonical semantic state.
+
+The required interaction scenarios use these realistic prompts:
 
 ```text
 $skill
@@ -1006,6 +1019,8 @@ Build manifest         PASS
 
 Deterministic validation owns structural and semantic checks. Independent behavior tests use a fresh context and save raw reports in the workspace, not in the installed Skill.
 
+Behavior reports use the current catalog schema and bind the catalog version and digest, reviewed Author snapshot, rendered target build and content digests, scenario identity, prompt, expected behavior, applicability, raw trial task and result digests, cited turn indices, and verdict. The compiler reconstructs the catalog and rehashes the preview and every raw trial; it never authorizes compilation from a bare `passed` boolean. Legacy reports remain immutable but require fresh trials and a new Review before compilation.
+
 ## Workspace compilation contract
 
 The host agent no longer authors or transports a monolithic blueprint.
@@ -1043,7 +1058,10 @@ The implemented sequence is:
 
 1. `run` inspects, acquires, transcribes, analyzes visuals, segments sources, and creates bounded Analyze work.
 2. Analyze submissions produce the canonical semantic map, relations, conflicts, coverage, and capability ceilings.
-3. Author submissions produce curriculum, interaction, artifact plans, instructional-affordance coverage, claims, and immutable drafts.
-4. Review submissions independently audit semantic and product retention plus runtime behavior.
-5. Failed reviews create immutable Author repair tasks and fresh Reviews, with at most three cycles.
-6. Passing state compiles, renders outside the workspace, validates, installs without clobbering, and persists a completion record.
+3. A bounded curriculum-planning Author submission produces immutable options and ordered semantic-unit sequences, without artifact plans, claims, assets, or drafts.
+4. The coordinator persists the recommended selection automatically or emits a durable `ask-user` action when the learning experience materially differs.
+5. Only after selection, the full Author consumes the pinned option and selection digests and produces interaction, artifact-bound curriculum paths, artifact plans, instructional-affordance coverage, claims, assets, and immutable drafts.
+6. The engine renders canonical Author state into an immutable private behavior target and dispatches each applicable catalog scenario as a separate behavior-trial Review task with a distinct execution-context binding.
+7. A different independent Review worker judges the raw trials and audits semantic retention, instructional-affordance retention, grounding, disclosure, safety, scope, and shareability against the actual target.
+8. Failed reviews create immutable Author repair tasks pinned to the same selected curriculum and fresh trials and Reviews, with at most three cycles.
+9. Passing state compiles delivery bytes that must match the reviewed target, validates, installs without clobbering, and persists a completion record.

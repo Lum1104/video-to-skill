@@ -12,9 +12,14 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps, UnidentifiedImageError
 
+from video_to_skill.analysis_depth import (
+    effective_source_settings,
+    verify_analysis_depth_contract,
+)
 from video_to_skill.config import Settings
 from video_to_skill.errors import ProcessingError
 from video_to_skill.models import VisualEvent, VisualKind, VisualOrigin
+from video_to_skill.tool_runs import digest_value, tool_run_scope, tracked_operation
 from video_to_skill.utils import hash_file, is_within, run_command, stable_hash
 from video_to_skill.visual import bounded_frame_scale_filter, difference_hash, hash_distance
 from video_to_skill.workspace import Workspace
@@ -614,6 +619,8 @@ def extract_window_frames(
                 str(pattern),
             ],
             timeout=settings.command_timeout_seconds,
+            provenance_operation="extract-investigation-window",
+            provenance_outputs=[],
         )
 
         generated = [staging / f"frame-{index:06d}.jpg" for index in range(frame_count)]
@@ -728,6 +735,33 @@ def extract_workspace_window_frames(
     """Extract a dense window from a workspace source's materialized local media."""
 
     workspace.get_source(source_id)
+    contract = workspace.analysis_depth_contract()
+    if contract is None:
+        raise ProcessingError("Frame investigation requires a persisted analysis-depth contract")
+    verify_analysis_depth_contract(contract, settings=settings)
+    budget = contract.budget
+    if not budget.visual_sampling_enabled:
+        raise ProcessingError(
+            "Frame investigation is disabled by the persisted transcript-only visual profile"
+        )
+    duration = end - start
+    if duration > budget.investigation_window_seconds + 1e-9:
+        raise ProcessingError(
+            f"Requested frame window is {duration:g}s; {contract.effective.value} depth "
+            f"allows at most {budget.investigation_window_seconds}s"
+        )
+    requested_frames = math.ceil(duration * fps)
+    if requested_frames > budget.investigation_max_frames_per_window:
+        raise ProcessingError(
+            f"Requested frame window would sample {requested_frames} frames; "
+            f"{contract.effective.value} depth allows at most "
+            f"{budget.investigation_max_frames_per_window}"
+        )
+    effective_settings = effective_source_settings(
+        settings,
+        contract,
+        source_id=source_id,
+    )
     record = workspace.materialization_record(source_id)
     if record is None or not record["media_path"]:
         raise ProcessingError(f"Source {source_id} has no materialized media file")
@@ -736,15 +770,49 @@ def extract_workspace_window_frames(
     else:
         output_directory = destination
         containment_root = None
-    return extract_window_frames(
-        Path(record["media_path"]),
-        output_directory,
-        source_id,
-        settings,
-        start=start,
-        end=end,
-        fps=fps,
-        deduplicate=deduplicate,
-        hash_threshold=hash_threshold,
-        _containment_root=containment_root,
-    )
+    media_path = Path(record["media_path"])
+    request = {
+        "start": start,
+        "end": end,
+        "fps": fps,
+        "deduplicate": deduplicate,
+        "hash_threshold": hash_threshold,
+        "frame_width": effective_settings.frame_width,
+    }
+    cache_key = digest_value(request)
+    with (
+        tool_run_scope(
+            workspace,
+            source_id=source_id,
+            stage="investigation",
+            cache_key=cache_key,
+            input_digests={"media": hash_file(media_path)},
+        ),
+        tracked_operation(
+            tool="video-to-skill-engine",
+            operation="retain-investigation-frames",
+            arguments=request,
+            input_paths=[media_path],
+        ) as tool_run,
+    ):
+        events = extract_window_frames(
+            media_path,
+            output_directory,
+            source_id,
+            effective_settings,
+            start=start,
+            end=end,
+            fps=fps,
+            deduplicate=deduplicate,
+            hash_threshold=hash_threshold,
+            _containment_root=containment_root,
+        )
+        for event in events:
+            if not is_within(event.path, workspace.root):
+                continue
+            tool_run.add_output(
+                event.path.resolve().relative_to(workspace.root).as_posix(),
+                hash_file(event.path),
+                size=event.path.stat().st_size,
+            )
+        return events

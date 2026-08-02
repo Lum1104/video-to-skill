@@ -21,9 +21,12 @@ from video_to_skill.models import (
     VisualEvent,
     VisualKind,
     VisualOrigin,
+    VisualRetentionInterval,
+    VisualRetentionReport,
 )
 from video_to_skill.pipeline import extract_sources
 from video_to_skill.sources import SourceAdapter, SourceRegistry
+from video_to_skill.utils import stable_hash
 from video_to_skill.workspace import Workspace
 
 
@@ -282,6 +285,131 @@ def test_end_to_end_transcript_profile(tmp_path: Path) -> None:
     assert manifest_again.state.value == "complete"
 
 
+def test_pipeline_persists_depth_before_processing_and_applies_effective_budgets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[tuple[int, float, int, int]] = []
+
+    def capture_budget(
+        materialized: MaterializedSource,
+        selected_settings: Settings,
+    ) -> tuple[list[VisualEvent], list[str]]:
+        del materialized
+        observed.append(
+            (
+                selected_settings.periodic_frame_interval,
+                selected_settings.scene_threshold,
+                selected_settings.frame_width,
+                selected_settings.target_segment_seconds,
+            )
+        )
+        return [], []
+
+    monkeypatch.setattr(pipeline_module, "analyze_visuals", capture_budget)
+    settings = Settings(
+        cache_root=tmp_path,
+        analysis_depth="archival",
+        asr_provider="none",
+        max_workers=1,
+    )
+    workspace, manifest = extract_sources(
+        ["fixture://course"],
+        settings,
+        workspace_path=tmp_path / "workspace",
+        registry=SourceRegistry([FixtureAdapter()]),
+    )
+
+    contract = manifest.analysis_depth
+    assert contract is not None
+    assert contract.requested == "archival"
+    assert contract.effective == "archival"
+    assert contract.legacy_compatibility is False
+    assert observed == [
+        (
+            contract.budget.periodic_frame_interval_seconds,
+            contract.budget.scene_threshold,
+            contract.budget.frame_width,
+            contract.budget.target_segment_seconds,
+        )
+    ]
+    assert workspace.load_manifest().analysis_depth == contract
+
+    with pytest.raises(Exception, match="conflicts with persisted request"):
+        extract_sources(
+            ["fixture://course"],
+            Settings(
+                cache_root=tmp_path,
+                analysis_depth="standard",
+                asr_provider="none",
+                max_workers=1,
+            ),
+            workspace_path=workspace.root,
+            registry=SourceRegistry([FixtureAdapter()]),
+        )
+
+
+def test_visual_retention_truncation_is_durable_partial_coverage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def truncate_visuals(
+        materialized: MaterializedSource,
+        selected_settings: Settings,
+    ) -> tuple[list[VisualEvent], list[str]]:
+        budget = selected_settings._analysis_budget
+        assert budget is not None
+        selected_settings._analysis_visual_retention_report = VisualRetentionReport(
+            source_id=materialized.source.id,
+            budget_digest=stable_hash(budget.model_dump(mode="json"), length=64),
+            candidate_count=10,
+            retained_count=3,
+            dropped_count=7,
+            truncated=True,
+            affected_intervals=[VisualRetentionInterval(start=3, end=17, dropped_count=7)],
+        )
+        return (
+            [
+                VisualEvent(
+                    id=f"retained-{index}",
+                    source_id=materialized.source.id,
+                    timestamp=float(index * 10),
+                    path=tmp_path / f"retained-{index}.jpg",
+                )
+                for index in range(3)
+            ],
+            [],
+        )
+
+    monkeypatch.setattr(pipeline_module, "analyze_visuals", truncate_visuals)
+    workspace, manifest = extract_sources(
+        ["fixture://course"],
+        Settings(
+            cache_root=tmp_path,
+            visual_profile="adaptive",
+            asr_provider="none",
+            max_workers=1,
+        ),
+        workspace_path=tmp_path / "workspace",
+        registry=SourceRegistry([FixtureAdapter()]),
+    )
+
+    assert manifest.state.value == "partial"
+    [report] = workspace.visual_retention_reports()
+    assert (report.candidate_count, report.retained_count, report.dropped_count) == (10, 3, 7)
+    assert sum(interval.dropped_count for interval in report.affected_intervals) == 7
+    [warning] = [
+        item for item in workspace.list_warnings() if item.code == "visual-retention-truncated"
+    ]
+    assert warning.source_id == "youtube-fixture"
+    assert any(gap.gap_type.value == "visual-retention-truncated" for gap in workspace.gaps())
+    coverage = json.loads((workspace.root / "coverage.json").read_text(encoding="utf-8"))
+    assert coverage["visual_evidence"]["complete"] is False
+    assert coverage["visual_evidence"]["candidate_count"] == 10
+    assert coverage["visual_evidence"]["retained_count"] == 3
+    assert coverage["visual_evidence"]["dropped_count"] == 7
+
+
 def test_extract_reuses_one_browser_cookie_snapshot_for_all_stages(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -407,6 +535,8 @@ def test_refresh_tombstones_removed_source_without_deleting_observations(
         producer=ObservationProducer(name="test"),
     )
     workspace.upsert_observations([observation])
+    original_depth = workspace.load_manifest().analysis_depth
+    assert original_depth is not None
     adapter.source_ids = ["two"]
 
     refreshed, _ = extract_sources(
@@ -421,6 +551,13 @@ def test_refresh_tombstones_removed_source_without_deleting_observations(
     assert [item.source.id for item in refreshed.list_retired_sources()] == ["youtube-one"]
     assert refreshed.observations("youtube-one") == [observation]
     assert len(refreshed.transcripts("youtube-one")) == 2
+    refreshed_depth = refreshed.load_manifest().analysis_depth
+    assert refreshed_depth is not None
+    assert (
+        refreshed_depth.characteristics.inventory_digest
+        != original_depth.characteristics.inventory_digest
+    )
+    assert refreshed_depth.legacy_compatibility is False
 
 
 def test_visual_failure_keeps_last_successful_baseline_and_investigation(

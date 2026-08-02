@@ -1,6 +1,6 @@
 # Developer guide
 
-This document covers installation, the internal CLI, provider configuration, testing, and evaluation. These commands are implementation and maintenance tools used by the generator Skill; they are not the end-user workflow described in the root README.
+This document covers installation, the internal CLI, provider configuration, testing, and evaluation. These commands are implementation and maintenance tools; the root `SKILL.md` owns the host-agent workflow.
 
 ## Runtime requirements
 
@@ -54,7 +54,7 @@ When using a `uv` checkout without an installed executable, replace `video-to-sk
 
 ## Validate installation from a local checkout
 
-The public GitHub source is not available yet. Validate the same source-form installation locally without publishing or changing a user-level Skill:
+Validate the source-form installation from the current checkout without changing a user-level Skill:
 
 ```bash
 V2S_CHECKOUT="$(pwd)"
@@ -75,7 +75,7 @@ VIDEO_TO_SKILL_RUNTIME_ROOT="$V2S_TEST_RUNTIME" \
 
 This copies the standalone Skill into the temporary project's `.claude/skills` and `.agents/skills` roots, then exercises its actual first-use launcher. The first run needs PyPI network access and can take longer while it prepares the isolated runtime. Run the final launcher command a second time to verify reuse. The `V2S_TEST_PROJECT` and `V2S_TEST_RUNTIME` variables identify the temporary artifacts for inspection or later cleanup.
 
-After the repository is published, validate the documented remote source from another clean temporary project:
+Validate the published repository from another clean temporary project:
 
 ```bash
 npx --yes skills add Lum1104/video-to-skill \
@@ -86,7 +86,7 @@ npx --yes skills add Lum1104/video-to-skill \
   --yes
 ```
 
-Do not change the README status note or report remote installation as released until this command succeeds against the public repository.
+Treat the local and remote checks as separate surfaces: the local command validates the working tree, while the remote command validates what GitHub currently serves.
 
 ## Source-form private runtime
 
@@ -106,7 +106,7 @@ scripts/video-to-skill ensure-capability diarization
 
 Each command installs the matching editable extra from the same source tree, validates it with a bounded import probe, and becomes an idempotent no-op when healthy. ASR is appropriate when captions are unavailable or inadequate, OCR when local text extraction is material, and diarization only when speaker separation is explicitly required. Extra wheels and later model downloads can be large, so do not install all capabilities eagerly.
 
-The end-user README uses the open `skills` installer because it preserves the standalone `/video-to-skill` and `$video-to-skill` names across Claude Code and Codex. Claude Code namespaces plugin Skills, so a marketplace plugin would change the public invocation contract.
+The open `skills` installer preserves the standalone `/video-to-skill` and `$video-to-skill` names across Claude Code and Codex. Claude Code namespaces plugin Skills, so a marketplace plugin would change the public invocation contract.
 
 ## Install a compact package bundle
 
@@ -169,6 +169,33 @@ video-to-skill extract \
 
 The extractor records isolated source failures without discarding successful course items.
 
+The engine records deterministic subprocess and provider executions directly in SQLite. Export the canonical sanitized view only when debugging or reproducing a workspace:
+
+```bash
+video-to-skill tool-runs ./video_skill_work
+```
+
+The command creates `logs/tool-runs.jsonl` inside the private workspace and reports its SHA-256 digest. It accepts an existing export only when the bytes are identical and never overwrites a different file. Records have stable logical IDs, immutable generation-numbered attempt histories, cache-hit counts, status and duration, tool versions when resolvable, normalized non-secret arguments, input SHA-256 values, workspace-relative file digests, and verified semantic digests for typed ASR, OCR, and vision records. They never contain raw stdout, stderr, environment variables, cookies, authorization values, expiring URLs, or private absolute paths, and they are not copied into generated Skills.
+
+### Export or verify evidence bundles
+
+Create a compact reproducibility bundle outside the workspace:
+
+```bash
+video-to-skill evidence-bundle ./video_skill_work --mode compact --output ./video_skill_work-evidence.v2sbundle
+video-to-skill verify-evidence-bundle ./video_skill_work-evidence.v2sbundle
+```
+
+Compact export is a code-owned allowlist and is independent of generated Skill compilation and `analysis_depth`. It includes sanitized source metadata, available canonical Analyze/design/review records, observations, gaps, selected visual derivatives and contact sheets, build reports, and the deterministic sanitized tool-run JSONL. It omits raw video/audio, SQLite, caches, task data, rendered Skill previews, credentials, signed URLs, and private absolute paths. Transcript and caption content is omitted by default; add `--authorize-transcript-redistribution` only after confirming that redistribution is permitted. Use `--edition EDITION-NAME` to bind the export to that edition's immutable downstream lineage.
+
+Private archival export requires a deliberate acknowledgement:
+
+```bash
+video-to-skill evidence-bundle ./video_skill_work --mode archival --confirm-private-archival --output ./video_skill_work-private.v2sbundle
+```
+
+The archival bundle may include raw media/audio, all retained frames, normalized transcript evidence, explicitly declared external local caption sidecars, canonical intermediates, and a synthesized evidence-only SQLite database for future reanalysis. It still excludes cookies, authentication and credential files, caches, locks, temporary downloads, task leases, rendered behavior targets, and generated Skill files; sanitized workspace and edition metadata never exposes output, project, install, or host paths. The file is created with mode `0600`, must stay outside the workspace and normal Git/Skill distribution, and is never overwritten. Stable ZIP metadata, sorted members, and content digests make unchanged exports byte-identical, while atomic create-only publication makes concurrent writers safe. Verification rejects symlinks, special members, duplicates, traversal names, unexpected members, identity drift, size mismatches, and checksum failures without extracting the bundle.
+
 ### Query bounded evidence
 
 List the course inventory and semantic sections:
@@ -221,44 +248,49 @@ video-to-skill gaps ./video_skill_work --source 1 --format json
 
 The host repeats synchronized context, visual inspection, dense sampling, annotation, and gap analysis only where important claims remain under-supported. See the root [`SKILL.md`](../SKILL.md) for observation schemas, investigation budgets, stopping rules, and generation policy.
 
-### Generate the blueprint authoring contract
+### Run the workspace-centered generation workflow
 
-Before authoring a course blueprint, derive its schema and full source ledger from the persisted workspace:
+Start a durable conversion with the artifact language and analysis-depth intent made explicit:
 
 ```bash
-video-to-skill blueprint-schema \
+video-to-skill run \
+  "https://www.youtube.com/playlist?list=..." \
   --workspace ./video_skill_work \
-  --output ./course-authoring.json
+  --host codex \
+  --output-language English \
+  --analysis-depth auto
 ```
 
-The output is an authoring envelope, not a build input. `blueprint_schema` contains the strict Pydantic JSON Schema, while `blueprint_seed` contains a sanitized starter blueprint with every active, retired, inaccessible, and failed course entry represented. Copy `blueprint_seed` to a separate JSON file, preserve its `sources` and `coverage_ledger` exactly, and fill in the semantic artifacts, claims, principles, and limitations. The envelope never contains transcripts, media, frame data, private local locators, or raw failure reasons.
-
-### Build, validate, and install from a blueprint
-
-`build-skill` is the integrated handoff from agent-authored semantics to a native course Skill:
+`run` advances deterministic work until it returns either `actions-required` or `complete`. Each action points at a bounded task directory whose packet, schema, lease, and output boundary are already materialized. A worker reads those files, writes `TASK_PATH/output/result.json`, and submits the result directly:
 
 ```bash
-video-to-skill build-skill ./course-blueprint.json \
-  --host claude \
-  --workspace ./video_skill_work \
-  --output ./generated-skills/course-name
+video-to-skill submit ./video_skill_work TASK_ID TASK_PATH/output/result.json
+video-to-skill run --workspace ./video_skill_work
 ```
 
-For Codex and project-local discovery:
+Repeat the resume command after the returned parallel action group completes. Do not retransmit sources, host, output, installation scope, language, or depth settings on resume. The coordinator validates every submission, persists immutable canonical revisions, runs the curriculum checkpoint before full artifact Authoring, renders an immutable behavior target, dispatches isolated behavior trials and an independent Review, and then compiles the internal schema-version 2 `CourseSkillBlueprint` from canonical workspace state. `blueprint-schema` and `build-skill` are not public commands.
+
+The generated Skill always has the fixed portable records documented in [Generated Skill V2](generated-skill-v2.md) plus at least one evidence-grounded authored artifact. Learn, Practice, Apply, and Reference are capability levels rather than required directories or quotas. Rendering, final validation, no-clobber installation, and completion persistence remain one coordinator-owned workflow.
+
+### Publish another edition without reanalysis
+
+Create a named edition when the user wants a localization or a different learning path over the completed Analyze map:
 
 ```bash
-video-to-skill build-skill ./course-blueprint.json --host codex --project
+video-to-skill edition ./video_skill_work chinese-course \
+  --host codex \
+  --output-language zh-CN \
+  --curriculum PATH-ID \
+  --skill-name chinese-course
 ```
 
-The input is the completed `blueprint_seed`: a strict `CourseSkillBlueprint` schema-version 1 JSON document. It supplies the Skill identity, scope, prerequisites, core principles, workspace-bound coverage ledger, evidence-linked claims, limitations, optional sanitized assets, and grounded artifacts for Learn, Practice, Apply, and Reference. The schema requires all four modes, at least one exercise and a separate solution or rubric, unique safe paths, and provenance for every rendered artifact.
+Use `--plan-curriculum` instead of `--curriculum` only when a new learning design is required. Use `--from-edition SOURCE-EDITION --curriculum PATH-ID` when reusing another edition's checkpoint and logical identity baseline. Resume without restating immutable configuration:
 
-The command first compares the blueprint ledger with the workspace's current active sources, retired-source tombstones, and complete inspection records. It rejects omitted or invented entries, stale ledgers from another workspace, altered metadata, and any attempt to present incomplete coverage as complete. It then deterministically renders the blueprint into a new portable artifact, runs shareability and supported fenced-code validation, invokes the official `skills-ref` validator when available, and safely installs the result for the selected host. `--workspace` is required for verified full-course accounting and when the blueprint includes visual assets; it also enforces separation between private evidence and shareable output. Without `--output`, the portable artifact defaults to `./generated-skills/<name>`. Without `--project`, installation uses the host's user-level Skill root.
+```bash
+video-to-skill edition ./video_skill_work chinese-course
+```
 
-Omitting `--workspace` remains available for standalone schema experiments, but the build record explicitly reports coverage as unverified and discards any unverified ledger supplied by the blueprint.
-
-Rendering refuses an existing output path and never edits the private workspace. Installation is atomic and never overwrites different same-name content. If validation or installation fails after rendering, the portable artifact is retained and its path is reported for repair; it is not presented as installed. On success, text output prints the direct `/name` or `$name` invocation, while `--json` returns the name, generated and installed paths, installation status, host, scope, and validity.
-
-Use the standalone `validate` and `install-generated` commands below for stage-level debugging or maintenance. Agent-driven production generation should use `build-skill` so rendering, validation, preservation on failure, installation, and the completion record stay one transactionally safe workflow.
+An edition reuses the pinned integrated Analyze task and creates only edition-local curriculum, Author, behavior, Review, build, and completion state. It never accepts sources or `--refresh`; changed Analyze lineage requires a new edition name.
 
 ### Validate a generated Skill
 
@@ -285,7 +317,7 @@ video-to-skill install-generated /path/to/generated-skill --host claude --projec
 video-to-skill install-generated /path/to/generated-skill --host codex --project
 ```
 
-The command runs full validation with supported fenced-code parsing before installation, invokes the official `skills-ref` validator when available, derives the destination name from `SKILL.md` frontmatter, rejects symbolic links, and copies through a temporary staging directory before an atomic rename. Reinstalling byte-identical content is idempotent. Different existing content with the same Skill name is never overwritten; the generated artifact is preserved so the agent can rename it or enter an explicit update workflow.
+The command runs full validation with supported fenced-code parsing before installation, invokes the official `skills-ref` validator when available, derives the destination name from `SKILL.md` frontmatter, rejects symbolic links, and copies through a temporary staging directory before an atomic rename. Reinstalling byte-identical content is idempotent. Different existing content with the same Skill name is never overwritten; preserve the generated artifact and choose a different name or destination because update and fold-in are not implemented.
 
 ### Reclaim workspace storage
 
@@ -309,6 +341,23 @@ Configuration is loaded in this order, with later sources taking precedence:
 
 See [`video-to-skill.toml.example`](../video-to-skill.toml.example) for operational settings. API keys are environment-only and are not serialized into manifests.
 
+Use one product-level setting for evidence recall and retention:
+
+```toml
+[video_to_skill]
+analysis_depth = "auto" # auto | standard | deep | archival
+```
+
+The equivalent environment variable is `VIDEO_TO_SKILL_ANALYSIS_DEPTH`, and `inspect`, `extract`, and `run` accept `--analysis-depth`. `auto` is the default and deterministically selects `standard` or `deep` from inspectable source/course density. `archival` is explicit opt-in. Inspect JSON includes the recommendation, reasons, and effective non-secret budgets before processing begins.
+
+Existing frame and segment settings remain advanced baseline overrides; the selected depth scales them and then applies hard safety maxima. Depth does not select providers or credentials. `visual_profile = "transcript"` still disables visual processing, and `vision_provider = "none"` remains unchanged at every depth.
+
+The requested/effective contract is persisted in `manifest.json` and `analysis/run-config.json`. Resume must match the persisted request and profile version. Use `--refresh` when source inventory or inspectable density has changed; refresh recomputes the contract and affected cache keys. Legacy workspaces are assigned a marked compatibility contract before any new Analyze snapshot.
+
+Named editions do not refresh evidence. Immutable edition state lives at `editions/<edition-id>/edition.json`; edition-local orchestration uses `editions/<edition-id>/analysis/`, and build receipts use `editions/<edition-id>/builds/`. The state pins the integrated Analyze task, workspace/source snapshot, canonical Analyze digests, and depth-contract digest. `submit` resolves the edition from task scope rather than ambient process state. If any pinned value differs, resume fails and a new edition must be created after refreshed Analyze work.
+
+Existing unnamespaced `analysis/run-config.json`, language state, tasks, canonical heads, and `builds/` remain the legacy compatibility edition. No database rewrite is required: post-Analyze record IDs are internally prefixed with the deterministic edition ID, while Analyze record IDs remain shared. Cross-run dependencies let an edition's first downstream task depend on the completed integrated Analyze task; acquisition and Analyze tasks are never materialized in the edition run.
+
 The default safety limits include 500 course items, eight hours per source, 20 GiB per local file or download, two concurrent source workers, and a two-hour subprocess timeout. The remote source adapter selects analysis media at up to 720p when media is required.
 
 ### Platform authentication
@@ -319,19 +368,9 @@ Platform authentication is opt-in:
 export VIDEO_TO_SKILL_COOKIES_FROM_BROWSER=chrome
 ```
 
-When browser authentication is configured, the engine invokes yt-dlp once to
-create a private temporary Netscape cookie jar. Source inspection and every
-concurrent materialization then use private per-worker copies through
-`--cookies`; they do not reopen the browser cookie database or race while
-yt-dlp updates its jar. The temporary directory is user-private on Windows and
-additionally uses mode `0700` with `0600` cookie files on POSIX. The jars are
-overwritten and removed when the command exits.
+When browser authentication is configured, the engine invokes yt-dlp once to create a private temporary Netscape cookie jar. Source inspection and every concurrent materialization then use private per-worker copies through `--cookies`; they do not reopen the browser cookie database or race while yt-dlp updates its jar. The temporary directory is user-private on Windows and additionally uses mode `0700` with `0600` cookie files on POSIX. The jars are overwritten and removed when the command exits.
 
-As an alternative, point `VIDEO_TO_SKILL_COOKIES_FILE` at an existing Netscape
-`cookies.txt` file. Configure only one cookie source. Use a dedicated browser
-profile or cookie file with the minimum access required. Never commit or
-distribute cookies, workspaces, debug logs, or downloaded media, and never place
-cookie text in a generated Skill.
+As an alternative, point `VIDEO_TO_SKILL_COOKIES_FILE` at an existing Netscape `cookies.txt` file. Configure only one cookie source. Use a dedicated browser profile or cookie file with the minimum access required. Never commit or distribute cookies, workspaces, debug logs, or downloaded media, and never place cookie text in a generated Skill.
 
 ### Native and hosted vision
 
@@ -355,6 +394,8 @@ The private, resumable workspace has this shape:
 manifest.json
 coverage.json
 evidence.sqlite3
+logs/
+  tool-runs.jsonl
 sources/
   <source-id>/
     media.*
@@ -365,9 +406,9 @@ sources/
     contact-sheets/
 ```
 
-The SQLite evidence schema is version 4. It stores ordered source descriptors, per-stage state, transcript segments, visual events, semantic sections, agent observations, evidence gaps, input inspection reports, and warnings. Older supported workspaces migrate forward when opened; workspaces created by an unsupported newer schema are refused.
+The SQLite evidence schema is version 10. It stores ordered source descriptors, per-stage state, transcript segments, visual events, semantic sections, agent observations, evidence gaps, input inspection reports, orchestration state, immutable publication heads, identity baselines, sanitized logical tool runs with immutable execution attempts, and warnings. WAL mode and one connection per operation allow concurrent source workers and tool-run writers to commit safely. Older supported workspaces migrate forward when opened; workspaces created by an unsupported newer schema are refused.
 
-Successful refreshed inspection tombstones sources that disappeared from the latest course inventory instead of deleting them. Active queries omit retired sources by default, while the tombstone retains the descriptor, removal time, and reason. Existing transcripts, frames, observations, and provenance references remain available for audit or an explicit update workflow.
+Successful refreshed inspection tombstones sources that disappeared from the latest course inventory instead of deleting them. Active queries omit retired sources by default, while the tombstone retains the descriptor, removal time, and reason. Existing transcripts, frames, observations, and provenance references remain available for audit or a future independently designed update workflow.
 
 Visual events carry an origin of `baseline` or `investigation`. A normal extraction refresh replaces only baseline scene and periodic evidence. Dense windows added by the host investigation loop retain the investigation origin and survive later baseline refreshes or visual-provider failures. A visual evidence ID cannot silently change origin.
 

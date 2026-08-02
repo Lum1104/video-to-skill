@@ -16,14 +16,24 @@ from video_to_skill.agentic import (
     assemble_agent_context,
     ingest_annotations,
 )
+from video_to_skill.analysis_depth import (
+    resolve_analysis_depth,
+    verify_analysis_depth_contract,
+)
 from video_to_skill.config import Settings, load_settings
 from video_to_skill.coordinator import advance_run, submit_workspace_result
 from video_to_skill.doctor import diagnostics_ok, run_diagnostics
+from video_to_skill.editions import load_edition_state
 from video_to_skill.errors import ProcessingError, VideoToSkillError
 from video_to_skill.evaluation import (
     evaluate_workspace,
     load_labels,
     render_evaluation_report,
+)
+from video_to_skill.evidence_bundles import (
+    EvidenceBundleMode,
+    export_evidence_bundle,
+    verify_evidence_bundle,
 )
 from video_to_skill.installation import (
     SkillHost,
@@ -84,12 +94,16 @@ def _settings(
     config: Path | None,
     *,
     language: str | None = None,
+    output_language: str | None = None,
+    analysis_depth: str | None = None,
     visual_profile: str | None = None,
     max_workers: int | None = None,
 ) -> Settings:
     return load_settings(
         config,
         language=language,
+        output_language=output_language,
+        analysis_depth=analysis_depth,
         visual_profile=visual_profile,
         max_workers=max_workers,
     )
@@ -213,24 +227,39 @@ def doctor(
 def inspect_command(
     sources: Annotated[list[str], typer.Argument(help="URLs or local media paths.")],
     config: Annotated[Path | None, typer.Option("--config")] = None,
-    language: Annotated[str | None, typer.Option("--language")] = None,
+    language: Annotated[
+        str | None,
+        typer.Option(
+            "--language",
+            help="Preferred source caption/ASR language; does not set artifact language.",
+        ),
+    ] = None,
+    analysis_depth: Annotated[
+        str | None,
+        typer.Option(
+            "--analysis-depth",
+            help="auto (recommended), standard, deep, or explicit archival.",
+        ),
+    ] = None,
     as_json: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
     """Resolve inputs and report course structure without downloading media."""
 
     try:
-        settings = _settings(config, language=language)
+        settings = _settings(config, language=language, analysis_depth=analysis_depth)
         inspection = inspect_inputs_with_completeness(sources, settings)
     except VideoToSkillError as exc:
         typer.echo(f"ERROR: {exc}", err=True)
         raise typer.Exit(2) from exc
     inspected = inspection.sources
+    depth_contract = resolve_analysis_depth(inspected, inspection.reports, settings)
     if as_json:
         typer.echo(
             json.dumps(
                 {
                     "sources": [item.model_dump(mode="json") for item in inspected],
                     "completeness": [item.model_dump(mode="json") for item in inspection.reports],
+                    "analysis_depth": depth_contract.model_dump(mode="json"),
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -250,6 +279,14 @@ def inspect_command(
         f"Estimated semantic input: ~{estimated_transcript_tokens:,} transcript tokens "
         "(provider pricing not included)"
     )
+    typer.echo(
+        f"Analysis depth: requested={depth_contract.requested.value} "
+        f"recommended={depth_contract.recommended.value} "
+        f"effective={depth_contract.effective.value} "
+        f"profile={depth_contract.budget.profile_version}"
+    )
+    for reason in depth_contract.recommendation_reasons:
+        typer.echo(f"  {reason}")
     for report in inspection.reports:
         expected = (
             str(report.expected_entries) if report.expected_entries is not None else "unknown"
@@ -273,11 +310,20 @@ def inspect_command(
                 route = f"media download + {backend.name} ASR"
             except VideoToSkillError:
                 route = "media download + ASR required (backend unavailable)"
-        visual_candidates = int((item.duration or 0) / settings.periodic_frame_interval) + 1
+        periodic = depth_contract.budget.periodic_frame_interval_seconds
+        visual_candidates = (
+            depth_contract.budget.source_visual_event_limits.get(item.id, 0)
+            if periodic is not None
+            else 0
+        )
         typer.echo(
             f"  captions={len(item.captions)} chapters={len(item.chapters)} id={item.id}\n"
-            f"  route={route}; up to {visual_candidates} periodic visual samples "
-            "plus scene changes"
+            f"  route={route}; retained visual-event budget={visual_candidates} "
+            + (
+                f"at {periodic}s periodic sampling plus scene changes"
+                if periodic is not None
+                else "(visual processing disabled by transcript profile)"
+            )
         )
     if not inspected:
         raise typer.Exit(1)
@@ -290,7 +336,27 @@ def extract(
         Path | None, typer.Option("--workspace", help="Evidence workspace path.")
     ] = None,
     config: Annotated[Path | None, typer.Option("--config")] = None,
-    language: Annotated[str | None, typer.Option("--language")] = None,
+    language: Annotated[
+        str | None,
+        typer.Option(
+            "--language",
+            help="Preferred source caption/ASR language; does not set artifact language.",
+        ),
+    ] = None,
+    output_language: Annotated[
+        str | None,
+        typer.Option(
+            "--output-language",
+            help="Canonical generated-artifact language, or 'source' (default).",
+        ),
+    ] = None,
+    analysis_depth: Annotated[
+        str | None,
+        typer.Option(
+            "--analysis-depth",
+            help="auto (recommended), standard, deep, or explicit archival.",
+        ),
+    ] = None,
     visual_profile: Annotated[
         str | None,
         typer.Option("--visual-profile", help="adaptive, always, or transcript"),
@@ -305,6 +371,8 @@ def extract(
         settings = _settings(
             config,
             language=language,
+            output_language=output_language,
+            analysis_depth=analysis_depth,
             visual_profile=visual_profile,
             max_workers=max_workers,
         )
@@ -549,6 +617,15 @@ def context(
             raise ProcessingError("Provide exactly one of --section or --at")
         if section is not None and window is not None:
             raise ProcessingError("--window can only be used with --at")
+        contract = evidence.analysis_depth_contract()
+        if contract is None:
+            raise ProcessingError("Context requires a persisted analysis-depth contract")
+        verify_analysis_depth_contract(contract)
+        if max_items > contract.budget.context_max_items_per_kind:
+            raise ProcessingError(
+                f"--max-items {max_items} exceeds the {contract.effective.value} depth "
+                f"context limit {contract.budget.context_max_items_per_kind}"
+            )
         radius = (15.0 if window is None else window) if timestamp is not None else None
         packet = assemble_agent_context(
             evidence,
@@ -556,6 +633,8 @@ def context(
             section=section,
             at=timestamp,
             window=radius,
+            max_window_seconds=contract.budget.context_window_seconds,
+            max_section_seconds=contract.budget.max_segment_seconds,
             max_items_per_kind=max_items,
         )
         selected_format = _output_format(output_format)
@@ -665,7 +744,33 @@ def run_workflow(
         ),
     ] = None,
     config: Annotated[Path | None, typer.Option("--config")] = None,
-    language: Annotated[str | None, typer.Option("--language")] = None,
+    language: Annotated[
+        str | None,
+        typer.Option(
+            "--language",
+            help="Preferred source caption/ASR language; does not set artifact language.",
+        ),
+    ] = None,
+    output_language: Annotated[
+        str | None,
+        typer.Option(
+            "--output-language",
+            help=(
+                "Canonical generated-artifact language, or 'source'; on resume, an explicit "
+                "value must match the persisted contract."
+            ),
+        ),
+    ] = None,
+    analysis_depth: Annotated[
+        str | None,
+        typer.Option(
+            "--analysis-depth",
+            help=(
+                "auto (recommended), standard, deep, or explicit archival; resume must "
+                "match the persisted request."
+            ),
+        ),
+    ] = None,
     visual_profile: Annotated[
         str | None,
         typer.Option("--visual-profile", help="adaptive, always, or transcript"),
@@ -683,6 +788,8 @@ def run_workflow(
         settings = _settings(
             config,
             language=language,
+            output_language=output_language,
+            analysis_depth=analysis_depth,
             visual_profile=visual_profile,
             max_workers=max_workers,
         )
@@ -690,6 +797,7 @@ def run_workflow(
             sources=list(sources or []),
             workspace_path=workspace,
             settings=settings,
+            output_language_override=output_language,
             host=host,
             output=output,
             project=project,
@@ -723,6 +831,120 @@ def submit_work_result(
     typer.echo(receipt.model_dump_json(indent=2))
 
 
+@app.command("edition")
+def edition_workflow(
+    workspace: Annotated[
+        Path,
+        typer.Argument(help="Completed evidence workspace whose Analyze state will be reused."),
+    ],
+    edition_name: Annotated[
+        str,
+        typer.Argument(help="Immutable lowercase-hyphenated edition name."),
+    ],
+    host: Annotated[
+        SkillHost | None,
+        typer.Option(
+            "--host",
+            case_sensitive=False,
+            help="Install for claude or codex; required only for a new edition.",
+        ),
+    ] = None,
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", help="Portable generated Skill path."),
+    ] = None,
+    project: Annotated[
+        bool | None,
+        typer.Option(
+            "--project/--user",
+            help="Installation scope; omit on resume to reuse the edition setting.",
+        ),
+    ] = None,
+    output_language: Annotated[
+        str | None,
+        typer.Option(
+            "--output-language",
+            help="Canonical artifact language or 'source'; immutable within this edition.",
+        ),
+    ] = None,
+    curriculum: Annotated[
+        str | None,
+        typer.Option(
+            "--curriculum",
+            help="Existing planned curriculum path id to bind before Authoring.",
+        ),
+    ] = None,
+    from_edition: Annotated[
+        str | None,
+        typer.Option(
+            "--from-edition",
+            help="Named edition whose curriculum checkpoint and identity baseline are reused.",
+        ),
+    ] = None,
+    plan_curriculum: Annotated[
+        bool,
+        typer.Option(
+            "--plan-curriculum",
+            help="Run one bounded curriculum-planning task over the reused Analyze map.",
+        ),
+    ] = False,
+    skill_name: Annotated[
+        str | None,
+        typer.Option("--skill-name", help="Required generated Skill name for this edition."),
+    ] = None,
+    identity_drift_reason: Annotated[
+        str | None,
+        typer.Option(
+            "--identity-drift-reason",
+            help="Explicit justification when logical artifact or claim ids must change.",
+        ),
+    ] = None,
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+    analysis_depth: Annotated[
+        str | None,
+        typer.Option(
+            "--analysis-depth",
+            help="Must match the persisted evidence workspace depth request.",
+        ),
+    ] = None,
+    max_workers: Annotated[int | None, typer.Option("--max-workers")] = None,
+    skip_official: Annotated[
+        bool,
+        typer.Option("--skip-official", help="Do not call skills-ref during final validation."),
+    ] = False,
+) -> None:
+    """Create or resume an isolated edition from immutable completed Analyze state."""
+
+    try:
+        settings = _settings(
+            config,
+            output_language=output_language,
+            analysis_depth=analysis_depth,
+            max_workers=max_workers,
+        )
+        envelope = advance_run(
+            sources=[],
+            workspace_path=workspace,
+            settings=settings,
+            output_language_override=output_language,
+            host=host,
+            output=output,
+            project=project,
+            refresh=False,
+            run_official_validation=not skip_official,
+            edition_name=edition_name,
+            curriculum_path_id=curriculum,
+            curriculum_source_edition=from_edition,
+            plan_curriculum=plan_curriculum,
+            skill_name=skill_name,
+            identity_drift_justification=identity_drift_reason,
+        )
+    except (VideoToSkillError, ValueError) as exc:
+        typer.echo(f"ERROR: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    typer.echo(envelope.model_dump_json(indent=2))
+
+
 @app.command()
 def validate(
     skill_directory: Annotated[Path, typer.Argument(help="Generated skill folder.")],
@@ -752,6 +974,116 @@ def validate(
     typer.echo(report.model_dump_json(indent=2) if as_json else render_validation_report(report))
     if not report.valid:
         raise typer.Exit(1)
+
+
+@app.command("tool-runs")
+def tool_runs(
+    workspace: Annotated[Path, typer.Argument(help="Evidence workspace.")],
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "--output",
+            help="Workspace-contained JSONL path; defaults to logs/tool-runs.jsonl.",
+        ),
+    ] = None,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Export sanitized deterministic tool provenance inside the raw workspace."""
+
+    try:
+        evidence = Workspace.open(workspace)
+        report = evidence.export_tool_runs(output)
+    except VideoToSkillError as exc:
+        typer.echo(f"ERROR: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    if as_json:
+        typer.echo(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        typer.echo(f"Tool runs: {report['records']} · {report['path']} · sha256={report['sha256']}")
+
+
+@app.command("evidence-bundle")
+def evidence_bundle(
+    workspace: Annotated[Path, typer.Argument(help="Evidence workspace.")],
+    output: Annotated[
+        Path,
+        typer.Option(
+            "--output",
+            help="Create-only .v2sbundle path outside the evidence workspace.",
+        ),
+    ],
+    mode: Annotated[
+        str,
+        typer.Option("--mode", help="Bundle policy: compact or archival."),
+    ] = EvidenceBundleMode.COMPACT.value,
+    edition: Annotated[
+        str | None,
+        typer.Option("--edition", help="Named edition whose downstream evidence to include."),
+    ] = None,
+    authorize_transcript_redistribution: Annotated[
+        bool,
+        typer.Option(
+            "--authorize-transcript-redistribution",
+            help="Include transcript/caption text in a compact shareable bundle.",
+        ),
+    ] = False,
+    confirm_private_archival: Annotated[
+        bool,
+        typer.Option(
+            "--confirm-private-archival",
+            help="Acknowledge that an archival bundle is private and sensitive.",
+        ),
+    ] = False,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Export deterministic compact or private archival evidence."""
+
+    try:
+        base = Workspace.open(workspace)
+        evidence = base
+        if edition is not None:
+            state = load_edition_state(base, edition)
+            evidence = base.for_edition(state.configuration.edition_id)
+        report = export_evidence_bundle(
+            evidence,
+            output,
+            mode=mode,
+            authorize_transcript_redistribution=authorize_transcript_redistribution,
+            confirm_private_archival=confirm_private_archival,
+        )
+    except VideoToSkillError as exc:
+        typer.echo(f"ERROR: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    if report.warning is not None:
+        typer.echo(report.warning, err=True)
+    if as_json:
+        typer.echo(report.model_dump_json(indent=2))
+    else:
+        typer.echo(
+            f"Evidence bundle: {report.mode.value} · {report.files} files · "
+            f"{report.path} · sha256={report.sha256}"
+        )
+
+
+@app.command("verify-evidence-bundle")
+def verify_bundle(
+    bundle: Annotated[Path, typer.Argument(help="Evidence .v2sbundle file.")],
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Verify an evidence bundle without extracting it."""
+
+    try:
+        report = verify_evidence_bundle(bundle)
+    except VideoToSkillError as exc:
+        typer.echo(f"ERROR: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    if as_json:
+        typer.echo(report.model_dump_json(indent=2))
+    else:
+        typer.echo(
+            f"Verified evidence bundle: {report.bundle_id} · {report.files} files · "
+            f"sha256={report.sha256}"
+        )
 
 
 @app.command()

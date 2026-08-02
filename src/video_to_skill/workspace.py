@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 import secrets
-import shutil
 import sqlite3
+import stat
 from collections.abc import Iterable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
@@ -17,6 +20,7 @@ from video_to_skill.config import Settings
 from video_to_skill.errors import ProcessingError
 from video_to_skill.models import (
     AgentObservation,
+    AnalysisDepthContract,
     EvidenceGap,
     EvidenceGapType,
     InspectionCompleteness,
@@ -31,9 +35,21 @@ from video_to_skill.models import (
     TranscriptSegment,
     VisualEvent,
     VisualOrigin,
+    VisualRetentionReport,
     WarningRecord,
 )
-from video_to_skill.utils import atomic_write_json, hash_file, is_within, stable_hash
+from video_to_skill.tool_runs import (
+    MAX_ARGUMENT_BYTES,
+    MAX_EXPORTED_RECORD_BYTES,
+    MAX_OUTPUT_BYTES,
+    TOOL_RUN_SCHEMA,
+    ToolRunFinish,
+    ToolRunStart,
+    bounded_json_text,
+    digest_value,
+    sanitize_value,
+)
+from video_to_skill.utils import atomic_write_json, is_within, stable_hash
 from video_to_skill.work import (
     AnalysisRun,
     CanonicalRecord,
@@ -43,7 +59,33 @@ from video_to_skill.work import (
     WorkState,
 )
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 10
+
+_EDITION_ID_RE = re.compile(r"^edition-[a-f0-9]{20}$")
+
+# Analyze output is shared evidence. Everything after Analyze belongs to one
+# independently resumable publication edition. Edition views encode the namespace
+# in canonical record ids so existing databases remain compatible without moving
+# the legacy single-edition heads.
+_EDITION_CANONICAL_KINDS = frozenset(
+    {
+        "artifact-language-declaration",
+        "curriculum-options",
+        "selected-curriculum",
+        "course",
+        "curriculum",
+        "interaction",
+        "capability-profile",
+        "artifact-plan",
+        "instructional-affordances",
+        "claims",
+        "assets",
+        "artifact-draft",
+        "critic-report",
+        "behavior-report",
+        "delivery-selection",
+    }
+)
 
 _AGENT_EVIDENCE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS agent_observations (
@@ -95,6 +137,7 @@ _ORCHESTRATION_SCHEMA = """
 CREATE TABLE IF NOT EXISTS analysis_runs (
     id TEXT PRIMARY KEY,
     snapshot_digest TEXT NOT NULL,
+    edition_id TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -112,6 +155,7 @@ CREATE TABLE IF NOT EXISTS work_items (
     lease_token_hash TEXT,
     lease_owner TEXT,
     lease_expires_at TEXT,
+    execution_context_id TEXT,
     attempt_count INTEGER NOT NULL DEFAULT 0,
     result_path TEXT,
     result_digest TEXT,
@@ -137,6 +181,14 @@ CREATE TABLE IF NOT EXISTS work_results (
     producer_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
     FOREIGN KEY (task_id) REFERENCES work_items(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS identity_baselines (
+    family_id TEXT PRIMARY KEY,
+    baseline_json TEXT NOT NULL,
+    baseline_digest TEXT NOT NULL,
+    producer_task_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (producer_task_id) REFERENCES work_items(id) ON DELETE RESTRICT
 );
 CREATE TABLE IF NOT EXISTS canonical_records (
     kind TEXT NOT NULL,
@@ -168,16 +220,517 @@ class _OwnedEvidence(Protocol):
     source_id: str
 
 
+@dataclass(frozen=True)
+class WorkspaceFileSnapshot:
+    """Immutable bytes read through a symlink-safe workspace descriptor chain."""
+
+    path: Path
+    payload: bytes
+    digest: str
+
+
+@dataclass(frozen=True)
+class CanonicalOutputSnapshot:
+    """Canonical output metadata bound to one immutable task-output snapshot."""
+
+    kind: str
+    record_id: str
+    file: WorkspaceFileSnapshot
+
+
+CanonicalOutput = tuple[str, str, Path] | CanonicalOutputSnapshot
+
+
 class Workspace:
     """Owns durable processing state; each operation opens its own DB connection."""
 
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, *, edition_id: str | None = None):
         self.root = root.resolve()
+        self.edition_id = edition_id
         self.database_path = self.root / "evidence.sqlite3"
         self.manifest_path = self.root / "manifest.json"
         self.sources_dir = self.root / "sources"
-        self.analysis_dir = self.root / "analysis"
+        self.editions_dir = self.root / "editions"
+        self.edition_dir = self.editions_dir / edition_id if edition_id is not None else None
+        self.analysis_dir = (
+            self.edition_dir / "analysis"
+            if self.edition_dir is not None
+            else self.root / "analysis"
+        )
+        self.builds_dir = (
+            self.edition_dir / "builds" if self.edition_dir is not None else self.root / "builds"
+        )
         self.tasks_dir = self.analysis_dir / "tasks"
+
+    def for_edition(self, edition_id: str) -> Workspace:
+        """Return an immutable edition-scoped view; no global active edition exists."""
+
+        if not _EDITION_ID_RE.fullmatch(edition_id):
+            raise ProcessingError("Edition id is invalid")
+        view = Workspace(self.root, edition_id=edition_id)
+        if not view.database_path.is_file() or not view.manifest_path.is_file():
+            raise ProcessingError(f"Not a video-to-skill workspace: {self.root}")
+        view._prepare_edition_directories()
+        return view
+
+    def _prepare_edition_directories(self) -> None:
+        """Open every edition parent without following symlinks and create fixed children."""
+
+        if self.edition_id is None:
+            return
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        descriptors: list[int] = []
+        try:
+            root_fd = os.open(self.root, directory_flags | nofollow)
+            descriptors.append(root_fd)
+            editions_fd = os.open(
+                "editions",
+                directory_flags | nofollow,
+                dir_fd=root_fd,
+            )
+            descriptors.append(editions_fd)
+            edition_fd = os.open(
+                self.edition_id,
+                directory_flags | nofollow,
+                dir_fd=editions_fd,
+            )
+            descriptors.append(edition_fd)
+            for child in ("analysis", "builds"):
+                with suppress(FileExistsError):
+                    os.mkdir(child, dir_fd=edition_fd)
+                child_fd = os.open(
+                    child,
+                    directory_flags | nofollow,
+                    dir_fd=edition_fd,
+                )
+                descriptors.append(child_fd)
+                if child == "analysis":
+                    with suppress(FileExistsError):
+                        os.mkdir("tasks", dir_fd=child_fd)
+                    tasks_fd = os.open(
+                        "tasks",
+                        directory_flags | nofollow,
+                        dir_fd=child_fd,
+                    )
+                    descriptors.append(tasks_fd)
+        except OSError as exc:
+            raise ProcessingError(
+                f"Edition filesystem namespace is unsafe: {self.edition_id}"
+            ) from exc
+        finally:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
+
+    def _edition_relative_parts(self, path: Path) -> tuple[str, ...]:
+        if self.edition_dir is None:
+            raise ProcessingError("Secure edition path requires a named-edition view")
+        lexical_path = Path(os.path.abspath(path))
+        lexical_root = Path(os.path.abspath(self.edition_dir))
+        try:
+            relative = lexical_path.relative_to(lexical_root)
+        except ValueError as exc:
+            raise ProcessingError("Edition path escapes its immutable namespace") from exc
+        if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+            raise ProcessingError("Edition descendant path is invalid")
+        return relative.parts
+
+    def _workspace_relative_parts(self, path: Path) -> tuple[str, ...]:
+        lexical_path = Path(os.path.abspath(path))
+        lexical_root = Path(os.path.abspath(self.root))
+        try:
+            relative = lexical_path.relative_to(lexical_root)
+        except ValueError as exc:
+            raise ProcessingError("Path escapes the workspace root") from exc
+        if any(part in {"", ".", ".."} for part in relative.parts):
+            raise ProcessingError("Workspace descendant path is invalid")
+        return relative.parts
+
+    @contextmanager
+    def _workspace_directory_descriptor(
+        self,
+        directory: Path,
+        *,
+        create: bool,
+    ) -> Iterator[int]:
+        parts = self._workspace_relative_parts(directory)
+        descriptors: list[int] = []
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            current_fd = os.open(self.root, flags)
+            descriptors.append(current_fd)
+            for part in parts:
+                if create:
+                    with suppress(FileExistsError):
+                        os.mkdir(part, mode=0o700, dir_fd=current_fd)
+                current_fd = os.open(part, flags, dir_fd=current_fd)
+                descriptors.append(current_fd)
+            yield current_fd
+        except OSError as exc:
+            raise ProcessingError(
+                "Workspace descendant namespace has unsafe or symlinked path components: "
+                f"{directory}"
+            ) from exc
+        finally:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
+
+    @contextmanager
+    def _edition_directory_descriptor(
+        self,
+        directory: Path,
+        *,
+        create: bool,
+    ) -> Iterator[int]:
+        parts = self._edition_relative_parts(directory)
+        descriptors: list[int] = []
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            root_fd = os.open(self.root, flags)
+            descriptors.append(root_fd)
+            editions_fd = os.open("editions", flags, dir_fd=root_fd)
+            descriptors.append(editions_fd)
+            assert self.edition_id is not None
+            current_fd = os.open(self.edition_id, flags, dir_fd=editions_fd)
+            descriptors.append(current_fd)
+            for part in parts:
+                if create:
+                    with suppress(FileExistsError):
+                        os.mkdir(part, mode=0o700, dir_fd=current_fd)
+                current_fd = os.open(part, flags, dir_fd=current_fd)
+                descriptors.append(current_fd)
+            yield current_fd
+        except OSError as exc:
+            raise ProcessingError(f"Edition descendant namespace is unsafe: {directory}") from exc
+        finally:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
+
+    def ensure_directory(self, directory: Path) -> None:
+        if self.edition_id is None:
+            with self._workspace_directory_descriptor(directory, create=True):
+                pass
+            return
+        with self._edition_directory_descriptor(directory, create=True):
+            pass
+
+    def read_file_bytes(self, path: Path, *, max_bytes: int | None = None) -> bytes:
+        if self.edition_id is None:
+            parts = self._workspace_relative_parts(path)
+            if not parts:
+                raise ProcessingError(f"Workspace file must be regular: {path}")
+            parent = self.root.joinpath(*parts[:-1])
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            try:
+                with self._workspace_directory_descriptor(parent, create=False) as parent_fd:
+                    descriptor = os.open(parts[-1], flags, dir_fd=parent_fd)
+                    try:
+                        metadata = os.fstat(descriptor)
+                        if not stat.S_ISREG(metadata.st_mode):
+                            raise ProcessingError(f"Workspace file must be regular: {path}")
+                        if max_bytes is not None and metadata.st_size > max_bytes:
+                            raise ProcessingError(f"Workspace file exceeds its size limit: {path}")
+                        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+                            payload = handle.read(None if max_bytes is None else max_bytes + 1)
+                    finally:
+                        os.close(descriptor)
+            except OSError as exc:
+                raise ProcessingError(f"Workspace file path is unsafe: {path}") from exc
+            if max_bytes is not None and len(payload) > max_bytes:
+                raise ProcessingError(f"Workspace file exceeds its size limit: {path}")
+            return payload
+        parts = self._edition_relative_parts(path)
+        assert self.edition_dir is not None
+        parent = self.edition_dir.joinpath(*parts[:-1])
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            with self._edition_directory_descriptor(parent, create=False) as parent_fd:
+                descriptor = os.open(parts[-1], flags, dir_fd=parent_fd)
+                try:
+                    metadata = os.fstat(descriptor)
+                    if not stat.S_ISREG(metadata.st_mode):
+                        raise ProcessingError(f"Edition file must be regular: {path}")
+                    if max_bytes is not None and metadata.st_size > max_bytes:
+                        raise ProcessingError(f"Edition file exceeds its size limit: {path}")
+                    with os.fdopen(descriptor, "rb", closefd=False) as handle:
+                        payload = handle.read(None if max_bytes is None else max_bytes + 1)
+                finally:
+                    os.close(descriptor)
+        except OSError as exc:
+            raise ProcessingError(f"Edition file path is unsafe: {path}") from exc
+        if max_bytes is not None and len(payload) > max_bytes:
+            raise ProcessingError(f"Edition file exceeds its size limit: {path}")
+        return payload
+
+    def write_file_bytes(
+        self,
+        path: Path,
+        payload: bytes,
+        *,
+        overwrite: bool = True,
+    ) -> None:
+        if self.edition_id is None:
+            parts = self._workspace_relative_parts(path)
+            if not parts:
+                raise ProcessingError(f"Workspace file target is unsafe: {path}")
+            parent = self.root.joinpath(*parts[:-1])
+            with self._workspace_directory_descriptor(parent, create=True) as parent_fd:
+                try:
+                    existing = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    existing = None
+                if existing is not None:
+                    if not stat.S_ISREG(existing.st_mode):
+                        raise ProcessingError(f"Workspace file target is unsafe: {path}")
+                    if not overwrite:
+                        raise ProcessingError(f"Workspace file already exists: {path}")
+                temporary_name = f".{parts[-1]}.{secrets.token_hex(12)}.tmp"
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+                descriptor = os.open(temporary_name, flags, 0o600, dir_fd=parent_fd)
+                try:
+                    with os.fdopen(descriptor, "wb", closefd=False) as handle:
+                        handle.write(payload)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    if overwrite:
+                        os.replace(
+                            temporary_name,
+                            parts[-1],
+                            src_dir_fd=parent_fd,
+                            dst_dir_fd=parent_fd,
+                        )
+                    else:
+                        os.link(
+                            temporary_name,
+                            parts[-1],
+                            src_dir_fd=parent_fd,
+                            dst_dir_fd=parent_fd,
+                            follow_symlinks=False,
+                        )
+                    os.fsync(parent_fd)
+                finally:
+                    os.close(descriptor)
+                    with suppress(FileNotFoundError):
+                        os.unlink(temporary_name, dir_fd=parent_fd)
+            return
+        parts = self._edition_relative_parts(path)
+        assert self.edition_dir is not None
+        parent = self.edition_dir.joinpath(*parts[:-1])
+        with self._edition_directory_descriptor(parent, create=True) as parent_fd:
+            try:
+                existing = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                existing = None
+            if existing is not None:
+                if not stat.S_ISREG(existing.st_mode):
+                    raise ProcessingError(f"Edition file target is unsafe: {path}")
+                if not overwrite:
+                    raise ProcessingError(f"Edition file already exists: {path}")
+            temporary_name = f".{parts[-1]}.{secrets.token_hex(12)}.tmp"
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(temporary_name, flags, 0o600, dir_fd=parent_fd)
+            try:
+                with os.fdopen(descriptor, "wb", closefd=False) as handle:
+                    handle.write(payload)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                if overwrite:
+                    os.replace(
+                        temporary_name,
+                        parts[-1],
+                        src_dir_fd=parent_fd,
+                        dst_dir_fd=parent_fd,
+                    )
+                else:
+                    os.link(
+                        temporary_name,
+                        parts[-1],
+                        src_dir_fd=parent_fd,
+                        dst_dir_fd=parent_fd,
+                        follow_symlinks=False,
+                    )
+                os.fsync(parent_fd)
+            finally:
+                os.close(descriptor)
+                with suppress(FileNotFoundError):
+                    os.unlink(temporary_name, dir_fd=parent_fd)
+
+    def write_json(self, path: Path, value: Any, *, overwrite: bool = True) -> None:
+        if hasattr(value, "model_dump"):
+            value = value.model_dump(mode="json")
+        payload = (json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode(
+            "utf-8"
+        )
+        self.write_file_bytes(path, payload, overwrite=overwrite)
+
+    def remove_file(self, path: Path) -> None:
+        if self.edition_id is None:
+            parts = self._workspace_relative_parts(path)
+            if not parts:
+                raise ProcessingError(f"Workspace file target is unsafe: {path}")
+            parent = self.root.joinpath(*parts[:-1])
+            try:
+                with self._workspace_directory_descriptor(parent, create=False) as parent_fd:
+                    metadata = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
+                    if not stat.S_ISREG(metadata.st_mode):
+                        raise ProcessingError(f"Workspace file target is unsafe: {path}")
+                    os.unlink(parts[-1], dir_fd=parent_fd)
+            except FileNotFoundError:
+                return
+            return
+        parts = self._edition_relative_parts(path)
+        assert self.edition_dir is not None
+        parent = self.edition_dir.joinpath(*parts[:-1])
+        try:
+            with self._edition_directory_descriptor(parent, create=False) as parent_fd:
+                metadata = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise ProcessingError(f"Edition file target is unsafe: {path}")
+                os.unlink(parts[-1], dir_fd=parent_fd)
+        except FileNotFoundError:
+            return
+
+    def task_output_file_snapshot(
+        self,
+        task_id: str,
+        path: Path,
+        *,
+        max_bytes: int | None = None,
+    ) -> WorkspaceFileSnapshot:
+        """Read one task output once without following any path component."""
+
+        submitted = self._validated_task_output_path(task_id, path)
+        payload = self.read_file_bytes(submitted, max_bytes=max_bytes)
+        return WorkspaceFileSnapshot(
+            path=submitted,
+            payload=payload,
+            digest=sha256(payload).hexdigest(),
+        )
+
+    def _validated_task_output_path(self, task_id: str, path: Path) -> Path:
+        submitted = Path(os.path.abspath(path))
+        task_output = Path(os.path.abspath(self.tasks_dir / task_id / "output"))
+        try:
+            relative = submitted.relative_to(task_output)
+        except ValueError as exc:
+            raise ProcessingError(
+                "Task output must be a regular file in its task output directory"
+            ) from exc
+        if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+            raise ProcessingError("Task output path is invalid")
+        return submitted
+
+    def _validate_task_output_snapshot(
+        self,
+        task_id: str,
+        snapshot: WorkspaceFileSnapshot,
+        *,
+        expected_path: Path | None = None,
+    ) -> None:
+        submitted = self._validated_task_output_path(task_id, snapshot.path)
+        if submitted != snapshot.path or (
+            expected_path is not None and submitted != Path(os.path.abspath(expected_path))
+        ):
+            raise ProcessingError("Task output snapshot path is invalid")
+        if sha256(snapshot.payload).hexdigest() != snapshot.digest:
+            raise ProcessingError("Task output snapshot digest is invalid")
+
+    def canonical_output_file_snapshot(
+        self,
+        task_id: str,
+        kind: str,
+        record_id: str,
+        path: Path,
+        *,
+        max_bytes: int | None = None,
+    ) -> CanonicalOutputSnapshot:
+        """Bind canonical metadata to bytes read once from a safe task output path."""
+
+        return CanonicalOutputSnapshot(
+            kind=kind,
+            record_id=record_id,
+            file=self.task_output_file_snapshot(
+                task_id,
+                path,
+                max_bytes=max_bytes,
+            ),
+        )
+
+    @staticmethod
+    def _scope_edition_id(item: WorkItem) -> str | None:
+        value = item.scope.get("edition_id")
+        if value is None:
+            return None
+        if not isinstance(value, str) or not _EDITION_ID_RE.fullmatch(value):
+            raise ProcessingError(f"Task has an invalid edition scope: {item.id}")
+        return value
+
+    def _assert_task_readable(self, item: WorkItem) -> None:
+        scoped_edition = self._scope_edition_id(item)
+        if scoped_edition == self.edition_id:
+            return
+        if (
+            self.edition_id is not None
+            and scoped_edition is None
+            and item.role == WorkRole.ANALYZE
+            and item.state == WorkState.COMPLETE
+            and item.scope.get("integrated") is True
+        ):
+            # A named edition may consume its explicitly pinned shared Analyze producer.
+            return
+        raise ProcessingError(f"Task belongs to a different workspace edition: {item.id}")
+
+    def _assert_task_mutable(self, item: WorkItem) -> None:
+        if self._scope_edition_id(item) != self.edition_id:
+            raise ProcessingError(f"Task belongs to a different workspace edition: {item.id}")
+
+    def task_edition_id(self, task_id: str) -> str | None:
+        """Resolve routing metadata without granting task read or mutation authority."""
+
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT scope_json FROM work_items WHERE id=?",
+                (task_id,),
+            ).fetchone()
+        if row is None:
+            raise ProcessingError(f"Unknown workspace task: {task_id}")
+        try:
+            scope = json.loads(str(row["scope_json"]))
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ProcessingError(f"Task has an invalid scope: {task_id}") from exc
+        if not isinstance(scope, dict):
+            raise ProcessingError(f"Task has an invalid scope: {task_id}")
+        edition_id = scope.get("edition_id")
+        if edition_id is None:
+            return None
+        if not isinstance(edition_id, str) or not _EDITION_ID_RE.fullmatch(edition_id):
+            raise ProcessingError(f"Task has an invalid edition scope: {task_id}")
+        return edition_id
+
+    def _assert_run_ownership(
+        self,
+        connection: sqlite3.Connection,
+        run_id: str,
+    ) -> None:
+        row = connection.execute(
+            "SELECT edition_id FROM analysis_runs WHERE id=?",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            raise ProcessingError(f"Unknown analysis run: {run_id}")
+        if cast(str | None, row["edition_id"]) != self.edition_id:
+            raise ProcessingError(f"Analysis run belongs to a different edition: {run_id}")
+
+    def _require_shared_evidence_view(self, operation: str) -> None:
+        if self.edition_id is not None:
+            raise ProcessingError(
+                f"Edition views cannot mutate shared evidence state ({operation})"
+            )
+
+    def _storage_record_id(self, kind: str, record_id: str) -> str:
+        if self.edition_id is None or kind not in _EDITION_CANONICAL_KINDS:
+            return record_id
+        return f"edition:{self.edition_id}:{record_id}"
 
     @classmethod
     def create(
@@ -203,6 +756,7 @@ class Workspace:
                 inputs=inputs,
                 workspace=workspace.root,
                 configuration_hash=settings.configuration_hash,
+                output_language=settings.output_language,
             )
             workspace.save_manifest(manifest)
         else:
@@ -344,6 +898,7 @@ class Workspace:
             connection.executescript(_AGENT_EVIDENCE_SCHEMA)
             connection.executescript(_INSPECTION_SCHEMA)
             connection.executescript(_ORCHESTRATION_SCHEMA)
+            connection.executescript(TOOL_RUN_SCHEMA)
             if existing_version is None:
                 connection.execute(
                     "INSERT INTO metadata(key, value) VALUES('schema_version', ?)",
@@ -355,6 +910,13 @@ class Workspace:
                 """
                 CREATE INDEX IF NOT EXISTS visual_source_origin_time
                 ON visual_events(source_id, origin, timestamp)
+                """
+            )
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS work_item_execution_context
+                ON work_items(execution_context_id)
+                WHERE execution_context_id IS NOT NULL
                 """
             )
 
@@ -371,6 +933,82 @@ class Workspace:
         }
         if column not in columns:
             connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+
+    @staticmethod
+    def _upgrade_tool_run_attempts(connection: sqlite3.Connection) -> None:
+        """Split the provisional mutable execution row into immutable attempts."""
+
+        table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='tool_runs'"
+        ).fetchone()
+        if table is None:
+            connection.executescript(TOOL_RUN_SCHEMA)
+            return
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(tool_runs)").fetchall()
+        }
+        if "status" not in columns:
+            connection.executescript(TOOL_RUN_SCHEMA)
+            return
+        legacy_rows = connection.execute("SELECT * FROM tool_runs ORDER BY id").fetchall()
+        connection.execute("DROP TABLE IF EXISTS tool_run_attempts")
+        connection.execute("DROP INDEX IF EXISTS tool_run_source_stage")
+        connection.execute("DROP INDEX IF EXISTS tool_run_status")
+        connection.execute("ALTER TABLE tool_runs RENAME TO tool_runs_v9")
+        connection.executescript(TOOL_RUN_SCHEMA)
+        for row in legacy_rows:
+            created_at = str(row["first_started_at"])
+            updated_at = str(row["updated_at"])
+            legacy_attempt_count = max(1, int(row["attempt_count"]))
+            connection.execute(
+                """
+                INSERT INTO tool_runs(
+                    id, identity_digest, tool, tool_version, operation, source_id,
+                    stage, input_digests_json, arguments_json, cache_key,
+                    attempt_count, cache_hit_count, created_at, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["id"],
+                    row["identity_digest"],
+                    row["tool"],
+                    row["tool_version"],
+                    row["operation"],
+                    row["source_id"],
+                    row["stage"],
+                    row["input_digests_json"],
+                    row["arguments_json"],
+                    row["cache_key"],
+                    legacy_attempt_count,
+                    row["cache_hit_count"],
+                    created_at,
+                    updated_at,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO tool_run_attempts(
+                    id, tool_run_id, generation, status, outputs_json,
+                    return_code, error_kind, started_at, completed_at,
+                    duration_ms, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    f"{row['id']}-attempt-{legacy_attempt_count:06d}",
+                    row["id"],
+                    legacy_attempt_count,
+                    row["status"],
+                    row["outputs_json"],
+                    row["return_code"],
+                    row["error_kind"],
+                    row["last_started_at"],
+                    row["completed_at"],
+                    row["duration_ms"],
+                    updated_at,
+                ),
+            )
+        connection.execute("DROP TABLE tool_runs_v9")
 
     def _upgrade_schema(self, connection: sqlite3.Connection, version: int) -> None:
         if version < 2:
@@ -410,6 +1048,71 @@ class Workspace:
             )
         if version < 5:
             connection.executescript(_ORCHESTRATION_SCHEMA)
+        if version < 6:
+            self._ensure_column(
+                connection,
+                table="work_items",
+                column="execution_context_id",
+                declaration="TEXT",
+            )
+        if version < 7:
+            self._ensure_column(
+                connection,
+                table="analysis_runs",
+                column="edition_id",
+                declaration="TEXT",
+            )
+            # Edition identity was already durably encoded in every named-edition
+            # task scope. Backfill runs so listing/expiry operations have an
+            # independently enforceable ownership boundary.
+            rows = connection.execute(
+                "SELECT id, scope_json FROM work_items ORDER BY id"
+            ).fetchall()
+            editions_by_run: dict[str, str | None] = {}
+            for row in rows:
+                try:
+                    scope = json.loads(str(row["scope_json"]))
+                except (TypeError, json.JSONDecodeError) as exc:
+                    raise ProcessingError("Workspace task has an invalid scope") from exc
+                if not isinstance(scope, dict):
+                    raise ProcessingError("Workspace task has an invalid scope")
+                edition_id = scope.get("edition_id")
+                if edition_id is not None and (
+                    not isinstance(edition_id, str) or not _EDITION_ID_RE.fullmatch(edition_id)
+                ):
+                    raise ProcessingError("Workspace task has an invalid edition scope")
+                run_id = str(
+                    connection.execute(
+                        "SELECT run_id FROM work_items WHERE id=?",
+                        (row["id"],),
+                    ).fetchone()["run_id"]
+                )
+                previous = editions_by_run.setdefault(run_id, edition_id)
+                if previous != edition_id:
+                    raise ProcessingError("Analysis run mixes tasks from different editions")
+            for run_id, edition_id in editions_by_run.items():
+                connection.execute(
+                    "UPDATE analysis_runs SET edition_id=? WHERE id=?",
+                    (edition_id, run_id),
+                )
+        if version < 8:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS identity_baselines (
+                    family_id TEXT PRIMARY KEY,
+                    baseline_json TEXT NOT NULL,
+                    baseline_digest TEXT NOT NULL,
+                    producer_task_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (producer_task_id)
+                        REFERENCES work_items(id) ON DELETE RESTRICT
+                )
+                """
+            )
+        if version < 9:
+            connection.executescript(TOOL_RUN_SCHEMA)
+        if version < 10:
+            self._upgrade_tool_run_attempts(connection)
         connection.execute(
             "UPDATE metadata SET value=? WHERE key='schema_version'",
             (str(SCHEMA_VERSION),),
@@ -446,6 +1149,44 @@ class Workspace:
         manifest.updated_at = datetime.now(UTC)
         atomic_write_json(self.manifest_path, manifest)
 
+    def analysis_depth_contract(self) -> AnalysisDepthContract | None:
+        return self.load_manifest().analysis_depth
+
+    def save_analysis_depth_contract(self, contract: AnalysisDepthContract) -> None:
+        manifest = self.load_manifest()
+        manifest.analysis_depth = contract
+        self.save_manifest(manifest)
+
+    def save_visual_retention_report(self, report: VisualRetentionReport) -> Path:
+        path = self.source_directory(report.source_id) / "visual-retention.json"
+        atomic_write_json(path, report)
+        return path
+
+    def visual_retention_report(self, source_id: str) -> VisualRetentionReport | None:
+        path = self.source_directory(source_id) / "visual-retention.json"
+        if not path.exists():
+            return None
+        try:
+            if path.is_symlink() or not path.is_file() or path.stat().st_size > 1024 * 1024:
+                raise ProcessingError("Visual retention report must be a bounded regular file")
+            report = VisualRetentionReport.model_validate_json(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            if isinstance(exc, ProcessingError):
+                raise
+            raise ProcessingError(
+                f"Invalid visual retention report for {source_id}: {exc}"
+            ) from exc
+        if report.source_id != source_id:
+            raise ProcessingError("Visual retention report belongs to a different source")
+        return report
+
+    def visual_retention_reports(self) -> list[VisualRetentionReport]:
+        return [
+            report
+            for source in self.list_sources()
+            if (report := self.visual_retention_report(source.id)) is not None
+        ]
+
     def workspace_snapshot_digest(self) -> str:
         """Return a compact identity for task inputs without loading evidence bodies."""
 
@@ -469,32 +1210,65 @@ class Workspace:
             {
                 "job_id": manifest.job_id,
                 "configuration": manifest.configuration_hash,
+                "analysis_depth_budget": (
+                    manifest.analysis_depth.budget_digest
+                    if manifest.analysis_depth is not None
+                    else None
+                ),
                 "sources": [dict(row) for row in rows],
                 "stages": [dict(row) for row in stage_rows],
             }
         )
 
-    def create_analysis_run(self, snapshot_digest: str | None = None) -> AnalysisRun:
+    def create_analysis_run(
+        self,
+        snapshot_digest: str | None = None,
+        *,
+        settings: Settings | None = None,
+    ) -> AnalysisRun:
+        manifest = self.load_manifest()
+        if manifest.analysis_depth is None:
+            # Legacy and programmatically assembled workspaces did not persist this
+            # contract. Resolve a marked compatibility contract before snapshotting so
+            # all newly planned work is bound to one durable budget.
+            from video_to_skill.analysis_depth import resolve_analysis_depth
+
+            manifest.analysis_depth = resolve_analysis_depth(
+                self.list_sources(),
+                self.inspection_reports(),
+                settings or Settings(),
+                legacy_compatibility=True,
+            )
+            self.save_manifest(manifest)
+        else:
+            from video_to_skill.analysis_depth import verify_analysis_depth_contract
+
+            verify_analysis_depth_contract(manifest.analysis_depth, settings=settings)
         snapshot = snapshot_digest or self.workspace_snapshot_digest()
-        run_id = f"run-{stable_hash({'job': self.load_manifest().job_id, 'snapshot': snapshot}, length=24)}"
+        run_id = f"run-{stable_hash({'job': self.load_manifest().job_id, 'snapshot': snapshot, 'edition_id': self.edition_id}, length=24)}"
         now = datetime.now(UTC)
         with self.connect() as connection:
             connection.execute(
                 """
-                INSERT INTO analysis_runs(id, snapshot_digest, created_at, updated_at)
-                VALUES(?, ?, ?, ?)
+                INSERT INTO analysis_runs(
+                    id, snapshot_digest, edition_id, created_at, updated_at
+                ) VALUES(?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET updated_at=excluded.updated_at
+                WHERE analysis_runs.edition_id IS excluded.edition_id
                 """,
-                (run_id, snapshot, now.isoformat(), now.isoformat()),
+                (run_id, snapshot, self.edition_id, now.isoformat(), now.isoformat()),
             )
             row = connection.execute(
                 "SELECT * FROM analysis_runs WHERE id=?",
                 (run_id,),
             ).fetchone()
         assert row is not None
+        if cast(str | None, row["edition_id"]) != self.edition_id:
+            raise ProcessingError("Analysis run identity collides across editions")
         return AnalysisRun(
             id=str(row["id"]),
             snapshot_digest=str(row["snapshot_digest"]),
+            edition_id=cast(str | None, row["edition_id"]),
             created_at=datetime.fromisoformat(str(row["created_at"])),
             updated_at=datetime.fromisoformat(str(row["updated_at"])),
         )
@@ -522,6 +1296,7 @@ class Workspace:
                 if row["lease_expires_at"]
                 else None
             ),
+            execution_context_id=cast(str | None, row["execution_context_id"]),
             attempt_count=int(row["attempt_count"]),
             result_path=Path(str(row["result_path"])) if row["result_path"] else None,
             result_digest=cast(str | None, row["result_digest"]),
@@ -550,7 +1325,9 @@ class Workspace:
                     (task_id,),
                 ).fetchall()
             ]
-        return self._row_to_work_item(row, dependencies)
+        item = self._row_to_work_item(row, dependencies)
+        self._assert_task_readable(item)
+        return item
 
     def list_work_items(
         self,
@@ -568,6 +1345,7 @@ class Workspace:
             clauses.append("state=?")
             parameters.append(state.value)
         with self.connect() as connection:
+            self._assert_run_ownership(connection, run_id)
             rows = connection.execute(
                 "SELECT * FROM work_items WHERE "
                 + " AND ".join(clauses)
@@ -586,7 +1364,9 @@ class Workspace:
                         (row["id"],),
                     ).fetchall()
                 ]
-                result.append(self._row_to_work_item(row, dependencies))
+                item = self._row_to_work_item(row, dependencies)
+                self._assert_task_mutable(item)
+                result.append(item)
         return result
 
     def ensure_work_item(
@@ -602,16 +1382,24 @@ class Workspace:
         snapshot_digest: str | None = None,
     ) -> WorkItem:
         dependency_ids = sorted(set(dependencies))
+        scope = dict(scope)
+        if self.edition_id is not None:
+            if role == WorkRole.ANALYZE:
+                raise ProcessingError("Named editions cannot create shared Analyze tasks")
+            scoped_edition = scope.get("edition_id")
+            if scoped_edition not in {None, self.edition_id}:
+                raise ProcessingError("Task scope belongs to a different edition")
+            scope["edition_id"] = self.edition_id
+        elif scope.get("edition_id") is not None:
+            raise ProcessingError("Unscoped workspace cannot create named-edition tasks")
         snapshot = snapshot_digest or self.workspace_snapshot_digest()
         task_id = f"task-{role.value}-{stable_hash({'run': run_id, 'role': role, 'scope': scope, 'dependencies': dependency_ids, 'snapshot': snapshot}, length=20)}"
         task_directory = self.tasks_dir / task_id
         packet_path = task_directory / "packet.json"
         result_schema_path = task_directory / "result-schema.json"
         output_directory = task_directory / "output"
-        task_directory.mkdir(parents=True, exist_ok=True)
-        output_directory.mkdir(parents=True, exist_ok=True)
-        if any(path.is_symlink() for path in (task_directory, output_directory)):
-            raise ProcessingError(f"Task directory cannot be a symlink: {task_directory}")
+        self.ensure_directory(task_directory)
+        self.ensure_directory(output_directory)
         packet_payload = {
             "task_id": task_id,
             "run_id": run_id,
@@ -629,31 +1417,35 @@ class Workspace:
             "schema": result_schema,
         }
         packet_digest = stable_hash(packet_payload, length=64)
-        atomic_write_json(packet_path, packet_payload)
-        atomic_write_json(result_schema_path, schema_payload)
+        self.write_json(packet_path, packet_payload)
+        self.write_json(result_schema_path, schema_payload)
         now = datetime.now(UTC)
         with self.connect() as connection:
-            if (
-                connection.execute(
-                    "SELECT 1 FROM analysis_runs WHERE id=?",
-                    (run_id,),
+            self._assert_run_ownership(connection, run_id)
+            invalid_dependencies: list[str] = []
+            for dependency in dependency_ids:
+                dependency_row = connection.execute(
+                    "SELECT run_id, role, scope_json, state FROM work_items WHERE id=?",
+                    (dependency,),
                 ).fetchone()
-                is None
-            ):
-                raise ProcessingError(f"Unknown analysis run: {run_id}")
-            missing_dependencies = [
-                dependency
-                for dependency in dependency_ids
-                if connection.execute(
-                    "SELECT 1 FROM work_items WHERE id=? AND run_id=?",
-                    (dependency, run_id),
-                ).fetchone()
-                is None
-            ]
-            if missing_dependencies:
+                if dependency_row is None:
+                    invalid_dependencies.append(dependency)
+                    continue
+                same_run = str(dependency_row["run_id"]) == run_id
+                reusable_analyze = False
+                if self.edition_id is not None:
+                    dependency_scope = json.loads(str(dependency_row["scope_json"]))
+                    reusable_analyze = (
+                        dependency_row["role"] == WorkRole.ANALYZE.value
+                        and dependency_row["state"] == WorkState.COMPLETE.value
+                        and dependency_scope.get("integrated") is True
+                    )
+                if not same_run and not reusable_analyze:
+                    invalid_dependencies.append(dependency)
+            if invalid_dependencies:
                 raise ProcessingError(
                     "Task dependencies are unknown or belong to another run: "
-                    + ", ".join(missing_dependencies)
+                    + ", ".join(invalid_dependencies)
                 )
             connection.execute(
                 """
@@ -686,7 +1478,7 @@ class Workspace:
                     """,
                     (task_id, dependency),
                 )
-        atomic_write_json(
+        self.write_json(
             task_directory / "task.json",
             {
                 "task_id": task_id,
@@ -702,11 +1494,12 @@ class Workspace:
     def ready_work_items(self, run_id: str, *, role: WorkRole | None = None) -> list[WorkItem]:
         now = datetime.now(UTC).isoformat()
         with self.connect() as connection:
+            self._assert_run_ownership(connection, run_id)
             connection.execute(
                 """
                 UPDATE work_items
                 SET state='pending', lease_token_hash=NULL, lease_owner=NULL,
-                    lease_expires_at=NULL, updated_at=?
+                    lease_expires_at=NULL, execution_context_id=NULL, updated_at=?
                 WHERE run_id=? AND state='leased' AND lease_expires_at <= ?
                 """,
                 (now, run_id, now),
@@ -745,7 +1538,9 @@ class Workspace:
                         (row["id"],),
                     ).fetchall()
                 ]
-                result.append(self._row_to_work_item(row, dependencies))
+                item = self._row_to_work_item(row, dependencies)
+                self._assert_task_mutable(item)
+                result.append(item)
         return result
 
     def lease_work_item(
@@ -757,7 +1552,10 @@ class Workspace:
     ) -> WorkLease:
         if lease_seconds < 1:
             raise ProcessingError("Task lease duration must be positive")
+        owned_item = self.get_work_item(task_id)
+        self._assert_task_mutable(owned_item)
         token = secrets.token_urlsafe(32)
+        execution_context_id = f"ctx-{secrets.token_urlsafe(24)}"
         token_hash = sha256(token.encode("utf-8")).hexdigest()
         now = datetime.now(UTC)
         expires = now + timedelta(seconds=lease_seconds)
@@ -791,17 +1589,26 @@ class Workspace:
                 """
                 UPDATE work_items
                 SET state='leased', lease_token_hash=?, lease_owner=?,
-                    lease_expires_at=?, attempt_count=attempt_count + 1, updated_at=?
+                    lease_expires_at=?, execution_context_id=?,
+                    attempt_count=attempt_count + 1, updated_at=?
                 WHERE id=?
                 """,
-                (token_hash, owner, expires.isoformat(), now.isoformat(), task_id),
+                (
+                    token_hash,
+                    owner,
+                    expires.isoformat(),
+                    execution_context_id,
+                    now.isoformat(),
+                    task_id,
+                ),
             )
         task_directory = self.tasks_dir / task_id
-        atomic_write_json(
+        self.write_json(
             task_directory / "lease.json",
             {
                 "task_id": task_id,
                 "lease_token": token,
+                "execution_context_id": execution_context_id,
                 "owner": owner,
                 "expires_at": expires.isoformat(),
             },
@@ -809,17 +1616,21 @@ class Workspace:
         return WorkLease(
             item=self.get_work_item(task_id),
             token=token,
+            execution_context_id=execution_context_id,
             output_directory=task_directory / "output",
         )
 
     def fail_work_item(self, task_id: str, reason: str) -> WorkItem:
+        item = self.get_work_item(task_id)
+        self._assert_task_mutable(item)
         now = datetime.now(UTC).isoformat()
         with self.connect() as connection:
             updated = connection.execute(
                 """
                 UPDATE work_items
                 SET state='failed', failure_reason=?, lease_token_hash=NULL,
-                    lease_owner=NULL, lease_expires_at=NULL, updated_at=?
+                    lease_owner=NULL, lease_expires_at=NULL, execution_context_id=NULL,
+                    updated_at=?
                 WHERE id=? AND state IN ('pending', 'leased')
                 """,
                 (" ".join(reason.split())[:2000], now, task_id),
@@ -829,6 +1640,7 @@ class Workspace:
         return self.get_work_item(task_id)
 
     def work_result_producer(self, task_id: str) -> dict[str, Any] | None:
+        self._assert_task_readable(self.get_work_item(task_id))
         with self.connect() as connection:
             row = connection.execute(
                 "SELECT producer_json FROM work_results WHERE task_id=?",
@@ -839,6 +1651,88 @@ class Workspace:
         value = json.loads(str(row["producer_json"]))
         return cast(dict[str, Any], value)
 
+    def identity_baseline_payload(self, family_id: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT baseline_json, baseline_digest FROM identity_baselines WHERE family_id=?",
+                (family_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            payload = json.loads(str(row["baseline_json"]))
+        except json.JSONDecodeError as exc:
+            raise ProcessingError("Stored logical identity baseline is invalid") from exc
+        if not isinstance(payload, dict) or stable_hash(payload, length=64) != str(
+            row["baseline_digest"]
+        ):
+            raise ProcessingError("Stored logical identity baseline failed its digest check")
+        return cast(dict[str, Any], payload)
+
+    @staticmethod
+    def _accept_identity_baseline(
+        connection: sqlite3.Connection,
+        *,
+        task_id: str,
+        payload: dict[str, Any],
+        now: datetime,
+    ) -> None:
+        family_id = payload.get("family_id")
+        if (
+            not isinstance(family_id, str)
+            or not re.fullmatch(r"identity-[a-f0-9]{20}", family_id)
+            or payload.get("established") is not True
+        ):
+            raise ProcessingError("Logical identity acceptance payload is invalid")
+        serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        digest = stable_hash(payload, length=64)
+        connection.execute(
+            """
+            INSERT INTO identity_baselines(
+                family_id, baseline_json, baseline_digest, producer_task_id, created_at
+            ) VALUES(?, ?, ?, ?, ?)
+            ON CONFLICT(family_id) DO NOTHING
+            """,
+            (family_id, serialized, digest, task_id, now.isoformat()),
+        )
+        existing = connection.execute(
+            """
+            SELECT baseline_json, baseline_digest
+            FROM identity_baselines WHERE family_id=?
+            """,
+            (family_id,),
+        ).fetchone()
+        if existing is None or (
+            str(existing["baseline_json"]) != serialized
+            or str(existing["baseline_digest"]) != digest
+        ):
+            raise ProcessingError(
+                "Author logical identity conflicts with the established family baseline"
+            )
+
+    def ensure_identity_baseline(
+        self,
+        *,
+        payload: dict[str, Any],
+        producer_task_id: str,
+    ) -> dict[str, Any]:
+        producer = self.get_work_item(producer_task_id)
+        if producer.state != WorkState.COMPLETE or producer.role != WorkRole.AUTHOR:
+            raise ProcessingError(
+                "Logical identity can only be seeded from an accepted Author result"
+            )
+        with self.connect() as connection:
+            self._accept_identity_baseline(
+                connection,
+                task_id=producer_task_id,
+                payload=payload,
+                now=datetime.now(UTC),
+            )
+        family_id = cast(str, payload["family_id"])
+        stored = self.identity_baseline_payload(family_id)
+        assert stored is not None
+        return stored
+
     def publish_canonical_record(
         self,
         *,
@@ -848,73 +1742,82 @@ class Workspace:
         producer_task_id: str,
         snapshot_digest: str,
     ) -> CanonicalRecord:
-        source = source_path.resolve()
-        if not source.is_file() or source.is_symlink() or not is_within(source, self.root):
+        producer_item = self.get_work_item(producer_task_id)
+        self._assert_task_mutable(producer_item)
+        if self.edition_id is not None and kind not in _EDITION_CANONICAL_KINDS:
+            raise ProcessingError(
+                f"Edition tasks cannot publish shared Analyze canonical kind: {kind}"
+            )
+        public_record_id = record_id
+        record_id = self._storage_record_id(kind, record_id)
+        source = Path(os.path.abspath(source_path))
+        if self.edition_id is None and not is_within(source, self.root):
             raise ProcessingError("Canonical record source must be a regular workspace file")
+        source_payload = self.read_file_bytes(source)
         now = datetime.now(UTC)
-        with self.connect() as connection:
-            task = connection.execute(
-                "SELECT state FROM work_items WHERE id=?",
-                (producer_task_id,),
-            ).fetchone()
-            if task is None:
-                raise ProcessingError(f"Unknown producer task: {producer_task_id}")
-            head = connection.execute(
-                """
-                SELECT revision FROM canonical_heads
-                WHERE kind=? AND record_id=?
-                """,
-                (kind, record_id),
-            ).fetchone()
-            revision = (int(head["revision"]) + 1) if head is not None else 1
-            suffix = source.suffix if source.suffix in {".json", ".md"} else ".data"
-            record_directory = (
-                self.analysis_dir
-                / "records"
-                / stable_hash(kind, length=20)
-                / stable_hash(record_id, length=20)
-            )
-            destination = record_directory / f"r{revision}{suffix}"
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            if destination.exists():
-                raise ProcessingError(f"Canonical record revision already exists: {destination}")
-            temporary = destination.with_name(f".{destination.name}.{secrets.token_hex(8)}.tmp")
-            try:
-                shutil.copyfile(source, temporary)
-                temporary.replace(destination)
-            finally:
-                temporary.unlink(missing_ok=True)
-            digest = hash_file(destination)
-            relative = destination.relative_to(self.root)
-            connection.execute(
-                """
-                INSERT INTO canonical_records(
-                    kind, record_id, revision, path, digest, producer_task_id,
-                    snapshot_digest, created_at
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    kind,
-                    record_id,
-                    revision,
-                    str(relative),
-                    digest,
-                    producer_task_id,
-                    snapshot_digest,
-                    now.isoformat(),
-                ),
-            )
-            connection.execute(
-                """
-                INSERT INTO canonical_heads(kind, record_id, revision)
-                VALUES(?, ?, ?)
-                ON CONFLICT(kind, record_id) DO UPDATE SET revision=excluded.revision
-                """,
-                (kind, record_id, revision),
-            )
+        destination: Path | None = None
+        try:
+            with self.connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                task = connection.execute(
+                    "SELECT state FROM work_items WHERE id=?",
+                    (producer_task_id,),
+                ).fetchone()
+                if task is None:
+                    raise ProcessingError(f"Unknown producer task: {producer_task_id}")
+                head = connection.execute(
+                    """
+                    SELECT revision FROM canonical_heads
+                    WHERE kind=? AND record_id=?
+                    """,
+                    (kind, record_id),
+                ).fetchone()
+                revision = (int(head["revision"]) + 1) if head is not None else 1
+                suffix = source.suffix if source.suffix in {".json", ".md"} else ".data"
+                record_directory = (
+                    self.analysis_dir
+                    / "records"
+                    / stable_hash(kind, length=20)
+                    / stable_hash(record_id, length=20)
+                )
+                destination = record_directory / f"r{revision}{suffix}"
+                self.write_file_bytes(destination, source_payload, overwrite=False)
+                digest = sha256(source_payload).hexdigest()
+                relative = destination.relative_to(self.root)
+                connection.execute(
+                    """
+                    INSERT INTO canonical_records(
+                        kind, record_id, revision, path, digest, producer_task_id,
+                        snapshot_digest, created_at
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        kind,
+                        record_id,
+                        revision,
+                        str(relative),
+                        digest,
+                        producer_task_id,
+                        snapshot_digest,
+                        now.isoformat(),
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO canonical_heads(kind, record_id, revision)
+                    VALUES(?, ?, ?)
+                    ON CONFLICT(kind, record_id) DO UPDATE SET revision=excluded.revision
+                    """,
+                    (kind, record_id, revision),
+                )
+        except Exception:
+            if destination is not None:
+                with suppress(ProcessingError):
+                    self.remove_file(destination)
+            raise
         return CanonicalRecord(
             kind=kind,
-            record_id=record_id,
+            record_id=public_record_id,
             revision=revision,
             path=relative,
             digest=digest,
@@ -929,22 +1832,40 @@ class Workspace:
         task_id: str,
         lease_token: str,
         result_path: Path,
+        result_snapshot: WorkspaceFileSnapshot | None = None,
         producer: dict[str, Any],
-        canonical_outputs: Iterable[tuple[str, str, Path]] = (),
+        canonical_outputs: Iterable[CanonicalOutput] = (),
+        identity_baseline: dict[str, Any] | None = None,
     ) -> tuple[WorkItem, list[CanonicalRecord]]:
         """Atomically accept a validated result and advance canonical record heads."""
 
         item = self.get_work_item(task_id)
-        result = result_path.resolve()
-        task_output = (self.tasks_dir / task_id / "output").resolve()
-        if (
-            not result.is_file()
-            or result.is_symlink()
-            or not is_within(result, task_output)
-            or any(parent.is_symlink() for parent in [result, *result.parents[:2]])
-        ):
-            raise ProcessingError("Task result must be a regular file in its task output directory")
-        result_digest = hash_file(result)
+        self._assert_task_mutable(item)
+        canonical_output_list = list(canonical_outputs)
+        if self.edition_id is not None:
+            invalid_kinds = sorted(
+                {
+                    output.kind if isinstance(output, CanonicalOutputSnapshot) else output[0]
+                    for output in canonical_output_list
+                }
+                - _EDITION_CANONICAL_KINDS
+            )
+            if invalid_kinds:
+                raise ProcessingError(
+                    "Edition tasks cannot publish shared Analyze canonical kinds: "
+                    + ", ".join(invalid_kinds)
+                )
+        result = Path(os.path.abspath(result_path))
+        if result_snapshot is None:
+            result_snapshot = self.task_output_file_snapshot(task_id, result)
+        else:
+            self._validate_task_output_snapshot(
+                task_id,
+                result_snapshot,
+                expected_path=result,
+            )
+        result_payload = result_snapshot.payload
+        result_digest = result_snapshot.digest
         now = datetime.now(UTC)
         if item.state == WorkState.COMPLETE:
             if item.result_digest == result_digest:
@@ -956,25 +1877,33 @@ class Workspace:
             raise ProcessingError(f"Task lease has expired: {task_id}")
         if self.workspace_snapshot_digest() != item.snapshot_digest:
             raise ProcessingError(f"Workspace snapshot changed while task was leased: {task_id}")
-        output_specs = list(canonical_outputs)
-        for _kind, _record_id, source_path in output_specs:
-            source = source_path.resolve()
-            if not source.is_file() or source.is_symlink() or not is_within(source, task_output):
-                raise ProcessingError(
-                    "Canonical outputs must be regular files in the task output directory"
+        output_specs: list[tuple[str, str, Path, bytes]] = []
+        for output in canonical_output_list:
+            if isinstance(output, CanonicalOutputSnapshot):
+                kind = output.kind
+                record_id = output.record_id
+                source_snapshot = output.file
+                self._validate_task_output_snapshot(task_id, source_snapshot)
+                source = source_snapshot.path
+            else:
+                kind, record_id, source_path = output
+                source = Path(os.path.abspath(source_path))
+                source_snapshot = self.task_output_file_snapshot(task_id, source)
+            output_specs.append(
+                (
+                    kind,
+                    self._storage_record_id(kind, record_id),
+                    source,
+                    source_snapshot.payload,
                 )
+            )
         token_hash = sha256(lease_token.encode("utf-8")).hexdigest()
         accepted_result = self.analysis_dir / "results" / f"{task_id}.json"
-        accepted_result.parent.mkdir(parents=True, exist_ok=True)
-        temporary_result = accepted_result.with_name(
-            f".{accepted_result.name}.{secrets.token_hex(8)}.tmp"
-        )
         prepared_records: list[CanonicalRecord] = []
         prepared_paths: list[Path] = []
         try:
-            shutil.copyfile(result, temporary_result)
-            temporary_result.replace(accepted_result)
             with self.connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
                 row = connection.execute(
                     """
                     SELECT state, lease_token_hash, lease_expires_at, snapshot_digest
@@ -991,7 +1920,11 @@ class Workspace:
                 expires = datetime.fromisoformat(str(row["lease_expires_at"]))
                 if expires <= now:
                     raise ProcessingError(f"Task lease has expired: {task_id}")
-                for kind, record_id, source_path in output_specs:
+                if str(row["snapshot_digest"]) != item.snapshot_digest:
+                    raise ProcessingError(f"Task snapshot changed before acceptance: {task_id}")
+                self.write_file_bytes(accepted_result, result_payload, overwrite=False)
+                prepared_paths.append(accepted_result)
+                for kind, record_id, source_path, source_payload in output_specs:
                     head = connection.execute(
                         """
                         SELECT revision FROM canonical_heads
@@ -1012,26 +1945,14 @@ class Workspace:
                         / stable_hash(record_id, length=20)
                         / f"r{revision}{suffix}"
                     )
-                    destination.parent.mkdir(parents=True, exist_ok=True)
-                    if destination.exists():
-                        raise ProcessingError(
-                            f"Canonical record revision already exists: {destination}"
-                        )
-                    temporary = destination.with_name(
-                        f".{destination.name}.{secrets.token_hex(8)}.tmp"
-                    )
-                    try:
-                        shutil.copyfile(source_path, temporary)
-                        temporary.replace(destination)
-                    finally:
-                        temporary.unlink(missing_ok=True)
+                    self.write_file_bytes(destination, source_payload, overwrite=False)
                     prepared_paths.append(destination)
                     record = CanonicalRecord(
                         kind=kind,
                         record_id=record_id,
                         revision=revision,
                         path=destination.relative_to(self.root),
-                        digest=hash_file(destination),
+                        digest=sha256(source_payload).hexdigest(),
                         producer_task_id=task_id,
                         snapshot_digest=item.snapshot_digest,
                         created_at=now,
@@ -1063,6 +1984,13 @@ class Workspace:
                         (record.kind, record.record_id, record.revision),
                     )
                     prepared_records.append(record)
+                if identity_baseline is not None:
+                    self._accept_identity_baseline(
+                        connection,
+                        task_id=task_id,
+                        payload=identity_baseline,
+                        now=now,
+                    )
                 connection.execute(
                     """
                     INSERT INTO work_results(
@@ -1093,15 +2021,15 @@ class Workspace:
                     ),
                 )
         except Exception:
-            for path in prepared_paths:
-                path.unlink(missing_ok=True)
-            accepted_result.unlink(missing_ok=True)
+            for path in reversed(prepared_paths):
+                with suppress(ProcessingError):
+                    self.remove_file(path)
             raise
-        finally:
-            temporary_result.unlink(missing_ok=True)
         return self.get_work_item(task_id), prepared_records
 
     def canonical_record(self, kind: str, record_id: str = "default") -> CanonicalRecord | None:
+        public_record_id = record_id
+        record_id = self._storage_record_id(kind, record_id)
         with self.connect() as connection:
             row = connection.execute(
                 """
@@ -1119,7 +2047,7 @@ class Workspace:
             return None
         return CanonicalRecord(
             kind=str(row["kind"]),
-            record_id=str(row["record_id"]),
+            record_id=public_record_id,
             revision=int(row["revision"]),
             path=Path(str(row["path"])),
             digest=str(row["digest"]),
@@ -1134,6 +2062,7 @@ class Workspace:
         *,
         failed_sources: list[str] | None = None,
     ) -> JobManifest:
+        self._require_shared_evidence_view("job state")
         manifest = self.load_manifest()
         manifest.state = state
         if failed_sources is not None:
@@ -1313,6 +2242,447 @@ class Workspace:
                 ).fetchone(),
             )
 
+    def start_tool_run(self, start: ToolRunStart) -> str:
+        """Atomically allocate one immutable attempt for a stable logical run."""
+
+        self._require_shared_evidence_view("tool-run start")
+        now = start.started_at.isoformat()
+        arguments_json = bounded_json_text(
+            start.arguments,
+            max_bytes=MAX_ARGUMENT_BYTES,
+            label="tool-run arguments",
+        )
+        inputs_json = bounded_json_text(
+            start.input_digests,
+            max_bytes=MAX_ARGUMENT_BYTES,
+            label="tool-run inputs",
+        )
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO tool_runs(
+                    id, identity_digest, tool, tool_version, operation, source_id,
+                    stage, input_digests_json, arguments_json, cache_key,
+                    attempt_count, cache_hit_count, created_at, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)
+                ON CONFLICT(id) DO NOTHING
+                """,
+                (
+                    start.id,
+                    start.identity_digest,
+                    start.tool,
+                    start.tool_version,
+                    start.operation,
+                    start.source_id,
+                    start.stage,
+                    inputs_json,
+                    arguments_json,
+                    start.cache_key,
+                    now,
+                    now,
+                ),
+            )
+            row = connection.execute(
+                "SELECT identity_digest FROM tool_runs WHERE id=?",
+                (start.id,),
+            ).fetchone()
+            if row is None or str(row["identity_digest"]) != start.identity_digest:
+                raise ProcessingError("Tool-run identity collision detected")
+            generation_row = connection.execute(
+                """
+                UPDATE tool_runs
+                SET attempt_count=attempt_count + 1, updated_at=?
+                WHERE id=?
+                RETURNING attempt_count
+                """,
+                (now, start.id),
+            ).fetchone()
+            if generation_row is None:
+                raise ProcessingError(f"Unknown logical tool run: {start.id}")
+            generation = int(generation_row["attempt_count"])
+            attempt_id = f"{start.id}-attempt-{generation:06d}"
+            connection.execute(
+                """
+                INSERT INTO tool_run_attempts(
+                    id, tool_run_id, generation, status, outputs_json,
+                    started_at, updated_at
+                ) VALUES(?, ?, ?, 'running', '[]', ?, ?)
+                """,
+                (attempt_id, start.id, generation, now, now),
+            )
+        return attempt_id
+
+    def finish_tool_run(self, finish: ToolRunFinish) -> None:
+        """Finish a tool execution without retaining raw stdout, stderr, or errors."""
+
+        self._require_shared_evidence_view("tool-run completion")
+        sanitized_outputs = sanitize_value(finish.outputs, workspace_root=self.root)
+        if not isinstance(sanitized_outputs, list):
+            raise ProcessingError("Tool-run outputs must be a list")
+        outputs_json = bounded_json_text(
+            sanitized_outputs,
+            max_bytes=MAX_OUTPUT_BYTES,
+            label="tool-run outputs",
+        )
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE tool_run_attempts SET
+                    outputs_json=?, status=?, return_code=?, error_kind=?,
+                    completed_at=?, duration_ms=?, updated_at=?
+                WHERE id=? AND status='running'
+                """,
+                (
+                    outputs_json,
+                    finish.status,
+                    finish.return_code,
+                    finish.error_kind,
+                    finish.completed_at.isoformat(),
+                    finish.duration_ms,
+                    finish.completed_at.isoformat(),
+                    finish.attempt_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ProcessingError(
+                    f"Unknown or already completed tool-run attempt: {finish.attempt_id}"
+                )
+
+    def record_tool_cache_hit(
+        self,
+        source_id: str,
+        stage: ProcessingStage,
+        cache_key: str,
+    ) -> int:
+        """Associate a resumed stage with its prior completed tool executions."""
+
+        self._require_shared_evidence_view("tool-run cache hit")
+        now = datetime.now(UTC).isoformat()
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE tool_runs
+                SET cache_hit_count=cache_hit_count + 1, updated_at=?
+                WHERE source_id=? AND stage=? AND cache_key=?
+                  AND EXISTS (
+                      SELECT 1 FROM tool_run_attempts attempts
+                      WHERE attempts.tool_run_id=tool_runs.id
+                        AND attempts.status='complete'
+                  )
+                """,
+                (now, source_id, stage.value, cache_key),
+            )
+        return cursor.rowcount
+
+    @staticmethod
+    def _load_bounded_tool_json(
+        payload: object,
+        *,
+        max_bytes: int,
+        label: str,
+    ) -> object:
+        text = str(payload)
+        if len(text.encode("utf-8")) > max_bytes:
+            raise ProcessingError(f"{label} exceeds its storage limit")
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ProcessingError(f"{label} is not valid JSON") from exc
+
+    def _verify_logical_tool_output(
+        self,
+        output: dict[str, object],
+    ) -> str:
+        """Verify a typed semantic digest against its authoritative SQLite record."""
+
+        record_type = output.get("record_type")
+        record_id = output.get("record_id")
+        expected = output.get("semantic_sha256")
+        if not all(isinstance(value, str) for value in (record_type, record_id, expected)):
+            return "mismatch"
+        assert isinstance(record_type, str)
+        assert isinstance(record_id, str)
+        assert isinstance(expected, str)
+        if record_type == "transcript-segments":
+            with self.connect() as connection:
+                source = connection.execute(
+                    "SELECT 1 FROM sources WHERE id=?",
+                    (record_id,),
+                ).fetchone()
+            if source is None:
+                return "missing"
+            actual = digest_value(
+                [
+                    segment.model_dump(mode="json")
+                    for segment in self.transcripts(record_id, limit=1_000_000)
+                ]
+            )
+            return "verified" if actual == expected else "mismatch"
+        if record_type in {"visual-event-ocr", "visual-event-analysis"}:
+            with self.connect() as connection:
+                row = connection.execute(
+                    "SELECT data_json FROM visual_events WHERE id=?",
+                    (record_id,),
+                ).fetchone()
+            if row is None:
+                return "missing"
+            try:
+                event = VisualEvent.model_validate_json(str(row["data_json"]))
+            except ValueError:
+                return "mismatch"
+            if record_type == "visual-event-ocr":
+                value = {
+                    "event_id": event.id,
+                    "ocr_text": event.ocr_text,
+                    "ocr_confidence": event.ocr_confidence,
+                }
+            else:
+                value = {
+                    "event_id": event.id,
+                    "kind": event.kind.value,
+                    "description": event.description,
+                    "confidence": event.confidence,
+                }
+            return "verified" if digest_value(value) == expected else "mismatch"
+        return "mismatch"
+
+    def _prepare_tool_outputs(self, payload: object) -> list[dict[str, object]]:
+        parsed = self._load_bounded_tool_json(
+            payload,
+            max_bytes=MAX_OUTPUT_BYTES,
+            label="Tool-run outputs",
+        )
+        sanitized = sanitize_value(parsed, workspace_root=self.root)
+        if not isinstance(sanitized, list):
+            raise ProcessingError("Tool-run outputs must be a list")
+        outputs: list[dict[str, object]] = []
+        for item in sanitized:
+            if not isinstance(item, dict):
+                raise ProcessingError("Tool-run output entries must be objects")
+            prepared = cast(dict[str, object], item)
+            if prepared.get("kind") == "logical-record":
+                prepared = {
+                    **prepared,
+                    "verification": self._verify_logical_tool_output(prepared),
+                }
+            outputs.append(prepared)
+        bounded_json_text(
+            outputs,
+            max_bytes=MAX_OUTPUT_BYTES,
+            label="tool-run outputs",
+        )
+        return outputs
+
+    def tool_run_records(self) -> list[dict[str, object]]:
+        """Return canonical sanitized records in stable identity order."""
+
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM tool_runs
+                ORDER BY id
+                """
+            ).fetchall()
+            attempt_rows = connection.execute(
+                """
+                SELECT * FROM tool_run_attempts
+                ORDER BY tool_run_id, generation
+                """
+            ).fetchall()
+        attempts_by_run: dict[str, list[sqlite3.Row]] = {}
+        for attempt_row in attempt_rows:
+            attempts_by_run.setdefault(str(attempt_row["tool_run_id"]), []).append(attempt_row)
+        records: list[dict[str, object]] = []
+        for row in rows:
+            input_digests = self._load_bounded_tool_json(
+                row["input_digests_json"],
+                max_bytes=MAX_ARGUMENT_BYTES,
+                label="Tool-run inputs",
+            )
+            arguments = self._load_bounded_tool_json(
+                row["arguments_json"],
+                max_bytes=MAX_ARGUMENT_BYTES,
+                label="Tool-run arguments",
+            )
+            attempts: list[dict[str, object]] = []
+            for attempt_row in attempts_by_run.get(str(row["id"]), []):
+                attempts.append(
+                    {
+                        "id": str(attempt_row["id"]),
+                        "generation": int(attempt_row["generation"]),
+                        "status": str(attempt_row["status"]),
+                        "outputs": self._prepare_tool_outputs(attempt_row["outputs_json"]),
+                        "return_code": cast(int | None, attempt_row["return_code"]),
+                        "error_kind": cast(str | None, attempt_row["error_kind"]),
+                        "started_at": str(attempt_row["started_at"]),
+                        "completed_at": cast(str | None, attempt_row["completed_at"]),
+                        "duration_ms": cast(int | None, attempt_row["duration_ms"]),
+                    }
+                )
+            if not attempts:
+                raise ProcessingError(f"Tool run has no execution attempts: {row['id']}")
+            latest = attempts[-1]
+            record: dict[str, object] = {
+                "schema_version": 1,
+                "id": str(row["id"]),
+                "tool": str(row["tool"]),
+                "tool_version": cast(str | None, row["tool_version"]),
+                "operation": str(row["operation"]),
+                "source_id": cast(str | None, row["source_id"]),
+                "stage": cast(str | None, row["stage"]),
+                "input_sha256": input_digests,
+                "arguments": arguments,
+                "outputs": latest["outputs"],
+                "cache_key": cast(str | None, row["cache_key"]),
+                "attempts": attempts,
+                "execution": {
+                    "status": latest["status"],
+                    "return_code": latest["return_code"],
+                    "error_kind": latest["error_kind"],
+                    "attempt_count": int(row["attempt_count"]),
+                    "cache_hit_count": int(row["cache_hit_count"]),
+                    "first_started_at": str(row["created_at"]),
+                    "last_started_at": latest["started_at"],
+                    "completed_at": latest["completed_at"],
+                    "duration_ms": latest["duration_ms"],
+                },
+            }
+            sanitized = sanitize_value(record, workspace_root=self.root)
+            if not isinstance(sanitized, dict):
+                raise ProcessingError("Tool-run sanitizer returned an invalid record")
+            prepared_record = cast(dict[str, object], sanitized)
+            bounded_json_text(
+                prepared_record,
+                max_bytes=MAX_EXPORTED_RECORD_BYTES,
+                label="tool-run export record",
+            )
+            records.append(prepared_record)
+        return records
+
+    def export_tool_runs(self, output: Path | None = None) -> dict[str, object]:
+        """Write canonical JSONL inside the private raw workspace."""
+
+        destination = output or self.root / "logs" / "tool-runs.jsonl"
+        lexical_destination = Path(os.path.abspath(destination.expanduser()))
+        lexical_root = Path(os.path.abspath(self.root))
+        try:
+            relative = lexical_destination.relative_to(lexical_root)
+        except ValueError as exc:
+            raise ProcessingError("Tool-run exports must remain inside the raw workspace") from exc
+        if (
+            not relative.parts
+            or relative.parts[0] != "logs"
+            or relative.suffix != ".jsonl"
+            or any(part in {"", ".", ".."} for part in relative.parts)
+        ):
+            raise ProcessingError("Tool-run export path is invalid")
+        records = self.tool_run_records()
+        payload = b"".join(
+            (
+                json.dumps(
+                    record,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("utf-8")
+            for record in records
+        )
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        descriptors: list[int] = []
+        temporary_name = f".{relative.name}.{secrets.token_hex(12)}.tmp"
+
+        def read_existing(directory_fd: int) -> bytes:
+            flags = os.O_RDONLY | nofollow
+            descriptor = os.open(relative.name, flags, dir_fd=directory_fd)
+            try:
+                metadata = os.fstat(descriptor)
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise ProcessingError("Tool-run export target is not a regular file")
+                if metadata.st_size != len(payload):
+                    raise ProcessingError(
+                        "Tool-run export target already exists with different content"
+                    )
+                with os.fdopen(descriptor, "rb", closefd=False) as handle:
+                    existing_payload = handle.read(len(payload) + 1)
+            finally:
+                os.close(descriptor)
+            if existing_payload != payload:
+                raise ProcessingError(
+                    "Tool-run export target already exists with different content"
+                )
+            return existing_payload
+
+        try:
+            current_fd = os.open(self.root, directory_flags | nofollow)
+            descriptors.append(current_fd)
+            for part in relative.parts[:-1]:
+                with suppress(FileExistsError):
+                    os.mkdir(part, mode=0o700, dir_fd=current_fd)
+                current_fd = os.open(part, directory_flags | nofollow, dir_fd=current_fd)
+                descriptors.append(current_fd)
+            try:
+                existing = os.stat(relative.name, dir_fd=current_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                existing = None
+            if existing is not None and not stat.S_ISREG(existing.st_mode):
+                raise ProcessingError("Tool-run export target is not a regular file")
+            if existing is not None:
+                read_existing(current_fd)
+                os.fsync(current_fd)
+                existing = None
+                return self._tool_run_export_report(records, payload, relative)
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow
+            output_fd = os.open(temporary_name, flags, 0o600, dir_fd=current_fd)
+            try:
+                with os.fdopen(output_fd, "wb", closefd=False) as handle:
+                    handle.write(payload)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            finally:
+                os.close(output_fd)
+            try:
+                os.link(
+                    temporary_name,
+                    relative.name,
+                    src_dir_fd=current_fd,
+                    dst_dir_fd=current_fd,
+                    follow_symlinks=False,
+                )
+            except FileExistsError:
+                read_existing(current_fd)
+            os.fsync(current_fd)
+        except OSError as exc:
+            raise ProcessingError(f"Tool-run export path is unsafe: {relative}") from exc
+        finally:
+            if descriptors:
+                with suppress(FileNotFoundError):
+                    os.unlink(temporary_name, dir_fd=descriptors[-1])
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
+        return self._tool_run_export_report(records, payload, relative)
+
+    @staticmethod
+    def _tool_run_export_report(
+        records: list[dict[str, object]],
+        payload: bytes,
+        relative: Path,
+    ) -> dict[str, object]:
+        statuses: dict[str, int] = {}
+        for record in records:
+            execution = cast(dict[str, object], record["execution"])
+            status = str(execution["status"])
+            statuses[status] = statuses.get(status, 0) + 1
+        return {
+            "schema_version": 1,
+            "path": relative.as_posix(),
+            "sha256": sha256(payload).hexdigest(),
+            "records": len(records),
+            "statuses": dict(sorted(statuses.items())),
+        }
+
     def stage_complete(self, source_id: str, stage: ProcessingStage, cache_key: str) -> bool:
         with self.connect() as connection:
             row = connection.execute(
@@ -1322,6 +2692,7 @@ class Workspace:
         return bool(row and row["state"] == "complete" and row["cache_key"] == cache_key)
 
     def start_stage(self, source_id: str, stage: ProcessingStage, cache_key: str) -> None:
+        self._require_shared_evidence_view("stage start")
         with self.connect() as connection:
             warning_rows = connection.execute(
                 "SELECT id, data_json FROM warnings WHERE source_id=?", (source_id,)
@@ -1355,6 +2726,7 @@ class Workspace:
             )
 
     def complete_stage(self, source_id: str, stage: ProcessingStage, cache_key: str) -> None:
+        self._require_shared_evidence_view("stage completion")
         with self.connect() as connection:
             connection.execute(
                 """
@@ -1367,6 +2739,7 @@ class Workspace:
     def fail_stage(
         self, source_id: str, stage: ProcessingStage, cache_key: str, error: str
     ) -> None:
+        self._require_shared_evidence_view("stage failure")
         with self.connect() as connection:
             connection.execute(
                 """
@@ -1988,6 +3361,51 @@ class Workspace:
             ).fetchall()
         return [AgentObservation.model_validate_json(row["data_json"]) for row in rows]
 
+    def analysis_evidence_counts(
+        self,
+        source_id: str,
+        *,
+        start: float,
+        end: float,
+    ) -> dict[str, int]:
+        """Return exact packet-category counts for one semantic interval."""
+
+        with self.connect() as connection:
+            transcript_count = connection.execute(
+                """
+                SELECT COUNT(*) AS count FROM transcript_segments
+                WHERE source_id=? AND end>=? AND start<=?
+                """,
+                (source_id, start, end),
+            ).fetchone()
+            visual_count = connection.execute(
+                """
+                SELECT COUNT(*) AS count FROM visual_events
+                WHERE source_id=? AND timestamp>=? AND timestamp<=?
+                """,
+                (source_id, start, end),
+            ).fetchone()
+            observation_count = connection.execute(
+                """
+                SELECT COUNT(*) AS count FROM agent_observations
+                WHERE source_id=? AND end>=? AND start<=?
+                """,
+                (source_id, start, end),
+            ).fetchone()
+            gap_count = connection.execute(
+                """
+                SELECT COUNT(*) AS count FROM evidence_gaps
+                WHERE source_id=? AND end>=? AND start<=?
+                """,
+                (source_id, start, end),
+            ).fetchone()
+        return {
+            "transcripts": int(transcript_count["count"]),
+            "visuals": int(visual_count["count"]),
+            "observations": int(observation_count["count"]),
+            "gaps": int(gap_count["count"]),
+        }
+
     def list_observations(
         self,
         source_id: str,
@@ -2151,6 +3569,8 @@ class Workspace:
         *,
         gap_type: EvidenceGapType | None = None,
         resolved: bool | None = None,
+        start: float | None = None,
+        end: float | None = None,
         limit: int | None = 1000,
     ) -> list[EvidenceGap]:
         if limit is not None and limit < 1:
@@ -2166,6 +3586,12 @@ class Workspace:
         if resolved is not None:
             where.append("resolved=?")
             params.append(int(resolved))
+        if start is not None:
+            where.append("end>=?")
+            params.append(start)
+        if end is not None:
+            where.append("start<=?")
+            params.append(end)
         query = "SELECT data_json FROM evidence_gaps"
         if where:
             query += " WHERE " + " AND ".join(where)

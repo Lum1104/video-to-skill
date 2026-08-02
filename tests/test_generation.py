@@ -5,6 +5,7 @@ import pytest
 from PIL import Image
 from pydantic import ValidationError as PydanticValidationError
 
+import video_to_skill.generation as generation_module
 from video_to_skill.errors import ProcessingError
 from video_to_skill.generation import (
     COURSE_SKILL_MARKER,
@@ -20,6 +21,7 @@ from video_to_skill.generation import (
     CurriculumPath,
     SemanticUnit,
     blueprint_from_json,
+    course_skill_build_id,
     render_course_skill_package,
 )
 from video_to_skill.utils import hash_file
@@ -289,6 +291,20 @@ def _blueprint_with_asset(workspace: Path, source_path: Path) -> CourseSkillBlue
         ).model_dump(mode="json")
     ]
     return CourseSkillBlueprint.model_validate(payload)
+
+
+def test_renderer_contract_version_is_part_of_build_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    blueprint = _blueprint()
+    current = course_skill_build_id(blueprint)
+    monkeypatch.setattr(
+        generation_module,
+        "COURSE_SKILL_RENDERER_CONTRACT_VERSION",
+        generation_module.COURSE_SKILL_RENDERER_CONTRACT_VERSION + 1,
+    )
+
+    assert course_skill_build_id(blueprint) != current
 
 
 def test_rendered_course_skill_is_teaching_first_and_valid(tmp_path: Path) -> None:

@@ -6,16 +6,53 @@ from PIL import Image
 
 from video_to_skill.config import Settings
 from video_to_skill.errors import ProcessingError
+from video_to_skill.models import VisualEvent
 from video_to_skill.utils import run_command
 from video_to_skill.visual import (
     MAX_EXTRACTED_FRAME_HEIGHT,
     MAX_EXTRACTED_FRAME_PIXELS,
     MAX_EXTRACTED_FRAME_WIDTH,
+    _bounded_visual_retention,
     bounded_frame_scale_filter,
     difference_hash,
     extract_candidate_frames,
     hash_distance,
 )
+
+
+def test_visual_retention_cap_reports_drops_and_deletes_only_dropped_candidates(
+    tmp_path: Path,
+) -> None:
+    sentinel = tmp_path / "sentinel.jpg"
+    sentinel.write_bytes(b"unrelated")
+    events: list[VisualEvent] = []
+    for index in range(10):
+        path = tmp_path / f"candidate-{index}.jpg"
+        path.write_bytes(f"candidate-{index}".encode())
+        events.append(
+            VisualEvent(
+                id=f"candidate-{index}",
+                source_id="source",
+                timestamp=float(index * 10),
+                path=path,
+                scene_score=float(index % 4) / 4,
+            )
+        )
+
+    retained, report = _bounded_visual_retention(
+        events,
+        3,
+        source_id="source",
+        budget_digest="budget",
+    )
+
+    assert [event.timestamp for event in retained] == [0, 30, 90]
+    assert (report.candidate_count, report.retained_count, report.dropped_count) == (10, 3, 7)
+    assert report.truncated is True
+    assert sum(interval.dropped_count for interval in report.affected_intervals) == 7
+    assert all(event.path.is_file() for event in retained)
+    assert all(event.path.exists() == (event in retained) for event in events)
+    assert sentinel.read_bytes() == b"unrelated"
 
 
 def test_color_aware_hash_preserves_distinct_visual_states(tmp_path: Path) -> None:

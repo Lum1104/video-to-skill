@@ -25,18 +25,24 @@ from video_to_skill.workspace import Workspace
 runner = CliRunner()
 
 
-def _evidence_workspace(tmp_path: Path) -> Workspace:
+def _evidence_workspace(
+    tmp_path: Path,
+    *,
+    duration: float = 120,
+    section_end: float = 30,
+) -> Workspace:
+    settings = Settings(cache_root=tmp_path, analysis_depth="standard")
     workspace = Workspace.create(
         root=tmp_path / "workspace",
         inputs=["demo"],
-        settings=Settings(cache_root=tmp_path),
+        settings=settings,
     )
     source = SourceDescriptor(
         id="source",
         platform=SourcePlatform.LOCAL,
         locator=str(tmp_path / "demo.mp4"),
         title="Agent Demo",
-        duration=120,
+        duration=duration,
     )
     workspace.upsert_sources([source])
     transcript = TranscriptSegment(
@@ -63,13 +69,14 @@ def _evidence_workspace(tmp_path: Path) -> Workspace:
         ordinal=1,
         title="Save state",
         start=0,
-        end=30,
+        end=section_end,
         transcript_ids=[transcript.id],
         visual_event_ids=[visual.id],
     )
     workspace.replace_transcripts(source.id, [transcript])
     workspace.replace_visuals(source.id, [visual])
     workspace.replace_semantic_segments(source.id, [segment])
+    workspace.create_analysis_run(settings=settings)
     return workspace
 
 
@@ -139,6 +146,64 @@ def test_contact_sheet_and_context_commands(tmp_path: Path) -> None:
     assert context_payload["window"] == {"start": 0.0, "end": 30.0}
     assert context_payload["transcripts"][0]["id"] == "transcript"
     assert context_payload["visuals"][0]["id"] == "visual"
+
+
+@pytest.mark.parametrize("section_end", [420, 720])
+def test_context_returns_complete_standard_depth_sections_up_to_profile_limit(
+    tmp_path: Path,
+    section_end: float,
+) -> None:
+    workspace = _evidence_workspace(
+        tmp_path,
+        duration=section_end,
+        section_end=section_end,
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "context",
+            str(workspace.root),
+            "--source",
+            "source",
+            "--section",
+            "1",
+            "--format",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["window"] == {"start": 0.0, "end": section_end}
+
+
+def test_context_rejects_section_beyond_profile_limit_and_oversized_timestamp(
+    tmp_path: Path,
+) -> None:
+    workspace = _evidence_workspace(tmp_path, duration=721, section_end=721)
+
+    oversized_section = runner.invoke(
+        app,
+        ["context", str(workspace.root), "--source", "source", "--section", "1"],
+    )
+    assert oversized_section.exit_code == 2
+    assert "Semantic section is 721s; maximum is 720s" in oversized_section.output
+
+    oversized_timestamp = runner.invoke(
+        app,
+        [
+            "context",
+            str(workspace.root),
+            "--source",
+            "source",
+            "--at",
+            "360",
+            "--window",
+            "91",
+        ],
+    )
+    assert oversized_timestamp.exit_code == 2
+    assert "Context window is 182s; maximum is 180s" in oversized_timestamp.output
 
 
 def test_annotate_and_gaps_commands_persist_agent_state(tmp_path: Path) -> None:

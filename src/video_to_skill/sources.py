@@ -292,6 +292,7 @@ class LocalSourceAdapter(SourceAdapter):
                 str(path),
             ],
             timeout=settings.command_timeout_seconds,
+            provenance_operation="inspect-local-media",
         )
         try:
             probe = json.loads(result.stdout)
@@ -486,6 +487,7 @@ class YtDlpSourceAdapter(SourceAdapter):
                 locator,
             ],
             timeout=settings.command_timeout_seconds,
+            provenance_operation="inspect-remote-source",
         )
         try:
             payload = json.loads(result.stdout)
@@ -697,7 +699,11 @@ class YtDlpSourceAdapter(SourceAdapter):
         else:
             args.append("--skip-download")
         args.append(source.locator)
-        run_command(args, timeout=settings.command_timeout_seconds)
+        run_command(
+            args,
+            timeout=settings.command_timeout_seconds,
+            provenance_operation="materialize-remote-source",
+        )
 
         caption_paths = sorted(
             path

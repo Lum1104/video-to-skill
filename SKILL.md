@@ -22,9 +22,13 @@ Treat supplied URLs or local paths as authorization for reversible local process
 
 Ask only when a material boundary cannot be inferred safely: credentials are needed, local or private media would leave the machine, a billed dependency is required, scope is unexpectedly large, the user must choose between materially different curricula, or an installation name conflicts with different content.
 
+Infer one canonical artifact language for every new build from the user's substantive request and conversation language. Honor an explicit language or locale exactly. For an ordinary personal build, use the user's language; for an explicitly public international release, recommend English unless the user named another audience. Ask only when competing language choices would materially change the intended audience and the intent cannot be inferred. Keep this separate from source caption or ASR selection.
+
 Never ask the user to run internal commands, supervise extraction, select frame parameters, copy task payloads, or invoke a second tutor Skill. Never request an account password.
 
 Resolve the complete expected source set before treating acquisition as complete. Preserve playlist order and explicit complete, partial, failed, skipped, inaccessible, or retired states. Continue through isolated source failures when useful material remains, never silently omit an expected item, and report how missing material limits the generated Skill.
+
+Use the engine's product-level analysis-depth contract instead of choosing frame or task knobs. `auto` deterministically recommends `standard` or `deep` from inspected duration, item count, chapters, caption coverage, and content signals. Use an explicit `standard` or `deep` when the user requests it. Use `archival` only when the user explicitly accepts its materially higher private storage and review boundary; it is never an implicit default. Analysis depth cannot authorize hosted vision, a paid provider, credentials, media redistribution, or visual processing disabled by `visual_profile=transcript`.
 
 The engine is model-agnostic and never calls an LLM. The host main agent dispatches native workers for semantic, multimodal, pedagogical, and critical judgment; deterministic code owns acquisition, bounded packets, task state, validation, compilation, rendering, and installation.
 
@@ -62,15 +66,43 @@ Choose a durable workspace outside the generated output and installed Skill. Use
 Start a new conversion:
 
 ```bash
-"$V2S_ENGINE" run SOURCES... --workspace WORKSPACE --host codex
-"$V2S_ENGINE" run SOURCES... --workspace WORKSPACE --host claude
+"$V2S_ENGINE" run SOURCES... --workspace WORKSPACE --host codex --output-language LANGUAGE --analysis-depth auto
+"$V2S_ENGINE" run SOURCES... --workspace WORKSPACE --host claude --output-language LANGUAGE --analysis-depth auto
 ```
+
+Always pass the inferred or explicit artifact `LANGUAGE` on a new run. Use `source` only when the user specifically wants artifacts in the source language. `--language` is a separate optional preference for source captions and ASR and never controls generated prose. If `source` evidence is uniformly known, the engine resolves it deterministically; mixed or incomplete source-language evidence requires the bounded curriculum agent to declare one canonical language under the persisted contract.
 
 Add `--project` only when the user requested project-local installation. Add `--output` only when the user supplied a portable output path. Resume without retransmitting sources or configuration:
 
 ```bash
 "$V2S_ENGINE" run --workspace WORKSPACE
 ```
+
+On resume, omit `--output-language` and reuse the persisted value. Never silently change it; an explicit conflicting resume override is rejected.
+
+### Publish another edition from the same Analyze map
+
+When the user wants a separately named localization or a different already-planned learning path, create or resume a named edition instead of starting a new conversion:
+
+```bash
+"$V2S_ENGINE" edition WORKSPACE EDITION-NAME --host codex --output-language LANGUAGE --curriculum PATH-ID --skill-name SKILL-NAME
+"$V2S_ENGINE" edition WORKSPACE EDITION-NAME --host claude --output-language LANGUAGE --from-edition SOURCE-EDITION --curriculum PATH-ID --skill-name SKILL-NAME
+"$V2S_ENGINE" edition WORKSPACE EDITION-NAME --host codex --output-language LANGUAGE --plan-curriculum --skill-name SKILL-NAME
+```
+
+Use `--curriculum` to bind an existing path without another curriculum-planning worker. Use `--from-edition` only when the path and logical artifact/claim identity should come from another named edition; otherwise the legacy single-edition checkpoint is the source. Use `--plan-curriculum` only when a new learning design is actually requested. These choices are settled before artifact Authoring.
+
+Resume with only:
+
+```bash
+"$V2S_ENGINE" edition WORKSPACE EDITION-NAME
+```
+
+A named edition never inspects, acquires, transcribes, extracts visuals, or reruns Analyze. It pins the completed integrated Analyze task, source snapshot, semantic-record digests, and analysis-depth contract, then runs only the necessary curriculum checkpoint followed by full Author, isolated behavior trials, independent Review, compilation, validation, and no-clobber installation. If source/depth refresh or a new Analyze revision changes that lineage, create a new edition name instead of silently reusing it.
+
+Each edition has immutable language, curriculum-source, output, name, host, and installation-scope configuration. Multiple editions coexist without an active-edition switch. Submit returned tasks with ordinary `submit WORKSPACE TASK_ID RESULT_FILE`; the task scope resolves its edition. Preserve semantic IDs and, for localization of the same curriculum, logical artifact IDs, claim IDs, evidence links, and timestamps. Supply `--identity-drift-reason` only for a real structural exception. It records justification; it is not update lineage, and `parent_build_id` remains unset.
+
+Also omit `--analysis-depth` on resume and reuse the persisted requested/effective depth and versioned budget profile. A conflicting request or profile drift is rejected. `--refresh` re-inspects the inventory; when duration, items, chapters, captions, or density signals change, the engine deterministically refreshes the contract and invalidates only affected stage/task snapshots.
 
 `run` performs every available deterministic transition and emits one JSON envelope.
 
@@ -100,6 +132,12 @@ After all dispatched workers finish, call `run --workspace WORKSPACE` again. Rep
 ### `complete`
 
 Report the installed Skill name and path, invocation, workspace path and retention, processed and failed source counts, source and semantic coverage, instructional-affordance coverage, critic repair count, build ID, and validation results.
+
+Also report the requested output-language intent, resolved canonical artifact language, resolution state, and whether it was deterministically resolved or agent-declared.
+
+For a named edition, also report its deterministic edition ID and configuration digest, pinned Analyze/source/depth lineage, curriculum source and selected path, identity-drift justification if any, and edition-local completion status.
+
+Report requested, recommended, and effective analysis depth, the recommendation reasons, and the versioned non-secret budget summary from the completion envelope.
 
 Make partial, inaccessible, skipped, retired, and failed sources visible in the completion summary. Distinguish source-acquisition coverage from semantic coverage and state any capability limits caused by missing evidence.
 
@@ -142,7 +180,11 @@ Every semantic unit needs a stable ID, source and time range, kind, compact summ
 
 ### Author
 
-Use a principal learning-science and Agent Skill author. Read canonical semantic records from the task packet, design a thematic default and justified alternate paths, and write Markdown drafts directly inside the task output directory.
+Author has two bounded task shapes under the same internal role. First, use a principal curriculum architect to read the canonical semantic records, recommend a thematic path, and propose up to two justified alternate learning experiences. This curriculum-planning task writes only curriculum options, ordered semantic-unit sequences, and concise decision metadata—never artifact plans, claims, assets, or Markdown drafts.
+
+The curriculum packet includes the immutable artifact-language contract. It must echo a fixed explicit or uniform-source language, or make the one constrained declaration required for mixed or unknown source evidence. That declaration is canonical. Full Author and every repair must preserve it exactly; Review audits actual prose for consistency because deterministic code does not pretend to identify the language of arbitrary Markdown reliably.
+
+When the alternatives would materially change the learning experience, stop at the durable `ask-user` action. Otherwise the coordinator canonically selects the recommendation. Only after that selection exists, dispatch the full Agent Skill author with the selected-curriculum path and digest. The full Author must preserve the selected path and planned semantic order while binding them to justified artifacts and writing Markdown drafts inside its task output directory. Do not reopen the curriculum choice during authoring or repair.
 
 Treat Learn, Practice, Apply, and Reference as evidence-bounded capability levels, not artifact quotas. Never exceed the Analyze capability ceiling.
 
@@ -156,11 +198,17 @@ Select only from the verified visual candidates in the Author packet. Retain a v
 
 ### Review
 
-Use a fresh senior Agent Skill critic who is independent of the Author producer. Review the actual canonical drafts and records, not an author-supplied summary.
+Use a fresh senior Agent Skill critic who is independent of both curriculum-planning and artifact-Author producers. Review the actual canonical drafts and records, not an author-supplied summary.
 
 Audit source-meaning retention and instructional-affordance retention separately, then grounding, uncertainty, disclosure, empty invocation, runtime behavior, safety, scope, source failures, and shareability. Inspect every selected teaching visual for necessity, legibility, context, ordering, privacy, evidence grounding, and on-demand loading.
 
-A failed Review completes its execution task but creates a new immutable Author revision and a fresh independent Review. Allow at most three repair cycles. Never weaken a capability claim merely to hide an affordance the evidence supports and the product needs.
+Before the final critic, let the engine render the canonical Author state into its private immutable behavior target. The engine owns a versioned scenario catalog: empty invocation, start/intake, bounded teaching, practice solution withholding, application context gathering, precise grounded reference, out-of-scope honesty, and deterministic semantic pressure cases for an opening thesis, middle example, qualification, likely misconception, prediction, unresolved question, and visual or temporal evidence when present. It marks content cases not applicable only from canonical semantic state.
+
+Dispatch every applicable scenario as its own `behavior-trial` Review task so the host supplies a genuinely fresh context. The engine issues a distinct `execution_context_id` with each task lease and rejects a result that does not echo that binding, but this identifier does not prove operating-system, process, filesystem, or model-context isolation; the host must dispatch each trial and the final judge in genuinely separate contexts and enforce any required sandbox or read-only boundary. A trial receives only the immutable target and one prompt, records the exact bounded user/assistant exchange, generated-Skill file accesses, and side effects, and makes no pass/fail judgment. After all trials complete exactly once, dispatch a different independent Review producer to inspect the actual rendered target, canonical evidence, code-owned expectations, and raw trial files. Raw trials and structured reports remain in the private workspace and never enter the installed Skill.
+
+Compilation accepts only the current behavior-catalog version with complete scenario accounting, verified trial and target digests, a passing critic, and passing applicable checks. Legacy boolean-only behavior reports remain preserved as history but never satisfy the current gate; resuming such a workspace creates fresh catalog trials and a new Review revision.
+
+A failed Review completes its execution task but creates a new immutable Author revision pinned to the same selected curriculum and a fresh independent Review. Allow at most three repair cycles. Never weaken a capability claim merely to hide an affordance the evidence supports and the product needs.
 
 ## Evidence rules
 
@@ -186,6 +234,21 @@ When browser authentication is authorized, let the engine decrypt browser cookie
 On macOS, a browser keychain prompt may appear once. Repeated prompts during one engine invocation indicate a failed authentication session; stop and report the failure instead of repeatedly asking the user to approve access.
 
 Treat cookies, headers, tokens, expiring URLs, and browser snapshots as runtime secrets. Never quote them back, place them in task packets or logs, persist them in the workspace, or include them in the generated Skill.
+
+Let the engine record tool provenance directly at its subprocess and provider boundaries. It stores stable logical runs, attempts, failures, cache reuse, normalized non-secret arguments, input digests, and workspace-relative output digests in SQLite; do not ask workers or the main agent to reconstruct or relay this data. Use `tool-runs WORKSPACE` only when a maintainer needs the canonical sanitized JSONL under `WORKSPACE/logs/`. Raw stdout, stderr, environment variables, credentials, signed URLs, private absolute paths, and tool records themselves never enter the portable generated Skill.
+
+## Export evidence bundles
+
+Export evidence only when the user asks for a reproducibility or preservation artifact. The engine assembles and verifies bundles directly from canonical workspace state; no LLM reads, rewrites, or transports their contents.
+
+```bash
+"$V2S_ENGINE" evidence-bundle WORKSPACE --mode compact --output /path/to/course-evidence.v2sbundle
+"$V2S_ENGINE" verify-evidence-bundle /path/to/course-evidence.v2sbundle
+```
+
+A compact bundle is a deterministic shareable evidence derivative, not a generated Skill. It contains sanitized source metadata, canonical semantic/design/review records when present, observations and gaps, selected teaching visuals and contact sheets, sanitized tool-run records, and a content-addressed manifest. It never contains raw video or audio, the workspace database, caches, credentials, host paths, or a rendered generated Skill. Transcript and caption text stays excluded unless the user has explicitly authorized redistribution; only then add `--authorize-transcript-redistribution`. Add `--edition EDITION-NAME` when exporting one named edition's downstream lineage.
+
+An archival bundle is private and sensitive. Use `--mode archival --confirm-private-archival` only after the user deliberately accepts that boundary. It may contain raw media, audio, frames, transcripts, canonical intermediates, and a consistent evidence-database snapshot, but still excludes cookies, credentials, authentication files, caches, locks, task leases, and rendered generated Skills. Keep its mode `0600`, outside the workspace, installed Skill, and ordinary Git history. Bundle mode is independent of `--analysis-depth archival`; neither option implies the other.
 
 ## Generated Skill contract
 
