@@ -17,8 +17,16 @@ def test_output_language_normalizes_locale_and_environment(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("VIDEO_TO_SKILL_OUTPUT_LANGUAGE", "ZH_hans_cn")
 
-    assert load_settings().output_language == "zh-Hans-CN"
+    loaded = load_settings()
+    assert loaded.output_language == "zh-Hans-CN"
+    assert loaded.output_language_explicit is True
     assert Settings(output_language=" SOURCE ").output_language == "source"
+
+
+def test_output_language_tracks_explicit_provenance() -> None:
+    assert Settings().output_language_explicit is False
+    assert Settings(output_language="source").output_language_explicit is True
+    assert Settings(output_language="French").output_language_explicit is True
 
 
 def test_output_language_rejects_blank_or_control_text() -> None:

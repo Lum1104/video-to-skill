@@ -10,6 +10,7 @@ import sqlite3
 import stat
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager, suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
@@ -219,6 +220,27 @@ class _OwnedEvidence(Protocol):
     source_id: str
 
 
+@dataclass(frozen=True)
+class WorkspaceFileSnapshot:
+    """Immutable bytes read through a symlink-safe workspace descriptor chain."""
+
+    path: Path
+    payload: bytes
+    digest: str
+
+
+@dataclass(frozen=True)
+class CanonicalOutputSnapshot:
+    """Canonical output metadata bound to one immutable task-output snapshot."""
+
+    kind: str
+    record_id: str
+    file: WorkspaceFileSnapshot
+
+
+CanonicalOutput = tuple[str, str, Path] | CanonicalOutputSnapshot
+
+
 class Workspace:
     """Owns durable processing state; each operation opens its own DB connection."""
 
@@ -313,6 +335,46 @@ class Workspace:
             raise ProcessingError("Edition descendant path is invalid")
         return relative.parts
 
+    def _workspace_relative_parts(self, path: Path) -> tuple[str, ...]:
+        lexical_path = Path(os.path.abspath(path))
+        lexical_root = Path(os.path.abspath(self.root))
+        try:
+            relative = lexical_path.relative_to(lexical_root)
+        except ValueError as exc:
+            raise ProcessingError("Path escapes the workspace root") from exc
+        if any(part in {"", ".", ".."} for part in relative.parts):
+            raise ProcessingError("Workspace descendant path is invalid")
+        return relative.parts
+
+    @contextmanager
+    def _workspace_directory_descriptor(
+        self,
+        directory: Path,
+        *,
+        create: bool,
+    ) -> Iterator[int]:
+        parts = self._workspace_relative_parts(directory)
+        descriptors: list[int] = []
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            current_fd = os.open(self.root, flags)
+            descriptors.append(current_fd)
+            for part in parts:
+                if create:
+                    with suppress(FileExistsError):
+                        os.mkdir(part, mode=0o700, dir_fd=current_fd)
+                current_fd = os.open(part, flags, dir_fd=current_fd)
+                descriptors.append(current_fd)
+            yield current_fd
+        except OSError as exc:
+            raise ProcessingError(
+                "Workspace descendant namespace has unsafe or symlinked path components: "
+                f"{directory}"
+            ) from exc
+        finally:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
+
     @contextmanager
     def _edition_directory_descriptor(
         self,
@@ -346,21 +408,37 @@ class Workspace:
 
     def ensure_directory(self, directory: Path) -> None:
         if self.edition_id is None:
-            directory.mkdir(parents=True, exist_ok=True)
+            with self._workspace_directory_descriptor(directory, create=True):
+                pass
             return
         with self._edition_directory_descriptor(directory, create=True):
             pass
 
     def read_file_bytes(self, path: Path, *, max_bytes: int | None = None) -> bytes:
         if self.edition_id is None:
+            parts = self._workspace_relative_parts(path)
+            if not parts:
+                raise ProcessingError(f"Workspace file must be regular: {path}")
+            parent = self.root.joinpath(*parts[:-1])
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
             try:
-                if path.is_symlink() or not path.is_file():
-                    raise ProcessingError(f"Workspace file must be regular: {path}")
-                if max_bytes is not None and path.stat().st_size > max_bytes:
-                    raise ProcessingError(f"Workspace file exceeds its size limit: {path}")
-                return path.read_bytes()
+                with self._workspace_directory_descriptor(parent, create=False) as parent_fd:
+                    descriptor = os.open(parts[-1], flags, dir_fd=parent_fd)
+                    try:
+                        metadata = os.fstat(descriptor)
+                        if not stat.S_ISREG(metadata.st_mode):
+                            raise ProcessingError(f"Workspace file must be regular: {path}")
+                        if max_bytes is not None and metadata.st_size > max_bytes:
+                            raise ProcessingError(f"Workspace file exceeds its size limit: {path}")
+                        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+                            payload = handle.read(None if max_bytes is None else max_bytes + 1)
+                    finally:
+                        os.close(descriptor)
             except OSError as exc:
-                raise ProcessingError(f"Could not read workspace file {path}: {exc}") from exc
+                raise ProcessingError(f"Workspace file path is unsafe: {path}") from exc
+            if max_bytes is not None and len(payload) > max_bytes:
+                raise ProcessingError(f"Workspace file exceeds its size limit: {path}")
+            return payload
         parts = self._edition_relative_parts(path)
         assert self.edition_dir is not None
         parent = self.edition_dir.joinpath(*parts[:-1])
@@ -392,15 +470,48 @@ class Workspace:
         overwrite: bool = True,
     ) -> None:
         if self.edition_id is None:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = path.with_name(f".{path.name}.{secrets.token_hex(12)}.tmp")
-            try:
-                temporary.write_bytes(payload)
-                if not overwrite and (path.exists() or path.is_symlink()):
-                    raise ProcessingError(f"Workspace file already exists: {path}")
-                temporary.replace(path)
-            finally:
-                temporary.unlink(missing_ok=True)
+            parts = self._workspace_relative_parts(path)
+            if not parts:
+                raise ProcessingError(f"Workspace file target is unsafe: {path}")
+            parent = self.root.joinpath(*parts[:-1])
+            with self._workspace_directory_descriptor(parent, create=True) as parent_fd:
+                try:
+                    existing = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    existing = None
+                if existing is not None:
+                    if not stat.S_ISREG(existing.st_mode):
+                        raise ProcessingError(f"Workspace file target is unsafe: {path}")
+                    if not overwrite:
+                        raise ProcessingError(f"Workspace file already exists: {path}")
+                temporary_name = f".{parts[-1]}.{secrets.token_hex(12)}.tmp"
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+                descriptor = os.open(temporary_name, flags, 0o600, dir_fd=parent_fd)
+                try:
+                    with os.fdopen(descriptor, "wb", closefd=False) as handle:
+                        handle.write(payload)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    if overwrite:
+                        os.replace(
+                            temporary_name,
+                            parts[-1],
+                            src_dir_fd=parent_fd,
+                            dst_dir_fd=parent_fd,
+                        )
+                    else:
+                        os.link(
+                            temporary_name,
+                            parts[-1],
+                            src_dir_fd=parent_fd,
+                            dst_dir_fd=parent_fd,
+                            follow_symlinks=False,
+                        )
+                    os.fsync(parent_fd)
+                finally:
+                    os.close(descriptor)
+                    with suppress(FileNotFoundError):
+                        os.unlink(temporary_name, dir_fd=parent_fd)
             return
         parts = self._edition_relative_parts(path)
         assert self.edition_dir is not None
@@ -454,7 +565,18 @@ class Workspace:
 
     def remove_file(self, path: Path) -> None:
         if self.edition_id is None:
-            path.unlink(missing_ok=True)
+            parts = self._workspace_relative_parts(path)
+            if not parts:
+                raise ProcessingError(f"Workspace file target is unsafe: {path}")
+            parent = self.root.joinpath(*parts[:-1])
+            try:
+                with self._workspace_directory_descriptor(parent, create=False) as parent_fd:
+                    metadata = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
+                    if not stat.S_ISREG(metadata.st_mode):
+                        raise ProcessingError(f"Workspace file target is unsafe: {path}")
+                    os.unlink(parts[-1], dir_fd=parent_fd)
+            except FileNotFoundError:
+                return
             return
         parts = self._edition_relative_parts(path)
         assert self.edition_dir is not None
@@ -467,6 +589,72 @@ class Workspace:
                 os.unlink(parts[-1], dir_fd=parent_fd)
         except FileNotFoundError:
             return
+
+    def task_output_file_snapshot(
+        self,
+        task_id: str,
+        path: Path,
+        *,
+        max_bytes: int | None = None,
+    ) -> WorkspaceFileSnapshot:
+        """Read one task output once without following any path component."""
+
+        submitted = self._validated_task_output_path(task_id, path)
+        payload = self.read_file_bytes(submitted, max_bytes=max_bytes)
+        return WorkspaceFileSnapshot(
+            path=submitted,
+            payload=payload,
+            digest=sha256(payload).hexdigest(),
+        )
+
+    def _validated_task_output_path(self, task_id: str, path: Path) -> Path:
+        submitted = Path(os.path.abspath(path))
+        task_output = Path(os.path.abspath(self.tasks_dir / task_id / "output"))
+        try:
+            relative = submitted.relative_to(task_output)
+        except ValueError as exc:
+            raise ProcessingError(
+                "Task output must be a regular file in its task output directory"
+            ) from exc
+        if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+            raise ProcessingError("Task output path is invalid")
+        return submitted
+
+    def _validate_task_output_snapshot(
+        self,
+        task_id: str,
+        snapshot: WorkspaceFileSnapshot,
+        *,
+        expected_path: Path | None = None,
+    ) -> None:
+        submitted = self._validated_task_output_path(task_id, snapshot.path)
+        if submitted != snapshot.path or (
+            expected_path is not None and submitted != Path(os.path.abspath(expected_path))
+        ):
+            raise ProcessingError("Task output snapshot path is invalid")
+        if sha256(snapshot.payload).hexdigest() != snapshot.digest:
+            raise ProcessingError("Task output snapshot digest is invalid")
+
+    def canonical_output_file_snapshot(
+        self,
+        task_id: str,
+        kind: str,
+        record_id: str,
+        path: Path,
+        *,
+        max_bytes: int | None = None,
+    ) -> CanonicalOutputSnapshot:
+        """Bind canonical metadata to bytes read once from a safe task output path."""
+
+        return CanonicalOutputSnapshot(
+            kind=kind,
+            record_id=record_id,
+            file=self.task_output_file_snapshot(
+                task_id,
+                path,
+                max_bytes=max_bytes,
+            ),
+        )
 
     @staticmethod
     def _scope_edition_id(item: WorkItem) -> str | None:
@@ -1644,8 +1832,9 @@ class Workspace:
         task_id: str,
         lease_token: str,
         result_path: Path,
+        result_snapshot: WorkspaceFileSnapshot | None = None,
         producer: dict[str, Any],
-        canonical_outputs: Iterable[tuple[str, str, Path]] = (),
+        canonical_outputs: Iterable[CanonicalOutput] = (),
         identity_baseline: dict[str, Any] | None = None,
     ) -> tuple[WorkItem, list[CanonicalRecord]]:
         """Atomically accept a validated result and advance canonical record heads."""
@@ -1655,7 +1844,10 @@ class Workspace:
         canonical_output_list = list(canonical_outputs)
         if self.edition_id is not None:
             invalid_kinds = sorted(
-                {kind for kind, _record_id, _path in canonical_output_list}
+                {
+                    output.kind if isinstance(output, CanonicalOutputSnapshot) else output[0]
+                    for output in canonical_output_list
+                }
                 - _EDITION_CANONICAL_KINDS
             )
             if invalid_kinds:
@@ -1664,15 +1856,16 @@ class Workspace:
                     + ", ".join(invalid_kinds)
                 )
         result = Path(os.path.abspath(result_path))
-        task_output = Path(os.path.abspath(self.tasks_dir / task_id / "output"))
-        try:
-            result.relative_to(task_output)
-        except ValueError as exc:
-            raise ProcessingError(
-                "Task result must be a regular file in its task output directory"
-            ) from exc
-        result_payload = self.read_file_bytes(result)
-        result_digest = sha256(result_payload).hexdigest()
+        if result_snapshot is None:
+            result_snapshot = self.task_output_file_snapshot(task_id, result)
+        else:
+            self._validate_task_output_snapshot(
+                task_id,
+                result_snapshot,
+                expected_path=result,
+            )
+        result_payload = result_snapshot.payload
+        result_digest = result_snapshot.digest
         now = datetime.now(UTC)
         if item.state == WorkState.COMPLETE:
             if item.result_digest == result_digest:
@@ -1685,20 +1878,23 @@ class Workspace:
         if self.workspace_snapshot_digest() != item.snapshot_digest:
             raise ProcessingError(f"Workspace snapshot changed while task was leased: {task_id}")
         output_specs: list[tuple[str, str, Path, bytes]] = []
-        for kind, record_id, source_path in canonical_output_list:
-            source = Path(os.path.abspath(source_path))
-            try:
-                source.relative_to(task_output)
-            except ValueError as exc:
-                raise ProcessingError(
-                    "Canonical outputs must be regular files in the task output directory"
-                ) from exc
+        for output in canonical_output_list:
+            if isinstance(output, CanonicalOutputSnapshot):
+                kind = output.kind
+                record_id = output.record_id
+                source_snapshot = output.file
+                self._validate_task_output_snapshot(task_id, source_snapshot)
+                source = source_snapshot.path
+            else:
+                kind, record_id, source_path = output
+                source = Path(os.path.abspath(source_path))
+                source_snapshot = self.task_output_file_snapshot(task_id, source)
             output_specs.append(
                 (
                     kind,
                     self._storage_record_id(kind, record_id),
                     source,
-                    self.read_file_bytes(source),
+                    source_snapshot.payload,
                 )
             )
         token_hash = sha256(lease_token.encode("utf-8")).hexdigest()

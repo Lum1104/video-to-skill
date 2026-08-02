@@ -7,6 +7,7 @@ import os
 import secrets
 import shutil
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 
 from pydantic import ValidationError as PydanticValidationError
@@ -410,16 +411,12 @@ def plan_behavior_trial_tasks(
     return tasks
 
 
-def _load_behavior_trial_result(path: Path) -> BehaviorTrialResult:
+def _load_behavior_trial_result(payload: bytes) -> BehaviorTrialResult:
     try:
-        if path.is_symlink() or not path.is_file() or path.stat().st_size > 2 * 1024 * 1024:
-            raise ProcessingError(
-                "Behavior trial result must be a regular JSON file no larger than 2 MiB"
-            )
-        return BehaviorTrialResult.model_validate_json(path.read_text(encoding="utf-8"))
+        return BehaviorTrialResult.model_validate_json(payload)
     except PydanticValidationError as exc:
         raise ProcessingError(f"Invalid behavior trial result: {exc}") from exc
-    except (OSError, UnicodeDecodeError, ValueError) as exc:
+    except (UnicodeDecodeError, ValueError) as exc:
         if isinstance(exc, ProcessingError):
             raise
         raise ProcessingError(f"Could not read behavior trial result: {exc}") from exc
@@ -476,12 +473,18 @@ def submit_behavior_trial_result(
     task = workspace.get_work_item(task_id)
     if task.role != WorkRole.REVIEW or task.scope.get("kind") != "behavior-trial":
         raise ProcessingError(f"Task is not a behavior trial: {task_id}")
-    result = _load_behavior_trial_result(result_path)
+    result_snapshot = workspace.task_output_file_snapshot(
+        task_id,
+        result_path,
+        max_bytes=2 * 1024 * 1024,
+    )
+    result = _load_behavior_trial_result(result_snapshot.payload)
     _verify_trial_against_task(workspace, task, result)
     accepted, _records = workspace.accept_work_result(
         task_id=task.id,
         lease_token=result.lease_token,
         result_path=result_path,
+        result_snapshot=result_snapshot,
         producer=result.producer.model_dump(mode="json"),
     )
     return accepted
@@ -508,9 +511,10 @@ def _verified_completed_trials(
         ):
             raise ProcessingError("Behavior Review requires completed fresh-context trials")
         result_path = workspace.root / task.result_path
-        if result_path.is_symlink() or hash_file(result_path) != task.result_digest:
+        result_payload = workspace.read_file_bytes(result_path, max_bytes=2 * 1024 * 1024)
+        if sha256(result_payload).hexdigest() != task.result_digest:
             raise ProcessingError("Accepted behavior trial result failed its digest check")
-        result = _load_behavior_trial_result(result_path)
+        result = _load_behavior_trial_result(result_payload)
         _verify_trial_against_task(workspace, task, result)
         scenario = expected.get(result.scenario_id)
         if scenario is None or result.scenario_digest != scenario.scenario_digest:
@@ -655,11 +659,9 @@ def plan_review_task(
     )
 
 
-def _load_review_result(path: Path) -> ReviewResult:
+def _load_review_result(payload: bytes) -> ReviewResult:
     try:
-        if not path.is_file() or path.stat().st_size > 4 * 1024 * 1024:
-            raise ProcessingError("Review result must be a regular JSON file no larger than 4 MiB")
-        raw = path.read_text(encoding="utf-8")
+        raw = payload.decode("utf-8")
         try:
             version = json.loads(raw).get("schema_version")
         except (json.JSONDecodeError, AttributeError):
@@ -672,7 +674,7 @@ def _load_review_result(path: Path) -> ReviewResult:
         return ReviewResult.model_validate_json(raw)
     except PydanticValidationError as exc:
         raise ProcessingError(f"Invalid Review result: {exc}") from exc
-    except (OSError, UnicodeDecodeError, ValueError) as exc:
+    except (UnicodeDecodeError, ValueError) as exc:
         if isinstance(exc, ProcessingError):
             raise
         raise ProcessingError(f"Could not read Review result: {exc}") from exc
@@ -687,7 +689,12 @@ def submit_review_result(
     if task.role != WorkRole.REVIEW or task.scope.get("kind") != "independent-review":
         raise ProcessingError(f"Task is not a Review task: {task_id}")
     _verified_task_packet(workspace, task)
-    result = _load_review_result(result_path)
+    result_snapshot = workspace.task_output_file_snapshot(
+        task_id,
+        result_path,
+        max_bytes=4 * 1024 * 1024,
+    )
+    result = _load_review_result(result_snapshot.payload)
     if (
         result.task_id != task.id
         or result.snapshot_digest != task.snapshot_digest
@@ -827,10 +834,21 @@ def submit_review_result(
         task_id=task.id,
         lease_token=result.lease_token,
         result_path=result_path,
+        result_snapshot=result_snapshot,
         producer=reviewer,
         canonical_outputs=[
-            ("critic-report", "default", review_path),
-            ("behavior-report", "default", behavior_path),
+            workspace.canonical_output_file_snapshot(
+                task.id,
+                "critic-report",
+                "default",
+                review_path,
+            ),
+            workspace.canonical_output_file_snapshot(
+                task.id,
+                "behavior-report",
+                "default",
+                behavior_path,
+            ),
         ],
     )
     return accepted

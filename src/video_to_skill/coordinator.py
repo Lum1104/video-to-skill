@@ -504,9 +504,14 @@ def submit_decision_result(
     task = workspace.get_work_item(task_id)
     if task.role != WorkRole.DECISION:
         raise ProcessingError(f"Task is not a user decision task: {task_id}")
+    result_snapshot = workspace.task_output_file_snapshot(
+        task_id,
+        result_path,
+        max_bytes=8 * 1024 * 1024,
+    )
     try:
-        result = DecisionResult.model_validate_json(result_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, PydanticValidationError) as exc:
+        result = DecisionResult.model_validate_json(result_snapshot.payload)
+    except (UnicodeDecodeError, PydanticValidationError) as exc:
         raise ProcessingError(f"Invalid user decision result: {exc}") from exc
     if result.task_id != task.id or result.snapshot_digest != task.snapshot_digest:
         raise ProcessingError("User decision does not belong to this task snapshot")
@@ -587,12 +592,17 @@ def submit_decision_result(
         canonical_outputs = [("delivery-selection", "default", output)]
     else:
         raise ProcessingError("Decision task has an unknown kind")
+    canonical_output_snapshots = [
+        workspace.canonical_output_file_snapshot(task.id, kind, record_id, path)
+        for kind, record_id, path in canonical_outputs
+    ]
     accepted, _records = workspace.accept_work_result(
         task_id=task.id,
         lease_token=result.lease_token,
         result_path=result_path,
+        result_snapshot=result_snapshot,
         producer=result.producer.model_dump(mode="json"),
-        canonical_outputs=canonical_outputs,
+        canonical_outputs=canonical_output_snapshots,
     )
     return accepted
 
@@ -854,11 +864,11 @@ def advance_run(
         else:
             if host is None:
                 raise ProcessingError("A new named edition requires --host")
-            requested_language = (
-                output_language_override
-                or base_workspace.load_manifest().output_language
-                or settings.output_language
-            )
+            requested_language = output_language_override
+            if requested_language is None and settings.output_language_explicit:
+                requested_language = settings.output_language
+            if requested_language is None:
+                requested_language = base_workspace.load_manifest().output_language
             source_name = curriculum_source_edition or LEGACY_EDITION_NAME
             if curriculum_source_edition is None:
                 candidate_source = base_workspace

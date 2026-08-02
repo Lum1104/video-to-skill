@@ -24,7 +24,7 @@ from video_to_skill.orchestration import (
 )
 from video_to_skill.utils import hash_file, stable_hash
 from video_to_skill.work import AnalysisRun, CanonicalRecord, WorkItem, WorkRole, WorkState
-from video_to_skill.workspace import Workspace
+from video_to_skill.workspace import CanonicalOutputSnapshot, Workspace
 
 CURRICULUM_PLANNER_PERSONA = (
     "You are a principal learning-science and curriculum architect with deep experience "
@@ -375,16 +375,12 @@ def validate_artifact_bound_curriculum(
             raise ProcessingError(f"Final curriculum unit sequence differs for {planned_path.id}")
 
 
-def _load_curriculum_plan_result(path: Path) -> CurriculumPlanResult:
+def _load_curriculum_plan_result(payload: bytes) -> CurriculumPlanResult:
     try:
-        if not path.is_file() or path.stat().st_size > 2 * 1024 * 1024:
-            raise ProcessingError(
-                "Curriculum plan result must be a regular JSON file no larger than 2 MiB"
-            )
-        return CurriculumPlanResult.model_validate_json(path.read_text(encoding="utf-8"))
+        return CurriculumPlanResult.model_validate_json(payload)
     except PydanticValidationError as exc:
         raise ProcessingError(f"Invalid curriculum plan result: {exc}") from exc
-    except (OSError, UnicodeDecodeError, ValueError) as exc:
+    except (UnicodeDecodeError, ValueError) as exc:
         if isinstance(exc, ProcessingError):
             raise
         raise ProcessingError(f"Could not read curriculum plan result: {exc}") from exc
@@ -461,7 +457,12 @@ def submit_curriculum_plan_result(
     task = workspace.get_work_item(task_id)
     if task.role != WorkRole.AUTHOR or task.scope.get("kind") != "curriculum-planning":
         raise ProcessingError(f"Task is not a curriculum-planning Author task: {task_id}")
-    result = _load_curriculum_plan_result(result_path)
+    result_snapshot = workspace.task_output_file_snapshot(
+        task_id,
+        result_path,
+        max_bytes=2 * 1024 * 1024,
+    )
+    result = _load_curriculum_plan_result(result_snapshot.payload)
     if result.task_id != task.id or result.snapshot_digest != task.snapshot_digest:
         raise ProcessingError("Curriculum plan result does not belong to this task snapshot")
     _validate_curriculum_plan(workspace, task, result.curriculum)
@@ -475,25 +476,44 @@ def submit_curriculum_plan_result(
     language_path = output_directory / "artifact-language.json"
     workspace.write_json(options_path, result.curriculum)
     workspace.write_json(language_path, language_declaration)
-    canonical_outputs: list[tuple[str, str, Path]] = [
-        ("curriculum-options", "default", options_path),
-        ("artifact-language-declaration", "default", language_path),
+    options_snapshot = workspace.canonical_output_file_snapshot(
+        task.id,
+        "curriculum-options",
+        "default",
+        options_path,
+    )
+    canonical_outputs: list[CanonicalOutputSnapshot] = [
+        options_snapshot,
+        workspace.canonical_output_file_snapshot(
+            task.id,
+            "artifact-language-declaration",
+            "default",
+            language_path,
+        ),
     ]
     if not result.curriculum.decision_required:
         selection_path = output_directory / "selected-curriculum.json"
         workspace.write_json(
             selection_path,
             CurriculumSelection(
-                curriculum_plan_digest=hash_file(options_path),
+                curriculum_plan_digest=options_snapshot.file.digest,
                 selected_path_id=result.curriculum.recommended_path_id,
                 source="recommended",
             ),
         )
-        canonical_outputs.append(("selected-curriculum", "default", selection_path))
+        canonical_outputs.append(
+            workspace.canonical_output_file_snapshot(
+                task.id,
+                "selected-curriculum",
+                "default",
+                selection_path,
+            )
+        )
     accepted, _records = workspace.accept_work_result(
         task_id=task.id,
         lease_token=result.lease_token,
         result_path=result_path,
+        result_snapshot=result_snapshot,
         producer=result.producer.model_dump(mode="json"),
         canonical_outputs=canonical_outputs,
     )

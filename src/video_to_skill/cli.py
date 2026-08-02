@@ -634,6 +634,7 @@ def context(
             at=timestamp,
             window=radius,
             max_window_seconds=contract.budget.context_window_seconds,
+            max_section_seconds=contract.budget.max_segment_seconds,
             max_items_per_kind=max_items,
         )
         selected_format = _output_format(output_format)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
@@ -8,7 +9,11 @@ from PIL import Image
 from pydantic import ValidationError as PydanticValidationError
 
 from video_to_skill.analyze import plan_analyze_tasks, submit_analyze_result
-from video_to_skill.author import plan_author_task, submit_author_result
+from video_to_skill.author import (
+    MAX_AUTHOR_DRAFT_BYTES,
+    plan_author_task,
+    submit_author_result,
+)
 from video_to_skill.config import Settings
 from video_to_skill.curriculum import plan_curriculum_task, submit_curriculum_plan_result
 from video_to_skill.errors import ProcessingError
@@ -395,6 +400,83 @@ def test_author_task_persists_affordance_ledger_and_draft(tmp_path: Path) -> Non
         .read_text(encoding="utf-8")
         .startswith("# Evidence-Updated Conviction")
     )
+
+
+def test_author_accepts_the_validated_draft_snapshot_if_path_is_replaced(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace, analyze_task = _analyzed_workspace(tmp_path)
+    run = workspace.create_analysis_run(analyze_task.snapshot_digest)
+    task = _plan_course_author_task(workspace, run, analyze_task)
+    lease = workspace.lease_work_item(task.id, owner="codex")
+    draft = lease.output_directory / "course.md"
+    original_payload = b"# Original Course\n\nGrounded content.\n"
+    draft.write_bytes(original_payload)
+    result = _author_result(task, lease.token, draft)
+    result_path = lease.output_directory / "result.json"
+    atomic_write_json(result_path, result)
+    original_accept = Workspace.accept_work_result
+
+    def replace_before_accept(self: Workspace, **kwargs):
+        draft.write_text("# Replacement Course\n", encoding="utf-8")
+        return original_accept(self, **kwargs)
+
+    monkeypatch.setattr(Workspace, "accept_work_result", replace_before_accept)
+
+    accepted = submit_author_result(workspace, task.id, result_path)
+
+    assert accepted.state == WorkState.COMPLETE
+    canonical_draft = workspace.canonical_record("artifact-draft", "artifact-course")
+    assert canonical_draft is not None
+    assert canonical_draft.digest == result.artifacts[0].draft_sha256
+    assert canonical_draft.digest == sha256(original_payload).hexdigest()
+    assert (workspace.root / canonical_draft.path).read_bytes() == original_payload
+    assert draft.read_text(encoding="utf-8") == "# Replacement Course\n"
+
+
+def test_author_rejects_symlinked_draft(tmp_path: Path) -> None:
+    workspace, analyze_task = _analyzed_workspace(tmp_path)
+    run = workspace.create_analysis_run(analyze_task.snapshot_digest)
+    task = _plan_course_author_task(workspace, run, analyze_task)
+    lease = workspace.lease_work_item(task.id, owner="codex")
+    target = tmp_path / "external-course.md"
+    target.write_text("# External Course\n", encoding="utf-8")
+    draft = lease.output_directory / "course.md"
+    draft.symlink_to(target)
+    result_path = lease.output_directory / "result.json"
+    atomic_write_json(result_path, _author_result(task, lease.token, draft))
+
+    with pytest.raises(ProcessingError, match="unsafe"):
+        submit_author_result(workspace, task.id, result_path)
+
+
+def test_author_rejects_oversized_draft(tmp_path: Path) -> None:
+    workspace, analyze_task = _analyzed_workspace(tmp_path)
+    run = workspace.create_analysis_run(analyze_task.snapshot_digest)
+    task = _plan_course_author_task(workspace, run, analyze_task)
+    lease = workspace.lease_work_item(task.id, owner="codex")
+    draft = lease.output_directory / "course.md"
+    draft.write_bytes(b"x" * (MAX_AUTHOR_DRAFT_BYTES + 1))
+    result_path = lease.output_directory / "result.json"
+    atomic_write_json(result_path, _author_result(task, lease.token, draft))
+
+    with pytest.raises(ProcessingError, match="exceeds its size limit"):
+        submit_author_result(workspace, task.id, result_path)
+
+
+def test_author_rejects_non_utf8_draft(tmp_path: Path) -> None:
+    workspace, analyze_task = _analyzed_workspace(tmp_path)
+    run = workspace.create_analysis_run(analyze_task.snapshot_digest)
+    task = _plan_course_author_task(workspace, run, analyze_task)
+    lease = workspace.lease_work_item(task.id, owner="codex")
+    draft = lease.output_directory / "course.md"
+    draft.write_bytes(b"\xff\xfe\x00")
+    result_path = lease.output_directory / "result.json"
+    atomic_write_json(result_path, _author_result(task, lease.token, draft))
+
+    with pytest.raises(ProcessingError, match="Could not read artifact"):
+        submit_author_result(workspace, task.id, result_path)
 
 
 def test_author_cannot_drift_from_curriculum_artifact_language(tmp_path: Path) -> None:

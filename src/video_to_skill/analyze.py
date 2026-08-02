@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable
+from hashlib import sha256
 from pathlib import Path
 from typing import Any, cast
 
@@ -14,10 +15,10 @@ from video_to_skill.errors import ProcessingError
 from video_to_skill.generation import SemanticUnit
 from video_to_skill.models import VisualEvent, VisualOrigin
 from video_to_skill.orchestration import AnalyzeResult
-from video_to_skill.utils import atomic_write_json, hash_file, is_within, stable_hash
+from video_to_skill.utils import is_within, stable_hash
 from video_to_skill.visual_assets import materialize_visual_asset_candidates
 from video_to_skill.work import AnalysisRun, WorkItem, WorkRole, WorkState
-from video_to_skill.workspace import Workspace
+from video_to_skill.workspace import CanonicalOutputSnapshot, Workspace
 
 MAX_ANALYZE_SECTIONS_PER_TASK = 8
 MAX_ANALYZE_PACKET_ITEMS = 3_000
@@ -321,14 +322,10 @@ def plan_analyze_integration_task(
         if item.state != WorkState.COMPLETE or item.result_path is None:
             raise ProcessingError("Analyze integration requires completed shard results")
         path = workspace.root / item.result_path
-        if (
-            not path.is_file()
-            or path.is_symlink()
-            or item.result_digest is None
-            or hash_file(path) != item.result_digest
-        ):
+        payload = workspace.read_file_bytes(path, max_bytes=8 * 1024 * 1024)
+        if item.result_digest is None or sha256(payload).hexdigest() != item.result_digest:
             raise ProcessingError(f"Accepted Analyze shard failed its digest check: {item.id}")
-        shard_results.append(_load_analyze_result(path))
+        shard_results.append(_load_analyze_result(payload))
         shard_result_paths.append(str(item.result_path))
     packet = {
         "analysis_depth": analysis_depth.model_dump(mode="json"),
@@ -378,14 +375,12 @@ def plan_analyze_integration_task(
     )
 
 
-def _load_analyze_result(path: Path) -> AnalyzeResult:
+def _load_analyze_result(payload: bytes) -> AnalyzeResult:
     try:
-        if not path.is_file() or path.stat().st_size > 8 * 1024 * 1024:
-            raise ProcessingError("Analyze result must be a regular JSON file no larger than 8 MiB")
-        return AnalyzeResult.model_validate_json(path.read_text(encoding="utf-8"))
+        return AnalyzeResult.model_validate_json(payload)
     except PydanticValidationError as exc:
         raise ProcessingError(f"Invalid Analyze result: {exc}") from exc
-    except (OSError, UnicodeDecodeError, ValueError) as exc:
+    except (UnicodeDecodeError, ValueError) as exc:
         if isinstance(exc, ProcessingError):
             raise
         raise ProcessingError(f"Could not read Analyze result: {exc}") from exc
@@ -550,7 +545,12 @@ def submit_analyze_result(
     task = workspace.get_work_item(task_id)
     if task.role != WorkRole.ANALYZE:
         raise ProcessingError(f"Task is not an Analyze task: {task_id}")
-    result = _load_analyze_result(result_path)
+    result_snapshot = workspace.task_output_file_snapshot(
+        task_id,
+        result_path,
+        max_bytes=8 * 1024 * 1024,
+    )
+    result = _load_analyze_result(result_snapshot.payload)
     if result.task_id != task_id or result.snapshot_digest != task.snapshot_digest:
         raise ProcessingError("Analyze result does not belong to this task snapshot")
     _validate_analyze_evidence(workspace, task, result)
@@ -561,20 +561,20 @@ def submit_analyze_result(
     capability_path = output / "capability-evidence.json"
     coverage_path = output / "semantic-coverage.json"
     conflicts_path = output / "semantic-conflicts.json"
-    atomic_write_json(
+    workspace.write_json(
         semantic_map_path,
         [unit.model_dump(mode="json") for unit in result.semantic_units],
     )
-    atomic_write_json(
+    workspace.write_json(
         relations_path,
         [relation.model_dump(mode="json") for relation in result.semantic_relations],
     )
-    atomic_write_json(
+    workspace.write_json(
         capability_path,
         [item.model_dump(mode="json") for item in result.capability_evidence],
     )
-    atomic_write_json(coverage_path, result.coverage)
-    atomic_write_json(
+    workspace.write_json(coverage_path, result.coverage)
+    workspace.write_json(
         conflicts_path,
         [item.model_dump(mode="json") for item in result.conflicts],
     )
@@ -585,23 +585,52 @@ def submit_analyze_result(
         record_prefix=record_id,
     )
     visual_assets_path = output / "visual-assets.json"
-    atomic_write_json(
+    workspace.write_json(
         visual_assets_path,
         [item.model_dump(mode="json") for item, _path in materialized_assets],
     )
+    image_outputs: list[CanonicalOutputSnapshot] = []
+    for item, path in materialized_assets:
+        snapshot = workspace.canonical_output_file_snapshot(
+            task_id,
+            "visual-asset-image",
+            item.image_record_id,
+            path,
+        )
+        if snapshot.file.digest != item.sha256:
+            raise ProcessingError(
+                f"Materialized visual asset changed before acceptance: {item.candidate_id}"
+            )
+        image_outputs.append(snapshot)
     canonical_outputs = [
-        ("semantic-map", record_id, semantic_map_path),
-        ("semantic-relations", record_id, relations_path),
-        ("capability-evidence", record_id, capability_path),
-        ("semantic-coverage", record_id, coverage_path),
-        ("semantic-conflicts", record_id, conflicts_path),
-        ("visual-asset-candidates", record_id, visual_assets_path),
-        *[("visual-asset-image", item.image_record_id, path) for item, path in materialized_assets],
+        workspace.canonical_output_file_snapshot(
+            task_id, "semantic-map", record_id, semantic_map_path
+        ),
+        workspace.canonical_output_file_snapshot(
+            task_id, "semantic-relations", record_id, relations_path
+        ),
+        workspace.canonical_output_file_snapshot(
+            task_id, "capability-evidence", record_id, capability_path
+        ),
+        workspace.canonical_output_file_snapshot(
+            task_id, "semantic-coverage", record_id, coverage_path
+        ),
+        workspace.canonical_output_file_snapshot(
+            task_id, "semantic-conflicts", record_id, conflicts_path
+        ),
+        workspace.canonical_output_file_snapshot(
+            task_id,
+            "visual-asset-candidates",
+            record_id,
+            visual_assets_path,
+        ),
+        *image_outputs,
     ]
     accepted, _records = workspace.accept_work_result(
         task_id=task_id,
         lease_token=result.lease_token,
         result_path=result_path,
+        result_snapshot=result_snapshot,
         producer=result.producer.model_dump(mode="json"),
         canonical_outputs=canonical_outputs,
     )

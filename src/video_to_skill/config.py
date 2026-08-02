@@ -100,6 +100,12 @@ class Settings(BaseModel):
         return "analysis_depth" in self.model_fields_set
 
     @property
+    def output_language_explicit(self) -> bool:
+        """Whether configuration, environment, CLI, or a caller selected output language."""
+
+        return "output_language" in self.model_fields_set
+
+    @property
     def configuration_hash(self) -> str:
         payload = self.model_dump(
             mode="json",

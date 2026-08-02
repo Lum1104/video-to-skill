@@ -109,10 +109,20 @@ def _bounded_interval(
     start: float | None,
     end: float | None,
     max_window_seconds: float,
+    max_section_seconds: float | None,
 ) -> tuple[EvidenceWindow, list[SemanticSegment]]:
     source = workspace.get_source(source_id)
     numeric_bounds = [
-        value for value in (at, window, start, end, max_window_seconds) if value is not None
+        value
+        for value in (
+            at,
+            window,
+            start,
+            end,
+            max_window_seconds,
+            max_section_seconds,
+        )
+        if value is not None
     ]
     if any(not math.isfinite(value) for value in numeric_bounds):
         raise ProcessingError("Context bounds must be finite numbers")
@@ -125,6 +135,8 @@ def _bounded_interval(
         )
     if max_window_seconds <= 0:
         raise ProcessingError("max_window_seconds must be positive")
+    if max_section_seconds is not None and max_section_seconds <= 0:
+        raise ProcessingError("max_section_seconds must be positive")
 
     all_segments = workspace.semantic_segments(source_id)
     if section_mode:
@@ -170,9 +182,16 @@ def _bounded_interval(
 
     if upper <= lower:
         raise ProcessingError("Context window is empty")
-    if upper - lower > max_window_seconds:
+    duration = upper - lower
+    if section_mode:
+        section_limit = max_section_seconds or max_window_seconds
+        if duration > section_limit:
+            raise ProcessingError(
+                f"Semantic section is {duration:g}s; maximum is {section_limit:g}s"
+            )
+    elif duration > max_window_seconds:
         raise ProcessingError(
-            f"Context window is {upper - lower:g}s; maximum is {max_window_seconds:g}s"
+            f"Context window is {duration:g}s; maximum is {max_window_seconds:g}s"
         )
     return EvidenceWindow(start=lower, end=upper), segments
 
@@ -187,6 +206,7 @@ def assemble_agent_context(
     start: float | None = None,
     end: float | None = None,
     max_window_seconds: float = DEFAULT_MAX_CONTEXT_SECONDS,
+    max_section_seconds: float | None = None,
     max_items_per_kind: int = DEFAULT_MAX_CONTEXT_ITEMS,
 ) -> AgentContext:
     """Build one finite evidence packet.
@@ -207,6 +227,7 @@ def assemble_agent_context(
         start=start,
         end=end,
         max_window_seconds=max_window_seconds,
+        max_section_seconds=max_section_seconds,
     )
     item_limit = max_items_per_kind + 1
     transcripts = workspace.transcripts(

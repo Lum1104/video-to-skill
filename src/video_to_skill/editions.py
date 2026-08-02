@@ -543,29 +543,47 @@ def materialize_reused_curriculum(
     language_path = output / "artifact-language.json"
     result_path = output / "result.json"
     workspace.write_json(plan_path, plan)
+    plan_snapshot = workspace.canonical_output_file_snapshot(
+        task.id,
+        "curriculum-options",
+        "default",
+        plan_path,
+    )
     workspace.write_json(
         selection_path,
         CurriculumSelection(
-            curriculum_plan_digest=hash_file(plan_path),
+            curriculum_plan_digest=plan_snapshot.file.digest,
             selected_path_id=selected_path_id,
             source="edition",
         ),
     )
     workspace.write_json(language_path, declaration)
     workspace.write_json(result_path, {})
+    result_snapshot = workspace.task_output_file_snapshot(task.id, result_path)
     accepted, _records = workspace.accept_work_result(
         task_id=task.id,
         lease_token=lease.token,
         result_path=result_path,
+        result_snapshot=result_snapshot,
         producer=ObservationProducer(
             name="video-to-skill deterministic edition binder",
             version="1",
             run_id=run.id,
         ).model_dump(mode="json"),
         canonical_outputs=[
-            ("curriculum-options", "default", plan_path),
-            ("selected-curriculum", "default", selection_path),
-            ("artifact-language-declaration", "default", language_path),
+            plan_snapshot,
+            workspace.canonical_output_file_snapshot(
+                task.id,
+                "selected-curriculum",
+                "default",
+                selection_path,
+            ),
+            workspace.canonical_output_file_snapshot(
+                task.id,
+                "artifact-language-declaration",
+                "default",
+                language_path,
+            ),
         ],
     )
     return accepted

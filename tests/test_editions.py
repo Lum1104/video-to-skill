@@ -8,7 +8,8 @@ from test_author import _analyzed_workspace, _author_result, _curriculum_result
 from test_coordinator import _submit_review_envelope, _submit_trial_envelope
 from test_review import _review_result
 
-from video_to_skill.config import Settings
+from video_to_skill import config as config_module
+from video_to_skill.config import Settings, load_settings
 from video_to_skill.coordinator import advance_run, submit_workspace_result
 from video_to_skill.editions import load_edition_state
 from video_to_skill.errors import ProcessingError
@@ -88,6 +89,97 @@ def _workspace_with_material_curriculum(
 def _edition_view(workspace: Workspace, name: str) -> Workspace:
     state = load_edition_state(workspace, name)
     return workspace.for_edition(state.configuration.edition_id)
+
+
+def _new_edition_language(
+    tmp_path: Path,
+    *,
+    settings: Settings,
+    edition_name: str,
+    output_language_override: str | None = None,
+    inherited_language: str = "source",
+) -> str:
+    workspace, _task = _analyzed_workspace(tmp_path)
+    manifest = workspace.load_manifest()
+    manifest.output_language = inherited_language
+    workspace.save_manifest(manifest)
+    advance_run(
+        sources=[],
+        workspace_path=workspace.root,
+        settings=settings,
+        output_language_override=output_language_override,
+        host=SkillHost.CODEX,
+        output=tmp_path / "generated" / edition_name,
+        skill_root=tmp_path / "skills",
+        run_official_validation=False,
+        edition_name=edition_name,
+        plan_curriculum=True,
+    )
+    return load_edition_state(workspace, edition_name).configuration.requested_output_language
+
+
+def test_new_edition_inherits_base_language_but_cli_has_highest_precedence(
+    tmp_path: Path,
+) -> None:
+    inherited = _new_edition_language(
+        tmp_path / "inherit",
+        settings=Settings(cache_root=tmp_path / "cache-inherit"),
+        edition_name="inherit-language",
+        inherited_language="Spanish",
+    )
+    cli = _new_edition_language(
+        tmp_path / "cli",
+        settings=Settings(cache_root=tmp_path / "cache-cli", output_language="French"),
+        edition_name="cli-language",
+        output_language_override="Japanese",
+        inherited_language="Spanish",
+    )
+
+    assert inherited == "Spanish"
+    assert cli == "Japanese"
+
+
+def test_new_edition_honors_config_file_output_language(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(config_module, "user_config_path", lambda _name: tmp_path / "user")
+    project = tmp_path / "config-case"
+    project.mkdir()
+    config = project / "settings.toml"
+    config.write_text('[video_to_skill]\noutput_language = "French"\n', encoding="utf-8")
+    monkeypatch.chdir(project)
+    settings = load_settings(config, cache_root=tmp_path / "cache")
+
+    assert (
+        _new_edition_language(
+            project,
+            settings=settings,
+            edition_name="configured-language",
+        )
+        == "French"
+    )
+
+
+def test_new_edition_honors_environment_output_language(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(config_module, "user_config_path", lambda _name: tmp_path / "user")
+    project = tmp_path / "env-case"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("VIDEO_TO_SKILL_OUTPUT_LANGUAGE", "de_DE")
+    settings = load_settings(cache_root=tmp_path / "cache")
+
+    assert (
+        _new_edition_language(
+            project,
+            settings=settings,
+            edition_name="environment-language",
+        )
+        == "de-DE"
+    )
 
 
 def _edition_author_result(

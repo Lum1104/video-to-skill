@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
@@ -661,8 +662,10 @@ def test_submit_rejects_result_outside_task_output_before_parsing(
         run_official_validation=False,
     )
     [action] = envelope.actions
-    outside = tmp_path / "not-even-json.txt"
-    outside.write_text("not JSON", encoding="utf-8")
+    task = workspace.get_work_item(action.task_id)
+    lease = json.loads((action.task_path / "lease.json").read_text(encoding="utf-8"))
+    outside = tmp_path / "valid-result.json"
+    atomic_write_json(outside, _curriculum_result(task, str(lease["lease_token"])))
 
     with pytest.raises(ProcessingError, match="regular task-output JSON"):
         submit_workspace_result(workspace, action.task_id, outside)
@@ -681,10 +684,84 @@ def test_submit_rejects_symlinked_result_before_parsing(tmp_path: Path) -> None:
         run_official_validation=False,
     )
     [action] = envelope.actions
-    target = action.task_path / "output" / "target.txt"
-    target.write_text("not JSON", encoding="utf-8")
+    task = workspace.get_work_item(action.task_id)
+    lease = json.loads((action.task_path / "lease.json").read_text(encoding="utf-8"))
+    target = tmp_path / "external-valid-result.json"
+    atomic_write_json(target, _curriculum_result(task, str(lease["lease_token"])))
     symlink = action.task_path / "output" / "result.json"
     symlink.symlink_to(target)
 
     with pytest.raises(ProcessingError, match="regular task-output JSON"):
         submit_workspace_result(workspace, action.task_id, symlink)
+
+
+def test_submit_rejects_result_beneath_symlinked_output_parent(tmp_path: Path) -> None:
+    workspace, _analyze_task = _analyzed_workspace(tmp_path)
+    envelope = advance_run(
+        sources=[],
+        workspace_path=workspace.root,
+        settings=Settings(cache_root=tmp_path),
+        host=SkillHost.CODEX,
+        output=tmp_path / "generated" / "course",
+        skill_root=tmp_path / "skills",
+        run_official_validation=False,
+    )
+    [action] = envelope.actions
+    task = workspace.get_work_item(action.task_id)
+    lease = json.loads((action.task_path / "lease.json").read_text(encoding="utf-8"))
+    external = tmp_path / "external-output"
+    external.mkdir()
+    atomic_write_json(
+        external / "result.json",
+        _curriculum_result(task, str(lease["lease_token"])),
+    )
+    linked_parent = action.task_path / "output" / "linked"
+    linked_parent.symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(ProcessingError, match="regular task-output JSON"):
+        submit_workspace_result(
+            workspace,
+            action.task_id,
+            linked_parent / "result.json",
+        )
+    assert workspace.get_work_item(task.id).state == "leased"
+
+
+def test_submit_accepts_the_validated_result_snapshot_if_path_is_replaced(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace, _analyze_task = _analyzed_workspace(tmp_path)
+    envelope = advance_run(
+        sources=[],
+        workspace_path=workspace.root,
+        settings=Settings(cache_root=tmp_path),
+        host=SkillHost.CODEX,
+        output=tmp_path / "generated" / "course",
+        skill_root=tmp_path / "skills",
+        run_official_validation=False,
+    )
+    [action] = envelope.actions
+    task = workspace.get_work_item(action.task_id)
+    lease = json.loads((action.task_path / "lease.json").read_text(encoding="utf-8"))
+    result_path = action.task_path / "output" / "result.json"
+    original_result = _curriculum_result(task, str(lease["lease_token"]))
+    atomic_write_json(result_path, original_result)
+    original_payload = result_path.read_bytes()
+    replacement = original_result.model_copy(
+        update={"producer": ObservationProducer(name="replacement-attacker")}
+    )
+    original_accept = Workspace.accept_work_result
+
+    def replace_before_accept(self: Workspace, **kwargs):
+        atomic_write_json(Path(kwargs["result_path"]), replacement)
+        return original_accept(self, **kwargs)
+
+    monkeypatch.setattr(Workspace, "accept_work_result", replace_before_accept)
+
+    receipt = submit_workspace_result(workspace, task.id, result_path)
+
+    assert receipt.result_digest == sha256(original_payload).hexdigest()
+    accepted = workspace.get_work_item(task.id)
+    assert accepted.result_path is not None
+    assert (workspace.root / accepted.result_path).read_bytes() == original_payload
