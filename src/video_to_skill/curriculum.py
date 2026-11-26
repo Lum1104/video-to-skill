@@ -27,10 +27,8 @@ from video_to_skill.work import AnalysisRun, CanonicalRecord, WorkItem, WorkRole
 from video_to_skill.workspace import CanonicalOutputSnapshot, Workspace
 
 CURRICULUM_PLANNER_PERSONA = (
-    "You are a principal learning-science and curriculum architect with deep experience "
-    "turning grounded semantic graphs into materially distinct, coherent learning journeys. "
-    "Preserve source meaning, conceptual dependencies, and application value without planning "
-    "publication artifacts or drafting course content."
+    "Curriculum planner. Organize canonical semantic units into a clear recommended "
+    "learning path and up to two distinct alternates without drafting final artifacts."
 )
 
 _CURRICULUM_INPUT_KINDS = (

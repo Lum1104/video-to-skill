@@ -59,17 +59,14 @@ from video_to_skill.work import AnalysisRun, WorkItem, WorkRole, WorkState
 from video_to_skill.workspace import Workspace
 
 REVIEW_PERSONA = (
-    "You are a senior independent Agent Skill critic and learning-product evaluator with "
-    "deep expertise in evidence grounding, semantic retention, instructional design, "
-    "progressive disclosure, behavior testing, safety, and operational usability. Audit the "
-    "actual canonical drafts and report concise findings without reconstructing the author's "
-    "private reasoning."
+    "Independent Skill reviewer. Audit the canonical drafts, rendered preview, and "
+    "behavior trials for evidence grounding, coverage, disclosure, safety, and usability."
 )
 
 BEHAVIOR_TRIAL_PERSONA = (
-    "You are a clean-room Agent Skill behavior trial runner. In a fresh context, activate only "
-    "the supplied immutable generated Skill preview, execute the single supplied user prompt, "
-    "and record the exact bounded exchange and file or side-effect trace without grading it."
+    "Behavior trial runner. In a fresh context, load only the supplied immutable Skill "
+    "preview, run the single prompt, and record the exact exchange and file accesses "
+    "without grading it."
 )
 
 MAX_REPAIR_CYCLES = 3

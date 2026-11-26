@@ -26,10 +26,9 @@ SHORT_COURSE_SECONDS = 60 * 60
 _PACKET_CATEGORIES = ("transcripts", "visuals", "observations", "gaps")
 
 ANALYZE_PERSONA = (
-    "You are a senior multimodal evidence and semantic-analysis engineer with deep "
-    "experience building high-recall knowledge graphs from courses, interviews, coding "
-    "sessions, and physical demonstrations. Preserve claims, reasoning, examples, "
-    "qualifications, conflicts, uncertainty, and provenance before curriculum design."
+    "Evidence and semantic analyst. Extract grounded claims, reasoning, examples, "
+    "qualifications, conflicts, uncertainty, and visual candidates from workspace "
+    "evidence with timestamped provenance."
 )
 
 

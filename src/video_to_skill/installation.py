@@ -135,6 +135,25 @@ def bundled_skill_text() -> str:
     raise ProcessingError("The bundled video-to-skill SKILL.md could not be located")
 
 
+def bundled_reference_files() -> dict[Path, str]:
+    """Return on-demand reference Markdown files shipped alongside SKILL.md."""
+
+    result: dict[Path, str] = {}
+    packaged_dir = files("video_to_skill").joinpath("bundled", "references")
+    if packaged_dir.is_dir():
+        for entry in sorted(packaged_dir.iterdir(), key=lambda item: item.name):
+            if entry.is_file() and entry.name.endswith(".md"):
+                result[Path("references") / entry.name] = entry.read_text(encoding="utf-8")
+        if result:
+            return result
+    repo_dir = Path(__file__).resolve().parents[2] / "references"
+    if repo_dir.is_dir():
+        for path in sorted(repo_dir.glob("*.md")):
+            if path.is_file():
+                result[Path("references") / path.name] = path.read_text(encoding="utf-8")
+    return result
+
+
 def bundled_engine_text() -> str:
     """Return the portable Python entry asset shipped with the generator bundle."""
 
@@ -189,6 +208,7 @@ def _generator_bundle_files() -> dict[Path, str]:
     }
     return {
         Path("SKILL.md"): bundled_skill_text(),
+        **bundled_reference_files(),
         _GENERATOR_ENGINE: bundled_engine_text(),
         _GENERATOR_POSIX_LAUNCHER: _posix_launcher(python_executable),
         _GENERATOR_WINDOWS_LAUNCHER: _windows_launcher(python_executable),

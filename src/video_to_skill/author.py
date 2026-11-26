@@ -40,10 +40,9 @@ from video_to_skill.work import AnalysisRun, WorkItem, WorkRole, WorkState
 from video_to_skill.workspace import CanonicalOutput, CanonicalOutputSnapshot, Workspace
 
 AUTHOR_PERSONA = (
-    "You are a principal learning-science architect and Agent Skill author with deep "
-    "experience turning grounded knowledge graphs into adaptive instruction, deliberate "
-    "practice, operational playbooks, feedback systems, and fast reference tools. Preserve "
-    "instructional usefulness without inventing source support."
+    "Course Skill author. Turn canonical semantic records and the selected curriculum "
+    "into grounded teaching, practice, application, and reference artifacts without "
+    "inventing unsupported claims."
 )
 
 _LEVEL_RANK: dict[CapabilityLevel, int] = {
