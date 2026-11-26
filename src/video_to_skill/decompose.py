@@ -59,7 +59,7 @@ class SkillPackPlan(OrchestrationModel):
 
     decomposition_mode: Literal["single", "multi"]
     rationale: str = Field(min_length=1)
-    skills: list[SkillCandidate] = Field(min_length=1)
+    skills: list[SkillCandidate] = Field(min_length=1, max_length=8)
 
     @model_validator(mode="after")
     def validate_plan(self) -> SkillPackPlan:
@@ -230,7 +230,8 @@ def submit_decompose_result(
         raise ProcessingError("Skill decomposition result snapshot_digest does not match task")
 
     units = _load_semantic_units(workspace)
-    known_unit_ids = {unit.id for unit in units}
+    units_by_id = {unit.id: unit for unit in units}
+    known_unit_ids = set(units_by_id)
     covered_unit_ids: set[str] = set()
     for skill in result.plan.skills:
         unknown = [uid for uid in skill.semantic_unit_ids if uid not in known_unit_ids]
@@ -238,6 +239,14 @@ def submit_decompose_result(
             raise ProcessingError(
                 f"Skill '{skill.id}' references unknown semantic unit ids: {', '.join(unknown)}"
             )
+        skill_unit_set = set(skill.semantic_unit_ids)
+        for uid in skill.semantic_unit_ids:
+            merged_target = units_by_id[uid].merged_into
+            if merged_target is not None and merged_target not in skill_unit_set:
+                raise ProcessingError(
+                    f"Skill '{skill.id}' includes merged unit '{uid}' without its "
+                    f"merged_into target '{merged_target}'"
+                )
         covered_unit_ids.update(skill.semantic_unit_ids)
     missing = sorted(known_unit_ids - covered_unit_ids)
     if missing:

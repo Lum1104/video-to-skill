@@ -470,8 +470,7 @@ def assemble_workspace_blueprint(workspace: Workspace) -> WorkspaceBlueprintProj
                 semantic_relations = [
                     rel
                     for rel in semantic_relations
-                    if rel.source_unit_id in allowed_unit_ids
-                    and rel.target_unit_id in allowed_unit_ids
+                    if rel.from_unit_id in allowed_unit_ids and rel.to_unit_id in allowed_unit_ids
                 ]
     artifacts = _validated_list(
         ArtifactDraftSpec,

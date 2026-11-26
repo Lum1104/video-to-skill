@@ -451,7 +451,7 @@ def _advance_multi_skill_pack(
     pending_curricula: list[tuple[Workspace, WorkItem]] = []
     pending_authors: list[tuple[Workspace, WorkItem]] = []
     pending_reviews: list[tuple[Workspace, WorkItem]] = []
-    ready_skills: list[tuple[SkillCandidate, Workspace]] = []
+    ready_skills: list[tuple[SkillCandidate, Workspace, AnalysisRun, WorkItem, WorkItem]] = []
 
     for skill in selected_skills:
         skill_view = base_workspace.for_skill(skill.id)
@@ -459,6 +459,7 @@ def _advance_multi_skill_pack(
             analyze_task.snapshot_digest,
             settings=settings,
         )
+        skill_view.ready_work_items(skill_run.id)
         all_author_tasks = skill_view.list_work_items(skill_run.id, role=WorkRole.AUTHOR)
         curriculum_tasks = [
             item for item in all_author_tasks if item.scope.get("kind") == "curriculum-planning"
@@ -558,7 +559,7 @@ def _advance_multi_skill_pack(
             continue
         if critic.get("verdict") != "pass":
             raise ProcessingError(f"Canonical critic report for '{skill.id}' has invalid verdict")
-        ready_skills.append((skill, skill_view))
+        ready_skills.append((skill, skill_view, skill_run, author_task, review_task))
 
     if pending_curricula:
         return _actions_required_scoped(
@@ -594,10 +595,58 @@ def _advance_multi_skill_pack(
             project_root=Path(str(configuration["project_root"])),
         )
     )
-    installed_entries: list[dict[str, object]] = []
-    for skill, skill_view in ready_skills:
-        blueprint, _receipt, _build_dir = compile_workspace_blueprint(skill_view)
+    pending_delivery_decisions: list[tuple[Workspace, WorkItem]] = []
+    compiled_ready: list[tuple[SkillCandidate, Workspace, Path]] = []
+    for skill, skill_view, skill_run, author_task, review_task in ready_skills:
+        blueprint, receipt, _build_dir = compile_workspace_blueprint(skill_view)
         skill_output = pack_output_root / blueprint.name
+        delivery_conflicts = _delivery_conflicts(
+            name=blueprint.name,
+            build_id=receipt.build_id,
+            output=skill_output,
+            skill_root=configured_skill_root,
+        )
+        if delivery_conflicts:
+            delivery_decisions = [
+                item
+                for item in _matching_tasks(
+                    skill_view.list_work_items(skill_run.id, role=WorkRole.DECISION),
+                    scope_key="conflicting_build_id",
+                    scope_value=receipt.build_id,
+                )
+                if item.scope.get("kind") == "delivery-name-selection"
+            ]
+            if not delivery_decisions:
+                decision_task = _plan_delivery_decision_task(
+                    skill_view,
+                    skill_run,
+                    author_task=author_task,
+                    review_task=review_task,
+                    build_id=receipt.build_id,
+                    name=blueprint.name,
+                    output=skill_output,
+                    skill_root=configured_skill_root,
+                    conflicts=delivery_conflicts,
+                )
+                pending_delivery_decisions.append((skill_view, decision_task))
+                continue
+            if delivery_decisions[-1].state != WorkState.COMPLETE:
+                pending_delivery_decisions.append((skill_view, delivery_decisions[-1]))
+                continue
+            raise ProcessingError(
+                f"Completed delivery decision for '{skill.id}' did not resolve Skill conflicts"
+            )
+        compiled_ready.append((skill, skill_view, skill_output))
+
+    if pending_delivery_decisions:
+        return _actions_required_scoped(
+            base_workspace,
+            pending_delivery_decisions,
+            parallel_group="pack-delivery-conflict",
+        )
+
+    installed_entries: list[dict[str, object]] = []
+    for skill, skill_view, skill_output in compiled_ready:
         built = build_workspace_skill(
             skill_view,
             host=host,

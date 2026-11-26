@@ -410,6 +410,10 @@ def _validate_author_result(
     if isinstance(skill_id, str):
         scoped_skill = scoped_skill_candidate(workspace, skill_id)
         if scoped_skill is not None:
+            if result.name != scoped_skill.name:
+                raise ProcessingError(
+                    f"Author name '{result.name}' differs from selected Skill name '{scoped_skill.name}'"
+                )
             allowed_ids = set(scoped_skill.semantic_unit_ids)
             units = [unit for unit in units if unit.id in allowed_ids]
     known_units = {unit.id for unit in units}
