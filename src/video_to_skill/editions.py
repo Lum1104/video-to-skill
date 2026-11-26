@@ -107,7 +107,7 @@ class EditionConfiguration(EditionModel):
     source_curriculum_plan_digest: str | None = None
     requested_curriculum_path_id: str | None = None
     skill_name: str | None = None
-    host: Literal["claude", "codex"]
+    host: Literal["claude", "codex", "copilot", "cursor"]
     output: Path
     output_is_default: bool
     project: bool
@@ -767,7 +767,7 @@ def create_edition_state(
     source_curriculum_plan_digest: str | None,
     requested_curriculum_path_id: str | None,
     skill_name: str | None,
-    host: Literal["claude", "codex"],
+    host: Literal["claude", "codex", "copilot", "cursor"],
     output: Path,
     output_is_default: bool,
     project: bool,

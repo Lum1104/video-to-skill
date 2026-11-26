@@ -31,6 +31,29 @@ class SkillHost(StrEnum):
 
     CLAUDE = "claude"
     CODEX = "codex"
+    COPILOT = "copilot"
+    CURSOR = "cursor"
+
+
+_PROJECT_SKILL_DIRS: Final[dict[SkillHost, str]] = {
+    SkillHost.CLAUDE: ".claude/skills",
+    SkillHost.CODEX: ".agents/skills",
+    SkillHost.COPILOT: ".github/skills",
+    SkillHost.CURSOR: ".cursor/skills",
+}
+
+_USER_SKILL_DIRS: Final[dict[SkillHost, str]] = {
+    SkillHost.CLAUDE: ".claude/skills",
+    SkillHost.CODEX: ".agents/skills",
+    SkillHost.COPILOT: ".copilot/skills",
+    SkillHost.CURSOR: ".cursor/skills",
+}
+
+
+def host_invocation_prefix(host: SkillHost) -> str:
+    """Return the slash/dollar invocation prefix for a supported host."""
+
+    return "$" if host == SkillHost.CODEX else "/"
 
 
 def host_skill_root(
@@ -44,9 +67,9 @@ def host_skill_root(
 
     if project:
         base = (project_root or Path.cwd()).expanduser().resolve()
-        return base / (".claude/skills" if host == SkillHost.CLAUDE else ".agents/skills")
+        return base / _PROJECT_SKILL_DIRS[host]
     base = (user_home or Path.home()).expanduser().resolve()
-    return base / (".claude/skills" if host == SkillHost.CLAUDE else ".agents/skills")
+    return base / _USER_SKILL_DIRS[host]
 
 
 def _skill_name(skill_directory: Path) -> str:
@@ -86,8 +109,10 @@ def _tree_manifest(root: Path) -> dict[str, str]:
 def install_generated_skill(
     skill_directory: Path,
     skill_root: Path,
+    *,
+    overwrite: bool = False,
 ) -> tuple[Path, str]:
-    """Atomically install a validated generated Skill without overwriting conflicts."""
+    """Atomically install (or with overwrite=True, safely update) a generated Skill."""
 
     source = skill_directory.expanduser().resolve()
     if not source.is_dir():
@@ -102,27 +127,48 @@ def install_generated_skill(
     target = root / name
     if target.is_symlink():
         raise ProcessingError(f"Refusing to replace symbolic-link target: {target}")
+    updating = False
     if target.exists():
         if not target.is_dir():
             raise ProcessingError(f"Skill installation target is not a directory: {target}")
         if _tree_manifest(target) == source_manifest:
             return target, "unchanged"
-        raise ProcessingError(
-            f"A different skill named '{name}' already exists at {target}. "
-            "Keep the generated artifact and choose a different name or explicitly update "
-            "the existing skill."
-        )
+        if not overwrite:
+            raise ProcessingError(
+                f"A different skill named '{name}' already exists at {target}. "
+                "Keep the generated artifact and choose a different name or re-run with "
+                "--force to replace the existing skill."
+            )
+        updating = True
 
     staging_root = Path(tempfile.mkdtemp(prefix=f".{name}.", dir=root))
     staged = staging_root / name
+    backup = staging_root / f"{name}.backup"
+    preserve_staging = False
     try:
         shutil.copytree(source, staged)
-        os.replace(staged, target)
+        if updating:
+            os.replace(target, backup)
+            try:
+                os.replace(staged, target)
+            except OSError as install_exc:
+                try:
+                    os.replace(backup, target)
+                except OSError as rollback_exc:
+                    preserve_staging = True
+                    raise ProcessingError(
+                        f"Could not install generated skill at {target}: {install_exc}. "
+                        f"Rollback also failed ({rollback_exc}); original skill backup preserved at {backup}."
+                    ) from install_exc
+                raise
+        else:
+            os.replace(staged, target)
     except OSError as exc:
         raise ProcessingError(f"Could not install generated skill at {target}: {exc}") from exc
     finally:
-        shutil.rmtree(staging_root, ignore_errors=True)
-    return target, "installed"
+        if not preserve_staging:
+            shutil.rmtree(staging_root, ignore_errors=True)
+    return target, ("updated" if updating else "installed")
 
 
 def bundled_skill_text() -> str:
@@ -133,6 +179,25 @@ def bundled_skill_text() -> str:
     if repository_copy.is_file():
         return repository_copy.read_text(encoding="utf-8")
     raise ProcessingError("The bundled video-to-skill SKILL.md could not be located")
+
+
+def bundled_reference_files() -> dict[Path, str]:
+    """Return on-demand reference Markdown files shipped alongside SKILL.md."""
+
+    result: dict[Path, str] = {}
+    packaged_dir = files("video_to_skill").joinpath("bundled", "references")
+    if packaged_dir.is_dir():
+        for entry in sorted(packaged_dir.iterdir(), key=lambda item: item.name):
+            if entry.is_file() and entry.name.endswith(".md"):
+                result[Path("references") / entry.name] = entry.read_text(encoding="utf-8")
+        if result:
+            return result
+    repo_dir = Path(__file__).resolve().parents[2] / "references"
+    if repo_dir.is_dir():
+        for path in sorted(repo_dir.glob("*.md")):
+            if path.is_file():
+                result[Path("references") / path.name] = path.read_text(encoding="utf-8")
+    return result
 
 
 def bundled_engine_text() -> str:
@@ -189,6 +254,7 @@ def _generator_bundle_files() -> dict[Path, str]:
     }
     return {
         Path("SKILL.md"): bundled_skill_text(),
+        **bundled_reference_files(),
         _GENERATOR_ENGINE: bundled_engine_text(),
         _GENERATOR_POSIX_LAUNCHER: _posix_launcher(python_executable),
         _GENERATOR_WINDOWS_LAUNCHER: _windows_launcher(python_executable),

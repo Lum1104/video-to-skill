@@ -329,7 +329,7 @@ def inspect_command(
         raise typer.Exit(1)
 
 
-@app.command()
+@app.command(hidden=True)
 def extract(
     sources: Annotated[list[str], typer.Argument(help="URLs or local media paths.")],
     workspace: Annotated[
@@ -396,7 +396,7 @@ def extract(
         typer.echo(f"Warnings: {len(manifest.warnings)}")
 
 
-@app.command()
+@app.command(hidden=True)
 def query(
     workspace: Annotated[Path, typer.Argument(help="Evidence workspace.")],
     source: Annotated[
@@ -441,7 +441,7 @@ def query(
         typer.echo(render_query_markdown(results))
 
 
-@app.command("contact-sheet")
+@app.command("contact-sheet", hidden=True)
 def contact_sheet(
     workspace: Annotated[Path, typer.Argument(help="Evidence workspace.")],
     source: Annotated[str, typer.Option("--source", help="Source index, ID, or title fragment.")],
@@ -528,7 +528,7 @@ def contact_sheet(
         )
 
 
-@app.command("frames")
+@app.command("frames", hidden=True)
 def frames(
     workspace: Annotated[Path, typer.Argument(help="Evidence workspace.")],
     source: Annotated[str, typer.Option("--source", help="Source index, ID, or title fragment.")],
@@ -590,7 +590,7 @@ def frames(
             typer.echo(f"- {format_timestamp(event.timestamp)} `{event.id}` {event.path}")
 
 
-@app.command("context")
+@app.command("context", hidden=True)
 def context(
     workspace: Annotated[Path, typer.Argument(help="Evidence workspace.")],
     source: Annotated[str, typer.Option("--source", help="Source index, ID, or title fragment.")],
@@ -647,7 +647,7 @@ def context(
         typer.echo(_render_agent_context(packet), nl=False)
 
 
-@app.command("annotate")
+@app.command("annotate", hidden=True)
 def annotate(
     workspace: Annotated[Path, typer.Argument(help="Evidence workspace.")],
     annotations: Annotated[Path, typer.Argument(help="Observation JSON file, or '-' for stdin.")],
@@ -680,7 +680,7 @@ def annotate(
             typer.echo(f"- {observation.id}: {observation.claim}")
 
 
-@app.command("gaps")
+@app.command("gaps", hidden=True)
 def gaps(
     workspace: Annotated[Path, typer.Argument(help="Evidence workspace.")],
     source: Annotated[
@@ -729,7 +729,8 @@ def run_workflow(
         typer.Option(
             "--host",
             case_sensitive=False,
-            help="Install for claude or codex; required only for a new run.",
+            metavar="HOST",
+            help="Install for claude, codex, copilot, or cursor; required only for a new run.",
         ),
     ] = None,
     output: Annotated[
@@ -846,7 +847,8 @@ def edition_workflow(
         typer.Option(
             "--host",
             case_sensitive=False,
-            help="Install for claude or codex; required only for a new edition.",
+            metavar="HOST",
+            help="Install for claude, codex, copilot, or cursor; required only for a new edition.",
         ),
     ] = None,
     output: Annotated[
@@ -976,7 +978,7 @@ def validate(
         raise typer.Exit(1)
 
 
-@app.command("tool-runs")
+@app.command("tool-runs", hidden=True)
 def tool_runs(
     workspace: Annotated[Path, typer.Argument(help="Evidence workspace.")],
     output: Annotated[
@@ -1106,7 +1108,7 @@ def clean(
     typer.echo(f"Removed {files} files ({size / 1024**2:.1f} MiB).")
 
 
-@app.command()
+@app.command(hidden=True)
 def evaluate(
     workspace: Annotated[Path, typer.Argument(help="Evidence workspace.")],
     labels: Annotated[Path, typer.Argument(help="Labeled evaluation JSON.")],
@@ -1178,7 +1180,8 @@ def install_generated(
         typer.Option(
             "--host",
             case_sensitive=False,
-            help="Install for claude or codex.",
+            metavar="HOST",
+            help="Install for claude, codex, copilot, or cursor.",
         ),
     ],
     project: Annotated[
@@ -1186,6 +1189,13 @@ def install_generated(
         typer.Option(
             "--project",
             help="Install into the current project instead of the user Skill directory.",
+        ),
+    ] = False,
+    force: Annotated[
+        bool,
+        typer.Option(
+            "--force",
+            help="Atomically replace an existing generated Skill with the same name.",
         ),
     ] = False,
     skip_official: Annotated[
@@ -1204,7 +1214,7 @@ def install_generated(
         if not report.valid:
             raise ProcessingError(render_validation_report(report))
         root = host_skill_root(host, project=project)
-        path, status = install_generated_skill(skill_directory, root)
+        path, status = install_generated_skill(skill_directory, root, overwrite=force)
     except VideoToSkillError as exc:
         typer.echo(f"ERROR: {exc}", err=True)
         raise typer.Exit(2) from exc

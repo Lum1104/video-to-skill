@@ -748,12 +748,40 @@ def test_v2_withholds_after_attempt_artifacts_independently_of_path(
     resident = (target / "SKILL.md").read_text(encoding="utf-8")
 
     assert "answer-keys/observe-transition.md" not in resident
-    assert "intentionally unindexed" in resident
+    assert "kept separate" in resident
     assert (target / "answer-keys" / "observe-transition.md").is_file()
 
     payload["curriculum"]["paths"][0]["artifact_ids"].append("artifact-solution")
     with pytest.raises(ValueError, match="cannot index after-attempt artifacts"):
         CourseSkillBlueprint.model_validate(payload)
+
+
+def test_localized_zh_and_ja_skill_rendering_and_validation(tmp_path: Path) -> None:
+    from video_to_skill.behavior import build_behavior_catalog
+
+    for lang, expected_heading, expected_prompt in (
+        ("zh-CN", "## 直接调用时", "从头开始教我这门课。"),
+        ("Chinese", "## 直接调用时", "从头开始教我这门课。"),
+        ("ja", "## 引数なしの呼び出し", "最初から教えてください。"),
+        ("Japanese", "## 引数なしの呼び出し", "最初から教えてください。"),
+    ):
+        payload = _blueprint().model_dump(mode="json")
+        payload["artifact_language"] = lang
+        blueprint = CourseSkillBlueprint.model_validate(payload)
+        target = render_course_skill_package(blueprint, tmp_path / lang / "transition-course")
+        resident = (target / "SKILL.md").read_text(encoding="utf-8")
+
+        assert expected_heading in resident
+        assert "## Empty invocation" not in resident
+        assert validate_skill(target).valid
+
+        scenarios = build_behavior_catalog(
+            blueprint.semantic_units,
+            [],
+            artifact_language=lang,
+        )
+        teach_scenario = next(s for s in scenarios if s.id == "interaction.bounded-teaching")
+        assert teach_scenario.prompt == expected_prompt
 
 
 def test_build_manifest_detects_human_modified_generated_file(tmp_path: Path) -> None:

@@ -199,3 +199,45 @@ def test_install_generated_skill_rejects_symlinks(tmp_path: Path) -> None:
 
     with pytest.raises(ProcessingError, match="symbolic links"):
         install_generated_skill(source, tmp_path / "skills")
+
+
+def test_install_generated_skill_overwrite_replaces_existing_safely(tmp_path: Path) -> None:
+    source = _write_generated_skill(tmp_path / "generated-v2")
+    skill_root = tmp_path / "skills"
+    target = skill_root / "course-skill"
+    target.mkdir(parents=True)
+    (target / "SKILL.md").write_text("old-version", encoding="utf-8")
+    (target / "stale.md").write_text("stale", encoding="utf-8")
+
+    installed, status = install_generated_skill(source, skill_root, overwrite=True)
+    assert installed == target.resolve()
+    assert status == "updated"
+    assert "course-skill" in (installed / "SKILL.md").read_text(encoding="utf-8")
+    assert not (installed / "stale.md").exists()
+
+
+def test_additional_host_skill_roots_and_prefixes(tmp_path: Path) -> None:
+    from video_to_skill.installation import host_invocation_prefix
+
+    project_root = tmp_path / "repo"
+    user_home = tmp_path / "home"
+    assert (
+        host_skill_root(SkillHost.COPILOT, project=True, project_root=project_root)
+        == project_root.resolve() / ".github/skills"
+    )
+    assert (
+        host_skill_root(SkillHost.COPILOT, user_home=user_home)
+        == user_home.resolve() / ".copilot/skills"
+    )
+    assert (
+        host_skill_root(SkillHost.CURSOR, project=True, project_root=project_root)
+        == project_root.resolve() / ".cursor/skills"
+    )
+    assert (
+        host_skill_root(SkillHost.CURSOR, user_home=user_home)
+        == user_home.resolve() / ".cursor/skills"
+    )
+    assert host_invocation_prefix(SkillHost.CLAUDE) == "/"
+    assert host_invocation_prefix(SkillHost.CODEX) == "$"
+    assert host_invocation_prefix(SkillHost.COPILOT) == "/"
+    assert host_invocation_prefix(SkillHost.CURSOR) == "/"

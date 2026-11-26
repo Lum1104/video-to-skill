@@ -42,6 +42,54 @@ _VISUAL_SIGNALS = {
     "workshop",
 }
 
+_VISUAL_SUBSTRING_SIGNALS = (
+    # Chinese (Simplified / Traditional)
+    "代码",
+    "代碼",
+    "编程",
+    "編程",
+    "源码",
+    "源碼",
+    "实战",
+    "實戰",
+    "实操",
+    "實操",
+    "演示",
+    "教程",
+    "界面",
+    "架构图",
+    "架構圖",
+    "流程图",
+    "流程圖",
+    "手把手",
+    "上机",
+    "实验",
+    "實驗",
+    "白板",
+    "绘图",
+    "繪圖",
+    "幻灯片",
+    "簡報",
+    "ppt",
+    # Japanese
+    "コード",
+    "プログラミング",
+    "チュートリアル",
+    "デモ",
+    "ハンズオン",
+    "スライド",
+    "画面",
+    "実装",
+    # Korean
+    "코딩",
+    "코드",
+    "실습",
+    "튜토리얼",
+    "데모",
+    "슬라이드",
+    "화면",
+)
+
 
 def _source_has_visual_signal(source: SourceDescriptor) -> bool:
     values: list[str] = [source.title, source.description or "", source.playlist_title or ""]
@@ -54,7 +102,10 @@ def _source_has_visual_signal(source: SourceDescriptor) -> bool:
     tokens = {
         token.strip(".,:;!?()[]{}<>\"'").casefold() for value in values for token in value.split()
     }
-    return bool(tokens & _VISUAL_SIGNALS)
+    if tokens & _VISUAL_SIGNALS:
+        return True
+    combined = " ".join(values).casefold()
+    return any(signal in combined for signal in _VISUAL_SUBSTRING_SIGNALS)
 
 
 def inspect_analysis_characteristics(

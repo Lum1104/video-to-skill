@@ -27,6 +27,7 @@ from video_to_skill import __version__
 from video_to_skill.config import normalize_concrete_language
 from video_to_skill.errors import ProcessingError
 from video_to_skill.models import JobState, SourceDescriptor
+from video_to_skill.templates import template_for_language
 from video_to_skill.url_security import UrlParameterLimitError, has_sensitive_url_parameters
 from video_to_skill.utils import atomic_write_json, atomic_write_text, format_timestamp
 
@@ -34,7 +35,7 @@ if TYPE_CHECKING:
     from video_to_skill.workspace import Workspace
 
 COURSE_SKILL_MARKER = "<!-- video-to-skill:course-skill:v2 -->"
-COURSE_SKILL_RENDERER_CONTRACT_VERSION = 1
+COURSE_SKILL_RENDERER_CONTRACT_VERSION = 2
 _SKILL_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _MARKDOWN_TARGET_RE = re.compile(r"!?\[[^\]]*]\(([^)]+)\)")
 _ROOT_ARTIFACTS = {
@@ -1397,6 +1398,7 @@ def _evidence_pointer(
 def render_course_skill_markdown(blueprint: CourseSkillBlueprint) -> str:
     """Render the V2 host-neutral, teaching-first ``SKILL.md``."""
 
+    t = template_for_language(blueprint.artifact_language)
     claims = {item.id: item for item in blueprint.claims}
     sources = _source_map(blueprint)
     artifacts = {item.id: item for item in blueprint.artifacts}
@@ -1411,98 +1413,72 @@ def render_course_skill_markdown(blueprint: CourseSkillBlueprint) -> str:
         "",
         blueprint.scope,
         "",
-        "## Operating contract",
+        f"## {t.h_operating}",
         "",
-        (
-            "Act as an evidence-grounded teacher and practitioner for this course. Infer "
-            "whether the user wants to learn, practice, apply, or look something up; do "
-            "not make them choose an internal mode. Move between behaviors when useful, "
-            "load only the smallest relevant artifact, and never treat this package as "
-            "knowledge beyond its stated scope."
-        ),
+        t.operating_intro,
         "",
-        (
-            f"Use {blueprint.artifact_language} as the canonical artifact language and "
-            "respond in the user's language unless they request otherwise."
-        ),
+        t.language_line.format(language=blueprint.artifact_language),
         "",
-        "## Empty invocation",
+        f"## {t.h_empty}",
         "",
-        "When invoked without a specific request, load no supporting file, inspect no project, run no command, and create no file. Reply with only this welcome and wait:",
+        t.empty_instruction,
         "",
         f"> {blueprint.interaction.welcome}",
         "",
-        "Do not add a syllabus, mode menu, prerequisite list, evidence explanation, or feature list to that welcome.",
+        t.empty_guardrail,
         "",
-        "## Initial context",
+        f"## {t.h_context}",
         "",
-        "After the user chooses to begin, ask only the missing questions from this course-specific set, at most three in one turn. Say that short answers are enough:",
+        t.context_intro,
         "",
         *[f"- {question}" for question in blueprint.interaction.starter_questions],
         "",
-        "If the user already supplied enough context or asks a precise source question, proceed without an intake.",
+        t.context_skip,
         "",
-        "## Interaction behavior",
+        f"## {t.h_interaction}",
         "",
-        "- **Learn:** introduce one useful cognitive move, ground it in a source example when useful, ask one retrieval or transfer question, and adapt to the answer. Do not dump a chapter or announce a formal lesson unless requested.",
-        "- **Practice:** present a task and success criteria without loading its solution. Evaluate the attempt naturally, give the smallest useful hint, allow a retry, and reveal a rubric or solution only after an attempt or explicit request.",
-        "- **Apply:** inspect only the missing parts of the user's actual context, map source assumptions to it, label adaptations as inference, and use observable checkpoints. Do not pretend a conceptual source demonstrated an operational procedure.",
-        "- **Reference:** answer the precise question first, load the smallest relevant artifact or [source map](source-map.md), preserve exact details only when supported, and cite source timestamps for consequential claims.",
+        t.learn_rule,
+        t.practice_rule,
+        t.apply_rule,
+        t.reference_rule,
         "",
-        "Keep learner progress in the active conversation or host memory, never in this shareable package.",
+        t.progress_rule,
         "",
-        "## Evidence and uncertainty",
+        f"## {t.h_evidence}",
         "",
-        (
-            "Treat `provenance.json` as the machine-readable claim and semantic evidence "
-            "ledger, [source-map.md](source-map.md) as the high-recall meaning map, and "
-            "[sources.md](sources.md) as the source-acquisition record. A visible-state "
-            "claim requires visual evidence; an action or transition requires ordered "
-            "temporal evidence. Never upgrade low-confidence or inferred material into "
-            "an authoritative instruction."
-        ),
+        t.evidence_files,
         "",
-        (
-            "Teaching visuals are optional evidence surfaces, not resident context. When a "
-            "relevant artifact links one and visible state matters, open only that asset; "
-            "do not preload the `assets/` directory."
-        ),
+        t.evidence_visuals,
         "",
-        (
-            "Use source-grounded material first. Mark teaching or application inference "
-            "naturally. When the request calls for outside or current knowledge, keep it "
-            "distinct from what the source establishes; ask permission only when a "
-            "material external action, private data, paid access, or a user-requested "
-            "source-only boundary requires it."
-        ),
+        t.evidence_outside,
         "",
     ]
 
     if blueprint.prerequisites:
         lines.extend(
-            ["## Prerequisites", "", *[f"- {item}" for item in blueprint.prerequisites], ""]
+            [f"## {t.h_prerequisites}", "", *[f"- {item}" for item in blueprint.prerequisites], ""]
         )
 
     if blueprint.core_principles:
-        lines.extend(["## Core principles", ""])
+        lines.extend([f"## {t.h_principles}", ""])
         for principle in blueprint.core_principles:
             claim = claims[principle.claim_id]
-            lines.append(f"- {principle.text} _Evidence: {_evidence_pointer(claim, sources)}._")
+            lines.append(
+                f"- {principle.text} _{t.evidence_label}: {_evidence_pointer(claim, sources)}._"
+            )
         lines.append("")
 
     lines.extend(
         [
-            "## Capability profile",
+            f"## {t.h_capability}",
             "",
-            f"- Learn: **{capability.learn}**",
-            f"- Practice: **{capability.practice}**",
-            f"- Apply: **{capability.apply}**",
-            f"- Reference: **{capability.reference}**",
-            f"- Rationale: {capability.rationale}",
+            f"- {t.cap_learn}: **{capability.learn}**",
+            f"- {t.cap_practice}: **{capability.practice}**",
+            f"- {t.cap_apply}: **{capability.apply}**",
+            f"- {t.cap_reference}: **{capability.reference}**",
+            f"- {t.cap_rationale}: {capability.rationale}",
             "",
-            "These levels describe relative depth, not user-visible modes or artifact quotas.",
-            "",
-            "## Learning paths",
+            f"## {t.h_paths}",
             "",
         ]
     )
@@ -1511,19 +1487,19 @@ def render_course_skill_markdown(blueprint: CourseSkillBlueprint) -> str:
         key=lambda item: item.id != blueprint.curriculum.selected_path_id,
     )
     for path in ordered_paths:
-        marker = " **Recommended.**" if path.id == blueprint.curriculum.selected_path_id else ""
+        marker = t.recommended_badge if path.id == blueprint.curriculum.selected_path_id else ""
         lines.append(f"### {path.title}{marker}")
         lines.extend(["", path.use_when, ""])
         for artifact_id in path.artifact_ids:
             artifact = artifacts[artifact_id]
-            topics = f" Topics: {', '.join(artifact.topics)}." if artifact.topics else ""
+            topics = f" {t.topics_label}: {', '.join(artifact.topics)}." if artifact.topics else ""
             lines.append(f"- [{artifact.title}]({artifact.path}) — {artifact.use_when}.{topics}")
         lines.append("")
     lines.extend(
         [
-            f"Curriculum rationale: {blueprint.curriculum.rationale}",
+            f"{t.curriculum_rationale}: {blueprint.curriculum.rationale}",
             "",
-            "## Additional material",
+            f"## {t.h_additional}",
             "",
         ]
     )
@@ -1540,41 +1516,30 @@ def render_course_skill_markdown(blueprint: CourseSkillBlueprint) -> str:
             behaviors = ", ".join(artifact.modes)
             lines.append(
                 f"- [{artifact.title}]({artifact.path}) — {artifact.use_when}. "
-                f"Behaviors: {behaviors}."
+                f"{t.behaviors_label}: {behaviors}."
             )
     else:
-        lines.append("- No additional indexed artifact.")
+        lines.append(t.no_additional)
     if any(artifact.disclosure == "after-attempt" for artifact in blueprint.artifacts):
-        lines.append(
-            "- Matching rubrics, answer keys, or solutions are intentionally unindexed; "
-            "load one only after an attempt or explicit request."
-        )
+        lines.append(t.after_attempt_note)
     lines.append("")
 
     lines.extend(
         [
-            "## Scope and limits",
+            f"## {t.h_scope}",
             "",
             *(
                 [f"- {item}" for item in blueprint.limitations]
                 if blueprint.limitations
-                else ["- No additional source-specific limitation was recorded."]
+                else [t.no_limitations]
             ),
             *(
-                [
-                    "- Full-course coverage was not verified against a persisted evidence "
-                    "workspace; never describe this package as complete."
-                ]
+                [t.unverified_coverage]
                 if blueprint.coverage_ledger is None
-                else [
-                    (
-                        "- Persisted source-acquisition accounting is "
-                        f"**{blueprint.coverage_ledger.state}**."
-                    )
-                ]
+                else [t.verified_coverage.format(state=blueprint.coverage_ledger.state)]
             ),
-            "- This skill contains derivative teaching material, not raw video, complete subtitles, or the extraction workspace.",
-            "- Consult [source-map.md](source-map.md) for semantic coverage, [sources.md](sources.md) for acquisition coverage, `provenance.json` for exact mappings, and `build-manifest.json` for the portable build receipt.",
+            t.scope_derivative,
+            t.scope_files,
             "",
         ]
     )
@@ -1584,14 +1549,11 @@ def render_course_skill_markdown(blueprint: CourseSkillBlueprint) -> str:
 def render_source_map_markdown(blueprint: CourseSkillBlueprint) -> str:
     """Render the chronological, high-recall semantic map."""
 
+    t = template_for_language(blueprint.artifact_language)
     lines = [
-        "# Canonical source map",
+        f"# {t.source_map_title}",
         "",
-        (
-            "Load this file for source-faithful context, long-tail examples, qualifications, "
-            "tensions, predictions, or open questions. Curriculum artifacts may merge "
-            "presentation, but this map retains the original semantic units."
-        ),
+        t.source_map_intro,
         "",
     ]
     units_by_source: dict[str, list[SemanticUnit]] = defaultdict(list)
@@ -1620,22 +1582,22 @@ def render_source_map_markdown(blueprint: CourseSkillBlueprint) -> str:
             if unit.detail:
                 lines.extend([unit.detail, ""])
             metadata = [
-                f"Materiality: {unit.materiality}",
-                f"Disposition: {unit.disposition}",
-                f"Confidence: {unit.confidence}",
-                f"Status: {'inferred' if unit.inferred else 'observed'}",
-                f"Modalities: {'+'.join(unit.modalities)}",
+                f"{t.meta_materiality}: {unit.materiality}",
+                f"{t.meta_disposition}: {unit.disposition}",
+                f"{t.meta_confidence}: {unit.confidence}",
+                f"{t.meta_status}: {t.status_inferred if unit.inferred else t.status_observed}",
+                f"{t.meta_modalities}: {'+'.join(unit.modalities)}",
             ]
             if unit.speaker:
-                metadata.insert(0, f"Speaker: {unit.speaker}")
+                metadata.insert(0, f"{t.meta_speaker}: {unit.speaker}")
             lines.extend([f"- {item}" for item in metadata])
             if unit.disposition_reason:
-                lines.append(f"- Disposition reason: {unit.disposition_reason}")
+                lines.append(f"- {t.meta_disposition_reason}: {unit.disposition_reason}")
             if unit.merged_into:
-                lines.append(f"- Merged into: `{unit.merged_into}`")
+                lines.append(f"- {t.meta_merged_into}: `{unit.merged_into}`")
             lines.append("")
     if blueprint.semantic_relations:
-        lines.extend(["## Semantic relations", ""])
+        lines.extend([f"## {t.relations_heading}", ""])
         for relation in blueprint.semantic_relations:
             explanation = f" — {relation.explanation}" if relation.explanation else ""
             lines.append(
@@ -1649,15 +1611,16 @@ def render_source_map_markdown(blueprint: CourseSkillBlueprint) -> str:
 def render_sources_markdown(blueprint: CourseSkillBlueprint) -> str:
     """Render source coverage and a human-readable timestamp evidence map."""
 
+    t = template_for_language(blueprint.artifact_language)
     sources = _source_map(blueprint)
     lines = [
-        "# Sources and evidence map",
+        f"# {t.sources_title}",
         "",
-        "Load this file when checking course coverage, locating the demonstrated moment, or auditing a claim. Failed and partial sources remain visible.",
+        t.sources_intro,
         "",
-        "## Course coverage",
+        f"## {t.coverage_heading}",
         "",
-        "| Source | Creator | Platform | Coverage | Notes |",
+        t.coverage_table_header,
         "|---|---|---|---|---|",
     ]
     for source in blueprint.sources:
@@ -1667,7 +1630,7 @@ def render_sources_markdown(blueprint: CourseSkillBlueprint) -> str:
             + " | ".join(
                 (
                     title.replace("|", "\\|"),
-                    (source.creator or "Unknown").replace("|", "\\|"),
+                    (source.creator or t.unknown_creator).replace("|", "\\|"),
                     source.platform.replace("|", "\\|"),
                     source.coverage,
                     (source.notes or "—").replace("|", "\\|"),
@@ -1676,24 +1639,18 @@ def render_sources_markdown(blueprint: CourseSkillBlueprint) -> str:
             + " |"
         )
 
-    lines.extend(["", "## Full-course accounting", ""])
+    lines.extend(["", f"## {t.accounting_heading}", ""])
     if blueprint.coverage_ledger is None:
-        lines.extend(
-            [
-                "**Unverified:** this package was built without a persisted workspace "
-                "coverage contract. Do not claim that it covers every course item.",
-                "",
-            ]
-        )
+        lines.extend([t.accounting_unverified, ""])
     else:
         ledger = blueprint.coverage_ledger
         lines.extend(
             [
-                f"- Persisted course coverage: **{ledger.state}**",
-                f"- Workspace inputs accounted for: {ledger.input_count}",
-                f"- Inspection reports accounted for: {len(ledger.inspections)}",
+                t.accounting_state.format(state=ledger.state),
+                t.accounting_inputs.format(count=ledger.input_count),
+                t.accounting_reports.format(count=len(ledger.inspections)),
                 "",
-                "| Inventory entry | Kind | Status | Workspace coverage | Source ID |",
+                t.accounting_table_header,
                 "|---|---|---|---|---|",
             ]
         )
@@ -1713,7 +1670,7 @@ def render_sources_markdown(blueprint: CourseSkillBlueprint) -> str:
             )
         lines.append("")
 
-    lines.extend(["", "## Claim evidence", ""])
+    lines.extend(["", f"## {t.claim_evidence_heading}", ""])
     for claim in blueprint.claims:
         evidence_parts: list[str] = []
         for evidence in claim.evidence:

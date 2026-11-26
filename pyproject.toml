@@ -42,6 +42,7 @@ video-to-skill = "video_to_skill.cli:run"
 local = "video_to_skill.sources:LocalSourceAdapter"
 youtube = "video_to_skill.sources:YouTubeSourceAdapter"
 bilibili = "video_to_skill.sources:BilibiliSourceAdapter"
+web = "video_to_skill.sources:GenericYtDlpSourceAdapter"
 
 [project.entry-points."video_to_skill.transcribers"]
 faster-whisper = "video_to_skill.transcript:FasterWhisperTranscriber"
@@ -58,6 +59,7 @@ packages = ["src/video_to_skill"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "SKILL.md" = "video_to_skill/bundled/SKILL.md"
+"references" = "video_to_skill/bundled/references"
 "scripts/video_to_skill.py" = "video_to_skill/bundled/engine.py"
 
 [tool.pytest.ini_options]

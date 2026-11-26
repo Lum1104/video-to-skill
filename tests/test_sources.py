@@ -10,6 +10,7 @@ from video_to_skill.config import Settings
 from video_to_skill.models import InspectionEntryStatus, SourceKind
 from video_to_skill.sources import (
     BilibiliSourceAdapter,
+    GenericYtDlpSourceAdapter,
     LocalSourceAdapter,
     SourceRegistry,
     YouTubeSourceAdapter,
@@ -30,14 +31,32 @@ def test_platform_host_allowlist() -> None:
     assert not bilibili.accepts("file:///tmp/demo.mp4")
 
 
-def test_registry_rejects_generic_web_urls() -> None:
+def test_registry_accepts_public_web_urls_and_rejects_ssrf_targets() -> None:
     registry = SourceRegistry()
-    try:
-        registry.adapter_for("https://example.com/video.mp4")
-    except Exception as exc:
-        assert "Unsupported URL host" in str(exc)
-    else:
-        raise AssertionError("generic URL should not be accepted")
+    assert isinstance(
+        registry.adapter_for("https://vimeo.com/123456"),
+        GenericYtDlpSourceAdapter,
+    )
+    assert isinstance(
+        registry.adapter_for("https://www.youtube.com/watch?v=abc"),
+        YouTubeSourceAdapter,
+    )
+    assert isinstance(
+        registry.adapter_for("https://www.bilibili.com/video/BV123"),
+        BilibiliSourceAdapter,
+    )
+
+    for unsafe in (
+        "http://localhost:8080/video.mp4",
+        "http://127.0.0.1/video.mp4",
+        "http://169.254.169.254/latest/meta-data",
+        "http://10.0.0.1/internal.mp4",
+        "http://intranet/video.mp4",
+        "http://user:pass@example.com/video.mp4",
+        "file:///etc/passwd",
+    ):
+        with pytest.raises(Exception, match=r"unsafe or unsupported|not a supported"):
+            registry.adapter_for(unsafe)
 
 
 def test_ytdlp_playlist_metadata_is_normalized(monkeypatch: pytest.MonkeyPatch) -> None:

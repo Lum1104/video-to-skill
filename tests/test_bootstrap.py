@@ -32,7 +32,7 @@ def _fake_runtime_python(runtime_root: Path) -> Path:
     return python
 
 
-def test_runtime_fingerprint_changes_with_source_and_engine(
+def test_runtime_fingerprint_ignores_editable_src_and_tracks_manifest(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -60,12 +60,35 @@ def test_runtime_fingerprint_changes_with_source_and_engine(
 
     original = bootstrap._runtime_fingerprint()
     module.write_text("VALUE = 2\n", encoding="utf-8")
-    source_changed = bootstrap._runtime_fingerprint()
+    assert bootstrap._runtime_fingerprint() == original
+
+    pyproject.write_text("[project]\nname='video-to-skill'\nversion='0.2.0'\n", encoding="utf-8")
+    manifest_changed = bootstrap._runtime_fingerprint()
     engine.write_text("ENGINE = 2\n", encoding="utf-8")
     engine_changed = bootstrap._runtime_fingerprint()
 
-    assert original != source_changed
-    assert source_changed != engine_changed
+    assert original != manifest_changed
+    assert manifest_changed != engine_changed
+
+
+def test_prune_stale_runtimes_keeps_recent_and_skips_locked(tmp_path: Path) -> None:
+    runtimes = tmp_path / "runtimes"
+    runtimes.mkdir()
+    active = runtimes / "active"
+    recent = runtimes / "recent"
+    old_free = runtimes / "old-free"
+    old_locked = runtimes / "old-locked"
+    for idx, folder in enumerate((old_free, old_locked, recent, active), start=1):
+        folder.mkdir()
+        os.utime(folder, (idx * 100, idx * 100))
+    (runtimes / ".old-locked.lock").write_text("999", encoding="ascii")
+
+    bootstrap._prune_stale_runtimes(runtimes, "active")
+
+    assert active.exists()
+    assert recent.exists()
+    assert old_locked.exists()
+    assert not old_free.exists()
 
 
 def test_import_probe_is_isolated_bounded_and_silent(

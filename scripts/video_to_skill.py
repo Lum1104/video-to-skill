@@ -62,22 +62,70 @@ def _user_data_root() -> Path:
     return base / "video-to-skill"
 
 
+MAX_RETAINED_RUNTIMES = 2
+
+
 def _fingerprint_files() -> list[Path]:
+    """Files whose changes require rebuilding the isolated venv.
+
+    The local package is installed in editable mode, so regular ``src/*.py``
+    edits take effect immediately without rebuilding the environment or
+    re-downloading PyPI dependencies and optional ASR/OCR extras.
+    """
     files = [
         PYPROJECT_PATH,
         ENGINE_PATH,
         POSIX_LAUNCHER_PATH,
         WINDOWS_LAUNCHER_PATH,
     ]
-    if SOURCE_ROOT.is_dir():
-        files.extend(
-            path
-            for path in SOURCE_ROOT.rglob("*")
-            if path.is_file()
-            and not path.is_symlink()
-            and (path.suffix == ".py" or path.name == "py.typed")
-        )
     return sorted(set(files), key=lambda path: path.as_posix())
+
+
+def _touch_runtime_used(runtime_root: Path) -> None:
+    with suppress(OSError):
+        (runtime_root / ".last-used").write_text(str(int(time.time())), encoding="utf-8")
+
+
+def _runtime_last_used(runtime_root: Path) -> float:
+    marker = runtime_root / ".last-used"
+    try:
+        if marker.is_file():
+            return marker.stat().st_mtime
+        return runtime_root.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+STALE_RUNTIME_MIN_AGE_SECONDS = 7 * 24 * 60 * 60
+
+
+def _prune_stale_runtimes(runtimes_root: Path, active_name: str) -> None:
+    """Remove old sibling runtime directories beyond MAX_RETAINED_RUNTIMES that have been idle."""
+    try:
+        candidates = [
+            entry
+            for entry in runtimes_root.iterdir()
+            if entry.is_dir()
+            and not entry.is_symlink()
+            and entry.name != active_name
+            and not entry.name.startswith(".")
+        ]
+    except OSError:
+        return
+    keep_extra = max(0, MAX_RETAINED_RUNTIMES - 1)
+    if len(candidates) <= keep_extra:
+        return
+
+    candidates.sort(key=_runtime_last_used, reverse=True)
+    cutoff = time.time() - STALE_RUNTIME_MIN_AGE_SECONDS
+    for stale in candidates[keep_extra:]:
+        lock_file = runtimes_root / f".{stale.name}.lock"
+        cap_lock = runtimes_root / f".{stale.name}.capabilities.lock"
+        if lock_file.exists() or cap_lock.exists():
+            continue
+        if _runtime_last_used(stale) > cutoff:
+            continue
+        shutil.rmtree(stale, ignore_errors=True)
 
 
 def _runtime_fingerprint() -> str:
@@ -398,6 +446,7 @@ def _prepare_runtime_once() -> Path:
         _write_runtime_record(runtime_root)
         if not _runtime_ready():
             raise BootstrapFailure("runtime readiness probe failed")
+        _prune_stale_runtimes(runtimes_root, runtime_root.name)
         return runtime_python
     except (OSError, BootstrapFailure) as exc:
         if touched_runtime:
@@ -426,6 +475,7 @@ def _bootstrap_checkout() -> None:
             )
         raise SystemExit(127) from exc
 
+    _touch_runtime_used(runtime_python.parent.parent)
     os.environ[BOOTSTRAP_GUARD] = "1"
     runtime_scripts = str(runtime_python.parent)
     current_path = os.environ.get("PATH", "")

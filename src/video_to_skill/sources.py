@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import mimetypes
+import re
+import socket
 from abc import ABC, abstractmethod
 from importlib.metadata import entry_points
 from pathlib import Path
@@ -194,8 +197,20 @@ def _source_from_ytdlp(
     remote_id = str(data.get("id") or stable_hash(data, length=16))
     canonical = data.get("webpage_url") or data.get("original_url") or fallback_locator
     title = str(data.get("title") or data.get("fulltitle") or remote_id)
+    if platform is SourcePlatform.WEB:
+        extractor_raw = str(
+            data.get("extractor_key")
+            or data.get("extractor")
+            or urlparse(str(canonical)).hostname
+            or "site"
+        )
+        site_slug = re.sub(r"[^a-z0-9]+", "-", extractor_raw.lower()).strip("-") or "site"
+        url_digest = stable_hash(str(canonical), length=8)
+        source_id = f"{platform.value}-{site_slug}-{remote_id}-{url_digest}"
+    else:
+        source_id = f"{platform.value}-{remote_id}"
     descriptor = SourceDescriptor(
-        id=f"{platform.value}-{remote_id}",
+        id=source_id,
         platform=platform,
         locator=str(canonical),
         canonical_url=str(canonical),
@@ -753,6 +768,107 @@ class BilibiliSourceAdapter(YtDlpSourceAdapter):
     hosts = ("bilibili.com", "b23.tv")
 
 
+def _is_public_ip(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    return not (
+        addr.is_private
+        or addr.is_loopback
+        or addr.is_link_local
+        or addr.is_multicast
+        or addr.is_reserved
+        or addr.is_unspecified
+    )
+
+
+def _parse_ip_literal(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    try:
+        return ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    # Catch abbreviated / numeric IPv4 literals (e.g. 127.1, 10.0.1, 2130706433)
+    try:
+        packed = socket.inet_aton(host)
+    except OSError:
+        return None
+    return ipaddress.IPv4Address(packed)
+
+
+def _is_safe_public_web_url(locator: str) -> bool:
+    """Return True for public http(s) URLs, rejecting localhost/private/credential URLs."""
+
+    parsed = urlparse(locator)
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    if parsed.username is not None or parsed.password is not None:
+        return False
+    host = (parsed.hostname or "").strip().lower().rstrip(".")
+    if not host:
+        return False
+    if host == "localhost" or host.endswith((".localhost", ".local", ".internal")):
+        return False
+    addr = _parse_ip_literal(host)
+    if addr is not None:
+        return _is_public_ip(addr)
+    # Domain name: require at least one dot (no bare intranet hostnames)
+    return "." in host
+
+
+def _verify_public_dns_resolution(locator: str) -> None:
+    """Resolve hostname before network access and reject non-public addresses."""
+
+    parsed = urlparse(locator)
+    host = (parsed.hostname or "").strip().lower().rstrip(".")
+    if not host or not _is_safe_public_web_url(locator):
+        raise SourceError(f"Refusing non-public or unsupported web URL: {locator}")
+    if _parse_ip_literal(host) is not None:
+        return
+    try:
+        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        return
+    for info in infos:
+        sockaddr = info[4]
+        raw_ip = str(sockaddr[0]).split("%", 1)[0]
+        resolved = _parse_ip_literal(raw_ip)
+        if resolved is not None and not _is_public_ip(resolved):
+            raise SourceError(
+                f"Refusing URL '{locator}': host '{host}' resolves to non-public address {resolved}"
+            )
+
+
+class GenericYtDlpSourceAdapter(YtDlpSourceAdapter):
+    """Fallback yt-dlp adapter for public web video URLs (Vimeo, Loom, TED, etc.)."""
+
+    platform = SourcePlatform.WEB
+    hosts: tuple[str, ...] = ()
+
+    def accepts(self, locator: str) -> bool:
+        return _is_safe_public_web_url(locator)
+
+    def inspect_with_completeness(
+        self,
+        locator: str,
+        settings: Settings,
+    ) -> SourceInspection:
+        _verify_public_dns_resolution(locator)
+        return super().inspect_with_completeness(locator, settings)
+
+    def materialize(
+        self,
+        source: SourceDescriptor,
+        destination: Path,
+        settings: Settings,
+        *,
+        need_media: bool,
+    ) -> MaterializedSource:
+        _verify_public_dns_resolution(source.locator)
+        return super().materialize(
+            source,
+            destination,
+            settings,
+            need_media=need_media,
+        )
+
+
 class SourceRegistry:
     def __init__(self, adapters: list[SourceAdapter] | None = None):
         if adapters is not None:
@@ -763,7 +879,7 @@ class SourceRegistry:
             YouTubeSourceAdapter(),
             BilibiliSourceAdapter(),
         ]
-        built_in_names = {"local", "youtube", "bilibili"}
+        built_in_names = {"local", "youtube", "bilibili", "web"}
         for entry_point in entry_points(group="video_to_skill.source_adapters"):
             if entry_point.name in built_in_names:
                 continue
@@ -774,6 +890,7 @@ class SourceRegistry:
                     "implement SourceAdapter"
                 )
             self.adapters.append(candidate)
+        self.adapters.append(GenericYtDlpSourceAdapter())
 
     def adapter_for(self, locator: str) -> SourceAdapter:
         matches = [adapter for adapter in self.adapters if adapter.accepts(locator)]
@@ -781,7 +898,8 @@ class SourceRegistry:
             parsed = urlparse(locator)
             if parsed.scheme in {"http", "https"}:
                 raise SourceError(
-                    "Unsupported URL host. Production inputs are limited to YouTube and Bilibili."
+                    "Rejected unsafe or unsupported URL (localhost, private network, "
+                    "intranet, and embedded-credential URLs are not allowed)."
                 )
             raise SourceError(f"Input is not a supported media file or URL: {locator}")
         return matches[0]

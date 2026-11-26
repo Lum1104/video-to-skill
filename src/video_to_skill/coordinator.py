@@ -48,7 +48,7 @@ from video_to_skill.editions import (
 )
 from video_to_skill.errors import ProcessingError
 from video_to_skill.generation import CurriculumDesign
-from video_to_skill.installation import SkillHost, host_skill_root
+from video_to_skill.installation import SkillHost, host_invocation_prefix, host_skill_root
 from video_to_skill.models import AnalysisDepthContract
 from video_to_skill.orchestration import (
     CurriculumSelection,
@@ -762,7 +762,7 @@ def _completion_payload(
         status: sum(isinstance(item, dict) and item.get("status") == status for item in affordances)
         for status in ("provided", "unsupported", "not-applicable")
     }
-    prefix = "/" if result.host == SkillHost.CLAUDE else "$"
+    prefix = host_invocation_prefix(result.host)
     payload = {
         **result.model_dump(mode="json"),
         "workspace": str(workspace.root),

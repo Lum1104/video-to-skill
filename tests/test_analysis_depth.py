@@ -184,3 +184,20 @@ def test_resume_reuses_contract_and_rejects_conflict_drift_and_inventory_change(
     )
     assert refreshed.characteristics.inventory_digest != contract.characteristics.inventory_digest
     assert refreshed.budget_digest != contract.budget_digest
+
+
+def test_multilingual_visual_signals_detected_for_cjk_titles() -> None:
+    zh_sources = [
+        _source("bili-1", duration=30 * 60, title="Python 实战编程教程 - 手把手带你写代码"),
+        _source("bili-2", duration=30 * 60, title="系统架构图讲解与源码演示"),
+    ]
+    ja_sources = [_source("jp-1", duration=30 * 60, title="Rustハンズオン入門スライド")]
+    plain_zh = [_source("pod-1", duration=30 * 60, title="创业访谈 - 聊一聊长期主义")]
+
+    zh_contract = resolve_analysis_depth(zh_sources, [], Settings())
+    ja_contract = resolve_analysis_depth(ja_sources, [], Settings())
+    plain_contract = resolve_analysis_depth(plain_zh, [], Settings())
+
+    assert zh_contract.characteristics.visual_signal_source_count == 2
+    assert ja_contract.characteristics.visual_signal_source_count == 1
+    assert plain_contract.characteristics.visual_signal_source_count == 0
