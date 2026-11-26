@@ -201,4 +201,3 @@ def test_multilingual_visual_signals_detected_for_cjk_titles() -> None:
     assert zh_contract.characteristics.visual_signal_source_count == 2
     assert ja_contract.characteristics.visual_signal_source_count == 1
     assert plain_contract.characteristics.visual_signal_source_count == 0
-

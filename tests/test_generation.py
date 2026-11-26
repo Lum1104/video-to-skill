@@ -762,7 +762,7 @@ def test_localized_zh_and_ja_skill_rendering_and_validation(tmp_path: Path) -> N
         payload = _blueprint().model_dump(mode="json")
         payload["artifact_language"] = lang
         blueprint = CourseSkillBlueprint.model_validate(payload)
-        target = render_course_skill_package(blueprint, tmp_path / f"course-{lang}")
+        target = render_course_skill_package(blueprint, tmp_path / lang / "transition-course")
         resident = (target / "SKILL.md").read_text(encoding="utf-8")
 
         assert expected_heading in resident
