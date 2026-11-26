@@ -1,6 +1,6 @@
 # Worker Protocol & Generated Skill Contract
 
-Detailed role boundaries, evidence rules, and output quality requirements for the `Analyze → Author → Review` pipeline.
+Detailed role boundaries, evidence rules, and output quality requirements for the `Analyze → Decompose → Author → Review` pipeline.
 
 ## Worker Roles
 
@@ -12,10 +12,17 @@ Combine high-recall extraction, terminology normalization, relation linking, mat
 - The engine supplies the visual evidence index (first frame, scene changes, periodic fallbacks, deduplication, OCR/type hints, and bounded dense windows). Analyze proposes at most 24 non-duplicate teaching visual candidates (single frame, normalized crop, or 2–4 frame sequence) only when a visual materially improves teaching or verification. Never edit pixels or supply arbitrary image paths.
 - Every semantic unit requires a stable ID, source/time range, kind, compact summary, materiality, disposition, modality, evidence IDs, observed-versus-inferred status, confidence, and uncertainty. Merged, context-only, and omitted items require an explicit reason.
 
+### Decompose
+Read the canonical Analyze semantic map and decide whether the material forms one cohesive Skill (`decomposition_mode: "single"`) or multiple independent, reusable Skills (`decomposition_mode: "multi"`, up to 8 candidates).
+
+- Partition material semantic units cleanly across candidates: each candidate gets a stable kebab-case `skill_id`, concise title/description, `primary_focus`, explicit `semantic_unit_ids`, and a short rationale explaining why it stands on its own.
+- When `decomposition_mode == "single"`, the coordinator auto-selects the lone Skill and continues without interrupting the user.
+- When `decomposition_mode == "multi"`, the coordinator pauses once at `skill-pack-selection` (`ask-user`, recommending building all candidates or selecting a subset), then executes `Curriculum → Author → Review → Compile & Install` in parallel across isolated `skill-*` scopes and writes `pack-manifest.json` in the output root.
+
 ### Author
 Author has two bounded task shapes:
 
-1. **Curriculum planning**: read canonical semantic records, recommend a thematic path, and propose up to two justified alternates. Write only curriculum options, ordered semantic-unit sequences, and concise decision metadata—never artifact plans, claims, assets, or Markdown drafts. Echo the fixed artifact language (or make the one constrained declaration for mixed/unknown source evidence). When alternatives materially change the learning experience, pause at the `ask-user` action; otherwise the coordinator selects the recommendation.
+1. **Curriculum planning**: read canonical semantic records (scoped to the Skill's `semantic_unit_ids` in multi-skill packs), recommend a thematic path, and propose up to two justified alternates. Write only curriculum options, ordered semantic-unit sequences, and concise decision metadata—never artifact plans, claims, assets, or Markdown drafts. Echo the fixed artifact language (or make the one constrained declaration for mixed/unknown source evidence). In single-skill mode, pause at `ask-user` only when alternatives materially change the learning experience; in multi-skill packs, the recommended curriculum is auto-selected per Skill.
 2. **Full Skill authoring**: preserve the selected curriculum path, semantic order, and canonical artifact language while binding them to justified artifacts and writing Markdown drafts inside the task output directory. Do not reopen the curriculum choice during authoring or repair.
 
 Authoring rules:
@@ -25,13 +32,11 @@ Authoring rules:
 - Select visuals only from verified candidates in the Author packet. Link each retained PNG from its `used_by` artifacts and bind it to claims preserving the same visual/temporal evidence. Leave decorative, redundant, illegible, private, or text-recoverable candidates unused.
 
 ### Review
-Use a fresh critic independent of both curriculum-planning and artifact-Author producers. Review actual canonical drafts and records, not an author-supplied summary.
+Use one fresh critic per Skill, independent of both curriculum-planning and artifact-Author producers. Review actual canonical drafts, rendered preview files, and evidence records—never an author-supplied summary.
 
-- Audit source-meaning retention and instructional-affordance retention separately, then grounding, uncertainty, disclosure, empty invocation, runtime behavior, safety, scope, source failures, and shareability. Inspect every selected visual for necessity, legibility, context, ordering, privacy, grounding, and on-demand loading.
-- Before the final critic, the engine renders canonical Author state into a private immutable behavior target and generates a versioned scenario catalog (empty invocation, start/intake, bounded teaching, practice solution withholding, application context gathering, grounded reference, out-of-scope honesty, plus deterministic semantic pressure cases).
-- Dispatch each applicable `behavior-trial` Review task in a genuinely fresh context. A trial receives only the immutable target and one prompt, echoes its lease `execution_context_id`, records the exact bounded exchange, file accesses, and side effects, and makes no pass/fail judgment.
-- After all trials finish, dispatch a separate Review critic to evaluate the rendered target, canonical evidence, expectations, and raw trial files. Raw trials and reports stay in the private workspace.
-- A failed Review creates a new Author revision pinned to the same curriculum and a fresh Review (up to 3 repair cycles). Never weaken a capability claim merely to hide an affordance the evidence supports.
+- Before dispatching Review, the engine renders canonical Author state into a private immutable preview directory (`review-targets/`).
+- The single independent critic audits source-meaning retention and instructional-affordance retention separately, then checks grounding, uncertainty, disclosure (`after-attempt` separation), empty invocation, runtime clarity, safety, scope, source failures, visual quality, and shareability.
+- A failed Review creates a new Author revision pinned to the same curriculum and a fresh Review (up to 2 repair cycles). Never weaken a capability claim merely to hide an affordance the evidence supports.
 
 ## Evidence Rules
 

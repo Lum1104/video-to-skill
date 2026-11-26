@@ -779,30 +779,18 @@ class ReviewResult(OrchestrationModel):
     snapshot_digest: str
     reviewed_snapshot_digest: str
     producer: ObservationProducer
-    catalog_version: str = Field(min_length=1, max_length=120)
-    catalog_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
     target_build_id: str = Field(min_length=1, max_length=80)
     target_content_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
     verdict: ReviewVerdict
     findings: list[ReviewFinding] = Field(default_factory=list)
-    behavior_checks: list[BehaviorCheck] = Field(min_length=1, max_length=32)
 
     @model_validator(mode="after")
     def coherent_verdict(self) -> ReviewResult:
-        scenario_ids = [check.id for check in self.behavior_checks]
-        if len(scenario_ids) != len(set(scenario_ids)):
-            raise ValueError("behavior scenarios must be judged exactly once")
-        trial_ids = [
-            check.trial_task_id for check in self.behavior_checks if check.trial_task_id is not None
-        ]
-        if len(trial_ids) != len(set(trial_ids)):
-            raise ValueError("each behavior scenario requires a distinct fresh-context trial")
         has_errors = any(finding.severity == "error" for finding in self.findings)
-        failed_behavior = any(check.passed is False for check in self.behavior_checks)
-        if self.verdict == "pass" and (has_errors or failed_behavior):
-            raise ValueError("passing reviews cannot retain errors or failed behavior checks")
-        if self.verdict == "fail" and not (has_errors or failed_behavior):
-            raise ValueError("failing reviews require an error or failed behavior check")
+        if self.verdict == "pass" and has_errors:
+            raise ValueError("passing reviews cannot retain blocking findings")
+        if self.verdict == "fail" and not has_errors:
+            raise ValueError("failing reviews require at least one error finding")
         return self
 
 

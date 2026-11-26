@@ -13,6 +13,11 @@ from test_review import _review_result
 from video_to_skill.behavior import snapshot_behavior_target
 from video_to_skill.config import Settings
 from video_to_skill.coordinator import advance_run, submit_workspace_result
+from video_to_skill.decompose import (
+    SkillCandidate,
+    SkillDecompositionResult,
+    SkillPackPlan,
+)
 from video_to_skill.errors import ProcessingError
 from video_to_skill.installation import SkillHost
 from video_to_skill.models import (
@@ -153,6 +158,41 @@ def _submit_review_envelope(workspace: Workspace, envelope: RunEnvelope) -> None
     submit_workspace_result(workspace, task.id, result_path)
 
 
+def _submit_single_skill_decompose(
+    workspace: Workspace,
+    envelope: RunEnvelope,
+) -> None:
+    [action] = envelope.actions
+    task = workspace.get_work_item(action.task_id)
+    assert task.scope["kind"] == "skill-decomposition"
+    lease = json.loads((action.task_path / "lease.json").read_text(encoding="utf-8"))
+    result_path = action.task_path / "output" / "result.json"
+    atomic_write_json(
+        result_path,
+        SkillDecompositionResult(
+            task_id=task.id,
+            lease_token=str(lease["lease_token"]),
+            snapshot_digest=task.snapshot_digest,
+            producer=ObservationProducer(name="decompose-worker", run_id="decompose-run"),
+            plan=SkillPackPlan(
+                decomposition_mode="single",
+                rationale="All material belongs to one cohesive Skill.",
+                skills=[
+                    SkillCandidate(
+                        id="evidence-updated-conviction",
+                        name="evidence-updated-conviction",
+                        title="Evidence-Updated Conviction",
+                        description="Make calibrated decisions grounded in evidence.",
+                        rationale="Single cohesive capability.",
+                        semantic_unit_ids=["unit-conviction"],
+                    )
+                ],
+            ),
+        ),
+    )
+    submit_workspace_result(workspace, task.id, result_path)
+
+
 def _reviewed_workspace(
     tmp_path: Path,
 ) -> tuple[Workspace, Settings, Path, Path]:
@@ -161,7 +201,7 @@ def _reviewed_workspace(
     output = tmp_path / "generated" / "evidence-updated-conviction"
     skill_root = tmp_path / "skills"
 
-    curriculum_envelope = advance_run(
+    decompose_envelope = advance_run(
         sources=[],
         workspace_path=workspace.root,
         settings=settings,
@@ -170,6 +210,10 @@ def _reviewed_workspace(
         skill_root=skill_root,
         run_official_validation=False,
     )
+    assert decompose_envelope.status == "actions-required"
+    _submit_single_skill_decompose(workspace, decompose_envelope)
+
+    curriculum_envelope = _resume(workspace, settings)
 
     assert curriculum_envelope.status == "actions-required"
     [curriculum_action] = curriculum_envelope.actions
@@ -212,50 +256,6 @@ def _reviewed_workspace(
         author_result_path,
     )
     assert author_receipt.status == "complete"
-
-    trial_envelope = _resume(workspace, settings)
-    assert all(action.role == "review" for action in trial_envelope.actions)
-    for index, trial_action in enumerate(trial_envelope.actions):
-        trial_task = workspace.get_work_item(trial_action.task_id)
-        trial_lease = json.loads(
-            (trial_action.task_path / "lease.json").read_text(encoding="utf-8")
-        )
-        packet = json.loads((workspace.root / trial_task.packet_path).read_text(encoding="utf-8"))[
-            "payload"
-        ]
-        target = snapshot_behavior_target(
-            workspace.root / packet["evaluation_target"]["path"],
-            expected_build_id=packet["evaluation_target"]["build_id"],
-        )
-        trial_result_path = trial_action.task_path / "output" / "result.json"
-        atomic_write_json(
-            trial_result_path,
-            BehaviorTrialResult(
-                task_id=trial_task.id,
-                lease_token=str(trial_lease["lease_token"]),
-                execution_context_id=str(trial_lease["execution_context_id"]),
-                snapshot_digest=trial_task.snapshot_digest,
-                producer=ObservationProducer(
-                    name=f"trial-worker-{index}",
-                    run_id=f"trial-run-{index}",
-                ),
-                scenario_id=str(trial_task.scope["scenario_id"]),
-                scenario_digest=str(trial_task.scope["scenario_digest"]),
-                target_content_digest=target.content_digest,
-                turns=[
-                    BehaviorTurn(role="user", content=packet["scenario"]["prompt"]),
-                    BehaviorTurn(role="assistant", content="A bounded grounded response."),
-                ],
-                artifact_accesses=[
-                    BehaviorArtifactAccess(
-                        path="SKILL.md",
-                        sha256=str(target.files["SKILL.md"]["sha256"]),
-                        reason="The host loaded the resident Skill instructions.",
-                    )
-                ],
-            ),
-        )
-        submit_workspace_result(workspace, trial_task.id, trial_result_path)
 
     review_envelope = _resume(workspace, settings)
     [review_action] = review_envelope.actions
@@ -381,7 +381,7 @@ def test_resume_reuses_omitted_analysis_depth_and_rejects_explicit_conflicts(
 def test_material_curriculum_decision_precedes_artifact_authoring(tmp_path: Path) -> None:
     workspace, _analyze_task = _analyzed_workspace(tmp_path)
     settings = Settings(cache_root=tmp_path)
-    first = advance_run(
+    decompose_envelope = advance_run(
         sources=[],
         workspace_path=workspace.root,
         settings=settings,
@@ -390,6 +390,8 @@ def test_material_curriculum_decision_precedes_artifact_authoring(tmp_path: Path
         skill_root=tmp_path / "skills",
         run_official_validation=False,
     )
+    _submit_single_skill_decompose(workspace, decompose_envelope)
+    first = _resume(workspace, settings)
     [curriculum_action] = first.actions
     curriculum_task = workspace.get_work_item(curriculum_action.task_id)
     curriculum_lease = json.loads(
@@ -533,10 +535,8 @@ def test_run_recovers_from_generated_and_installed_name_conflicts(
     atomic_write_json(result_path, result)
     submit_workspace_result(workspace, task.id, result_path)
 
-    fresh_trials = _resume(workspace, settings)
-    assert fresh_trials.status == "actions-required"
-    _submit_trial_envelope(workspace, fresh_trials, run_prefix="renamed-trial")
     fresh_review = _resume(workspace, settings)
+    assert fresh_review.status == "actions-required"
     _submit_review_envelope(workspace, fresh_review)
     complete = _resume(workspace, settings)
 
@@ -732,15 +732,18 @@ def test_submit_accepts_the_validated_result_snapshot_if_path_is_replaced(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     workspace, _analyze_task = _analyzed_workspace(tmp_path)
-    envelope = advance_run(
+    settings = Settings(cache_root=tmp_path)
+    decompose_envelope = advance_run(
         sources=[],
         workspace_path=workspace.root,
-        settings=Settings(cache_root=tmp_path),
+        settings=settings,
         host=SkillHost.CODEX,
         output=tmp_path / "generated" / "course",
         skill_root=tmp_path / "skills",
         run_official_validation=False,
     )
+    _submit_single_skill_decompose(workspace, decompose_envelope)
+    envelope = _resume(workspace, settings)
     [action] = envelope.actions
     task = workspace.get_work_item(action.task_id)
     lease = json.loads((action.task_path / "lease.json").read_text(encoding="utf-8"))

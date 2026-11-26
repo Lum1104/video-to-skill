@@ -843,7 +843,7 @@ def create_edition_state(
 
 
 def public_edition_lineage(workspace: Workspace) -> dict[str, Any] | None:
-    if workspace.edition_id is None:
+    if not workspace.is_named_edition:
         return None
     state = assert_edition_analysis_lineage(workspace)
     configuration = state.configuration
@@ -874,7 +874,7 @@ def validate_edition_author_identity(
     artifacts: list[Any],
     claims: list[Any],
 ) -> dict[str, Any] | None:
-    if workspace.edition_id is None:
+    if not workspace.is_named_edition:
         return None
     state = assert_edition_analysis_lineage(workspace)
     configuration = state.configuration

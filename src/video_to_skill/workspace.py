@@ -61,12 +61,10 @@ from video_to_skill.work import (
 
 SCHEMA_VERSION = 10
 
-_EDITION_ID_RE = re.compile(r"^edition-[a-f0-9]{20}$")
+_EDITION_ID_RE = re.compile(r"^(?:edition|skill)-[a-f0-9]{20}$")
 
 # Analyze output is shared evidence. Everything after Analyze belongs to one
-# independently resumable publication edition. Edition views encode the namespace
-# in canonical record ids so existing databases remain compatible without moving
-# the legacy single-edition heads.
+# independently resumable publication edition or decomposed skill scope.
 _EDITION_CANONICAL_KINDS = frozenset(
     {
         "artifact-language-declaration",
@@ -82,7 +80,6 @@ _EDITION_CANONICAL_KINDS = frozenset(
         "assets",
         "artifact-draft",
         "critic-report",
-        "behavior-report",
         "delivery-selection",
     }
 )
@@ -262,6 +259,18 @@ class Workspace:
         )
         self.tasks_dir = self.analysis_dir / "tasks"
 
+    @property
+    def is_named_edition(self) -> bool:
+        """True when this view targets a named publication edition (edition-*)."""
+
+        return self.edition_id is not None and self.edition_id.startswith("edition-")
+
+    @property
+    def is_skill_scope(self) -> bool:
+        """True when this view targets an isolated decomposed Skill scope (skill-*)."""
+
+        return self.edition_id is not None and self.edition_id.startswith("skill-")
+
     def for_edition(self, edition_id: str) -> Workspace:
         """Return an immutable edition-scoped view; no global active edition exists."""
 
@@ -272,6 +281,43 @@ class Workspace:
             raise ProcessingError(f"Not a video-to-skill workspace: {self.root}")
         view._prepare_edition_directories()
         return view
+
+    def skill_scope_id(self, skill_id: str) -> str:
+        """Compute a deterministic isolated scope id for a decomposed Skill."""
+
+        cleaned = skill_id.strip()
+        if not cleaned:
+            raise ProcessingError("Skill id must be non-empty")
+        return "skill-" + stable_hash(
+            {"skill_id": cleaned, "parent_edition": self.edition_id},
+            length=20,
+        )
+
+    def for_skill(self, skill_id: str) -> Workspace:
+        """Return an isolated workspace view for one decomposed Skill."""
+
+        scope_id = self.skill_scope_id(skill_id)
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        descriptors: list[int] = []
+        try:
+            root_fd = os.open(self.root, directory_flags | nofollow)
+            descriptors.append(root_fd)
+            with suppress(FileExistsError):
+                os.mkdir("editions", dir_fd=root_fd)
+            editions_fd = os.open("editions", directory_flags | nofollow, dir_fd=root_fd)
+            descriptors.append(editions_fd)
+            with suppress(FileExistsError):
+                os.mkdir(scope_id, dir_fd=editions_fd)
+            scope_fd = os.open(scope_id, directory_flags | nofollow, dir_fd=editions_fd)
+            descriptors.append(scope_fd)
+        except OSError as exc:
+            raise ProcessingError(f"Skill workspace scope is unsafe: {scope_id}") from exc
+        finally:
+            for descriptor in reversed(descriptors):
+                with suppress(OSError):
+                    os.close(descriptor)
+        return self.for_edition(scope_id)
 
     def _prepare_edition_directories(self) -> None:
         """Open every edition parent without following symlinks and create fixed children."""
@@ -672,11 +718,13 @@ class Workspace:
         if (
             self.edition_id is not None
             and scoped_edition is None
-            and item.role == WorkRole.ANALYZE
             and item.state == WorkState.COMPLETE
-            and item.scope.get("integrated") is True
+            and (
+                (item.role == WorkRole.ANALYZE and item.scope.get("integrated") is True)
+                or item.scope.get("kind") == "skill-decomposition"
+            )
         ):
-            # A named edition may consume its explicitly pinned shared Analyze producer.
+            # Scoped views may consume shared completed Analyze or skill-decomposition tasks.
             return
         raise ProcessingError(f"Task belongs to a different workspace edition: {item.id}")
 

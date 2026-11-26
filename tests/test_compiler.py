@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 from test_author import _analyzed_workspace, _author_result, _plan_course_author_task
 from test_generation import _blueprint
-from test_review import _authored_workspace, _complete_behavior_trials, _plan_review, _review_result
+from test_review import _authored_workspace, _plan_review, _review_result
 
 from video_to_skill.artifact_language import (
     artifact_language_contract_path,
@@ -172,12 +172,10 @@ def _compiled_workspace(tmp_path: Path, *, review_passes: bool = True) -> Worksp
         ).model_dump(mode="json"),
         canonical_outputs=canonical_outputs,
     )
-    trials = _complete_behavior_trials(workspace, run, author)
     review = plan_review_task(
         workspace,
         run,
         author_task=author,
-        behavior_trial_tasks=trials,
     )
     review_lease = workspace.lease_work_item(review.id, owner="codex")
     review_result = review_lease.output_directory / "result.json"
@@ -374,12 +372,10 @@ def test_legacy_repair_pins_course_derived_explicit_language(tmp_path: Path) -> 
     )
     assert language_state.declaration_digest == repair.scope["artifact_language_declaration_digest"]
 
-    trials = _complete_behavior_trials(workspace, run, repaired)
     subsequent_review = plan_review_task(
         workspace,
         run,
         author_task=repaired,
-        behavior_trial_tasks=trials,
     )
     subsequent_review_lease = workspace.lease_work_item(
         subsequent_review.id,
@@ -429,23 +425,14 @@ def test_compiler_refuses_failed_review(tmp_path: Path) -> None:
 def test_compiler_refuses_forged_passing_heads_after_failed_review(tmp_path: Path) -> None:
     workspace = _compiled_workspace(tmp_path, review_passes=False)
     critic_record = workspace.canonical_record("critic-report")
-    behavior_record = workspace.canonical_record("behavior-report")
     assert critic_record is not None
-    assert behavior_record is not None
 
     critic = json.loads((workspace.root / critic_record.path).read_text(encoding="utf-8"))
-    behavior = json.loads((workspace.root / behavior_record.path).read_text(encoding="utf-8"))
     critic["verdict"] = "pass"
     critic["findings"] = []
-    behavior["passed"] = True
-    for check in behavior["checks"]:
-        if check["applicability"] == "required":
-            check["passed"] = True
 
     forged_critic = workspace.analysis_dir / "forged-critic-report.json"
-    forged_behavior = workspace.analysis_dir / "forged-behavior-report.json"
     atomic_write_json(forged_critic, critic)
-    atomic_write_json(forged_behavior, behavior)
     workspace.publish_canonical_record(
         kind="critic-report",
         record_id="default",
@@ -453,17 +440,10 @@ def test_compiler_refuses_forged_passing_heads_after_failed_review(tmp_path: Pat
         producer_task_id=critic_record.producer_task_id,
         snapshot_digest=critic_record.snapshot_digest,
     )
-    workspace.publish_canonical_record(
-        kind="behavior-report",
-        record_id="default",
-        source_path=forged_behavior,
-        producer_task_id=behavior_record.producer_task_id,
-        snapshot_digest=behavior_record.snapshot_digest,
-    )
 
     with pytest.raises(
         ProcessingError,
-        match="Canonical Review heads differ from the accepted ReviewResult",
+        match="Canonical critic report differs from the accepted ReviewResult",
     ):
         compile_workspace_blueprint(workspace)
 
@@ -483,25 +463,7 @@ def test_compiler_refuses_canonical_snapshot_drift_after_review(tmp_path: Path) 
         snapshot_digest=interaction_record.snapshot_digest,
     )
 
-    with pytest.raises(ProcessingError, match="stale catalog or Skill preview"):
-        compile_workspace_blueprint(workspace)
-
-
-def test_compiler_refuses_legacy_passed_boolean_behavior_report(tmp_path: Path) -> None:
-    workspace = _compiled_workspace(tmp_path)
-    current = workspace.canonical_record("behavior-report")
-    assert current is not None
-    legacy_path = workspace.analysis_dir / "legacy-behavior-report.json"
-    atomic_write_json(legacy_path, {"passed": True, "checks": []})
-    workspace.publish_canonical_record(
-        kind="behavior-report",
-        record_id="default",
-        source_path=legacy_path,
-        producer_task_id=current.producer_task_id,
-        snapshot_digest=current.snapshot_digest,
-    )
-
-    with pytest.raises(ProcessingError, match="Legacy behavior reports"):
+    with pytest.raises(ProcessingError, match="stale Skill preview"):
         compile_workspace_blueprint(workspace)
 
 
@@ -559,12 +521,10 @@ def test_compiler_binds_selected_visual_to_integrated_candidate(tmp_path: Path) 
     atomic_write_json(author_result_path, author_result)
     accepted_author = submit_author_result(workspace, author_task.id, author_result_path)
 
-    trials = _complete_behavior_trials(workspace, run, accepted_author)
     review_task = plan_review_task(
         workspace,
         run,
         author_task=accepted_author,
-        behavior_trial_tasks=trials,
     )
     review_lease = workspace.lease_work_item(review_task.id, owner="codex")
     review_result = _review_result(workspace, review_task, review_lease.token)

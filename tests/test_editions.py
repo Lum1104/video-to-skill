@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 from test_author import _analyzed_workspace, _author_result, _curriculum_result
-from test_coordinator import _submit_review_envelope, _submit_trial_envelope
+from test_coordinator import _submit_review_envelope, _submit_single_skill_decompose
 from test_review import _review_result
 
 from video_to_skill import config as config_module
@@ -37,7 +37,7 @@ def _workspace_with_material_curriculum(
 ) -> tuple[Workspace, Settings, str]:
     workspace, analyze_task = _analyzed_workspace(tmp_path)
     settings = Settings(cache_root=tmp_path)
-    first = advance_run(
+    decompose_env = advance_run(
         sources=[],
         workspace_path=workspace.root,
         settings=settings,
@@ -45,6 +45,13 @@ def _workspace_with_material_curriculum(
         output=tmp_path / "legacy-output",
         skill_root=tmp_path / "skills",
         run_official_validation=False,
+    )
+    _submit_single_skill_decompose(workspace, decompose_env)
+    first = advance_run(
+        sources=[],
+        workspace_path=workspace.root,
+        settings=settings,
+        host=None,
     )
     [action] = first.actions
     task = workspace.get_work_item(action.task_id)
@@ -272,8 +279,6 @@ def _finish_passing_edition(
     settings: Settings,
     name: str,
 ):
-    trials = _resume_edition(base, settings, name)
-    _submit_trial_envelope(view, trials, run_prefix=name)
     review = _resume_edition(base, settings, name)
     _submit_review_envelope(view, review)
     return _resume_edition(base, settings, name)
@@ -366,8 +371,6 @@ def test_two_named_editions_reuse_analyze_and_resume_independently(
     assert english_complete.status == "complete"
     english_completion = dict(english_complete.completion or {})
 
-    chinese_trials = _resume_edition(workspace, settings, "chinese-application")
-    _submit_trial_envelope(chinese_view, chinese_trials, run_prefix="chinese-first")
     chinese_review = _resume_edition(workspace, settings, "chinese-application")
     [review_action] = chinese_review.actions
     review_task = chinese_view.get_work_item(review_action.task_id)

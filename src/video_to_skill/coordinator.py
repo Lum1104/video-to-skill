@@ -33,6 +33,15 @@ from video_to_skill.curriculum import (
     plan_curriculum_task,
     submit_curriculum_plan_result,
 )
+from video_to_skill.decompose import (
+    SkillCandidate,
+    SkillPackSelection,
+    load_canonical_skill_pack_checkpoint,
+    load_canonical_skill_pack_plan,
+    plan_decompose_task,
+    selected_skill_candidates,
+    submit_decompose_result,
+)
 from video_to_skill.editions import (
     LEGACY_EDITION_NAME,
     assert_edition_analysis_lineage,
@@ -62,12 +71,11 @@ from video_to_skill.pipeline import extract_sources
 from video_to_skill.review import (
     MAX_REPAIR_CYCLES,
     plan_author_repair_task,
-    plan_behavior_trial_tasks,
     plan_review_task,
-    submit_behavior_trial_result,
     submit_review_result,
 )
-from video_to_skill.utils import stable_hash
+from video_to_skill.review_contract import reconstruct_review_snapshot
+from video_to_skill.utils import atomic_write_json, stable_hash
 from video_to_skill.work import AnalysisRun, WorkItem, WorkRole, WorkState
 from video_to_skill.workspace import Workspace
 
@@ -305,7 +313,7 @@ def _actions_required(workspace: Workspace, items: list[WorkItem]) -> RunEnvelop
         raise ProcessingError("Coordinator reached an incomplete stage without dispatchable tasks")
     edition_id: str | None = None
     edition_name: str | None = None
-    if workspace.edition_id is not None:
+    if workspace.is_named_edition:
         state = assert_edition_analysis_lineage(workspace)
         edition_id = state.configuration.edition_id
         edition_name = state.configuration.edition_name
@@ -315,6 +323,38 @@ def _actions_required(workspace: Workspace, items: list[WorkItem]) -> RunEnvelop
         edition_id=edition_id,
         edition_name=edition_name,
         actions=[_task_action(workspace, item) for item in dispatchable],
+    )
+
+
+def _actions_required_scoped(
+    base_workspace: Workspace,
+    scoped_items: list[tuple[Workspace, WorkItem]],
+    *,
+    parallel_group: str,
+) -> RunEnvelope:
+    """Dispatch multiple tasks across isolated per-skill workspace views in parallel."""
+
+    failed = [item for _view, item in scoped_items if item.state == WorkState.FAILED]
+    if failed:
+        raise ProcessingError(
+            "Required workspace tasks failed: "
+            + ", ".join(f"{item.id} ({item.failure_reason})" for item in failed)
+        )
+    dispatchable = [
+        (view, item)
+        for view, item in scoped_items
+        if item.state in {WorkState.PENDING, WorkState.LEASED}
+    ]
+    if not dispatchable:
+        raise ProcessingError("Coordinator reached an incomplete stage without dispatchable tasks")
+    actions: list[RunAction] = []
+    for view, item in dispatchable:
+        action = _task_action(view, item)
+        actions.append(action.model_copy(update={"parallel_group": parallel_group}))
+    return RunEnvelope(
+        status="actions-required",
+        workspace=base_workspace.root,
+        actions=actions,
     )
 
 
@@ -337,6 +377,327 @@ def _curriculum_requires_decision(
         expected_producer_task_id=curriculum_task.id,
     )
     return curriculum.decision_required
+
+
+def _plan_skill_pack_decision_task(
+    workspace: Workspace,
+    run: AnalysisRun,
+    decompose_task: WorkItem,
+) -> WorkItem:
+    plan, plan_record = load_canonical_skill_pack_plan(workspace)
+    options: list[dict[str, str]] = [
+        {
+            "id": "all",
+            "label": f"Build all {len(plan.skills)} Skills (recommended)",
+            "description": (
+                "Author, review, and install every decomposed Skill in parallel: "
+                + ", ".join(skill.name for skill in plan.skills)
+            ),
+            "skill_ids": ",".join(skill.id for skill in plan.skills),
+        }
+    ]
+    for skill in plan.skills:
+        options.append(
+            {
+                "id": skill.id,
+                "label": f"{skill.title} ({skill.name})",
+                "description": skill.description,
+                "semantic_unit_ids": ",".join(skill.semantic_unit_ids),
+            }
+        )
+    return workspace.ensure_work_item(
+        run_id=run.id,
+        role=WorkRole.DECISION,
+        scope={
+            "kind": "skill-pack-selection",
+            "decompose_task_id": decompose_task.id,
+            "skill_pack_plan_digest": plan_record.digest,
+        },
+        persona_hint="User Skill pack selection.",
+        packet={
+            "prompt": (
+                f"This source decomposes into {len(plan.skills)} focused Skills. "
+                "Select 'all' to build and install all of them in parallel, or pick one "
+                "or more comma-separated Skill IDs."
+            ),
+            "rationale": plan.rationale,
+            "options": options,
+        },
+        result_schema=DecisionResult.model_json_schema(mode="validation"),
+        dependencies=[decompose_task.id],
+        snapshot_digest=run.snapshot_digest,
+    )
+
+
+def _advance_multi_skill_pack(
+    base_workspace: Workspace,
+    base_run: AnalysisRun,
+    *,
+    analyze_task: WorkItem,
+    selected_skills: list[SkillCandidate],
+    configuration: dict[str, object],
+    settings: Settings,
+) -> RunEnvelope:
+    """Advance all selected decomposed Skills in parallel through Author -> Light Review -> Install."""
+
+    current_analysis_depth = base_workspace.analysis_depth_contract()
+    if current_analysis_depth is None:
+        raise ProcessingError("Multi-skill build requires a persisted analysis-depth contract")
+    current_analysis_depth_digest = stable_hash(
+        current_analysis_depth.model_dump(mode="json"),
+        length=64,
+    )
+
+    pending_curricula: list[tuple[Workspace, WorkItem]] = []
+    pending_authors: list[tuple[Workspace, WorkItem]] = []
+    pending_reviews: list[tuple[Workspace, WorkItem]] = []
+    ready_skills: list[tuple[SkillCandidate, Workspace, AnalysisRun, WorkItem, WorkItem]] = []
+
+    for skill in selected_skills:
+        skill_view = base_workspace.for_skill(skill.id)
+        skill_run = skill_view.create_analysis_run(
+            analyze_task.snapshot_digest,
+            settings=settings,
+        )
+        skill_view.ready_work_items(skill_run.id)
+        all_author_tasks = skill_view.list_work_items(skill_run.id, role=WorkRole.AUTHOR)
+        curriculum_tasks = [
+            item for item in all_author_tasks if item.scope.get("kind") == "curriculum-planning"
+        ]
+        if not curriculum_tasks:
+            curriculum_task = plan_curriculum_task(
+                skill_view,
+                skill_run,
+                analyze_task=analyze_task,
+                skill_candidate=skill,
+            )
+            pending_curricula.append((skill_view, curriculum_task))
+            continue
+        curriculum_task = curriculum_tasks[-1]
+        if curriculum_task.state != WorkState.COMPLETE:
+            pending_curricula.append((skill_view, curriculum_task))
+            continue
+
+        course_author_tasks = [
+            item
+            for item in all_author_tasks
+            if item.scope.get("kind") in {"course-authoring", "course-authoring-repair"}
+            and item.scope.get("curriculum_task_id") == curriculum_task.id
+        ]
+        if not course_author_tasks:
+            author_task = plan_author_task(
+                skill_view,
+                skill_run,
+                analyze_task=analyze_task,
+                curriculum_task=curriculum_task,
+                skill_candidate=skill,
+            )
+            pending_authors.append((skill_view, author_task))
+            continue
+        author_task = course_author_tasks[-1]
+        if author_task.state != WorkState.COMPLETE:
+            pending_authors.append((skill_view, author_task))
+            continue
+
+        repair_cycle = max(0, int(author_task.scope.get("revision", 1)) - 1)
+        current_reviewed_snapshot_digest, _ = reconstruct_review_snapshot(
+            skill_view,
+            expected_author_task_id=author_task.id,
+        )
+        reviews = [
+            item
+            for item in _matching_tasks(
+                skill_view.list_work_items(skill_run.id, role=WorkRole.REVIEW),
+                scope_key="author_task_id",
+                scope_value=author_task.id,
+            )
+            if item.scope.get("kind") == "independent-review"
+            and item.scope.get("repair_cycle") == repair_cycle
+            and item.scope.get("analysis_depth_contract_digest") == current_analysis_depth_digest
+            and item.scope.get("reviewed_snapshot_digest") == current_reviewed_snapshot_digest
+        ]
+        if not reviews:
+            review_task = plan_review_task(
+                skill_view,
+                skill_run,
+                author_task=author_task,
+                repair_cycle=repair_cycle,
+            )
+            pending_reviews.append((skill_view, review_task))
+            continue
+        review_task = reviews[-1]
+        if review_task.state != WorkState.COMPLETE:
+            pending_reviews.append((skill_view, review_task))
+            continue
+        critic_record = skill_view.canonical_record("critic-report")
+        if critic_record is None or critic_record.producer_task_id != review_task.id:
+            raise ProcessingError(
+                f"Latest Review for Skill '{skill.id}' did not publish canonical critic report"
+            )
+        critic = _load_json(skill_view.root / critic_record.path)
+        assert isinstance(critic, dict)
+        if critic.get("verdict") == "fail":
+            if repair_cycle >= MAX_REPAIR_CYCLES:
+                raise ProcessingError(
+                    f"Maximum Author repair cycles exceeded for Skill '{skill.id}'"
+                )
+            repairs = _matching_tasks(
+                course_author_tasks,
+                scope_key="review_task_id",
+                scope_value=review_task.id,
+            )
+            if not repairs:
+                repair_task = plan_author_repair_task(
+                    skill_view,
+                    skill_run,
+                    failed_review_task=review_task,
+                    prior_author_task=author_task,
+                )
+                pending_authors.append((skill_view, repair_task))
+            elif repairs[-1].state != WorkState.COMPLETE:
+                pending_authors.append((skill_view, repairs[-1]))
+            continue
+        if critic.get("verdict") != "pass":
+            raise ProcessingError(f"Canonical critic report for '{skill.id}' has invalid verdict")
+        ready_skills.append((skill, skill_view, skill_run, author_task, review_task))
+
+    if pending_curricula:
+        return _actions_required_scoped(
+            base_workspace,
+            pending_curricula,
+            parallel_group=f"{base_run.id}-skill-curriculum",
+        )
+    if pending_authors:
+        return _actions_required_scoped(
+            base_workspace,
+            pending_authors,
+            parallel_group=f"{base_run.id}-skill-author",
+        )
+    if pending_reviews:
+        return _actions_required_scoped(
+            base_workspace,
+            pending_reviews,
+            parallel_group=f"{base_run.id}-skill-review",
+        )
+
+    base_output = Path(str(configuration["output"]))
+    pack_output_root = (
+        base_output.parent if bool(configuration["output_is_default"]) else base_output
+    )
+    pack_output_root.mkdir(parents=True, exist_ok=True)
+    host = SkillHost(str(configuration["host"]))
+    configured_skill_root = (
+        Path(str(configuration["skill_root"]))
+        if configuration.get("skill_root")
+        else host_skill_root(
+            host,
+            project=bool(configuration["project"]),
+            project_root=Path(str(configuration["project_root"])),
+        )
+    )
+    pending_delivery_decisions: list[tuple[Workspace, WorkItem]] = []
+    compiled_ready: list[tuple[SkillCandidate, Workspace, Path]] = []
+    for skill, skill_view, skill_run, author_task, review_task in ready_skills:
+        blueprint, receipt, _build_dir = compile_workspace_blueprint(skill_view)
+        skill_output = pack_output_root / blueprint.name
+        delivery_conflicts = _delivery_conflicts(
+            name=blueprint.name,
+            build_id=receipt.build_id,
+            output=skill_output,
+            skill_root=configured_skill_root,
+        )
+        if delivery_conflicts:
+            delivery_decisions = [
+                item
+                for item in _matching_tasks(
+                    skill_view.list_work_items(skill_run.id, role=WorkRole.DECISION),
+                    scope_key="conflicting_build_id",
+                    scope_value=receipt.build_id,
+                )
+                if item.scope.get("kind") == "delivery-name-selection"
+            ]
+            if not delivery_decisions:
+                decision_task = _plan_delivery_decision_task(
+                    skill_view,
+                    skill_run,
+                    author_task=author_task,
+                    review_task=review_task,
+                    build_id=receipt.build_id,
+                    name=blueprint.name,
+                    output=skill_output,
+                    skill_root=configured_skill_root,
+                    conflicts=delivery_conflicts,
+                )
+                pending_delivery_decisions.append((skill_view, decision_task))
+                continue
+            if delivery_decisions[-1].state != WorkState.COMPLETE:
+                pending_delivery_decisions.append((skill_view, delivery_decisions[-1]))
+                continue
+            raise ProcessingError(
+                f"Completed delivery decision for '{skill.id}' did not resolve Skill conflicts"
+            )
+        compiled_ready.append((skill, skill_view, skill_output))
+
+    if pending_delivery_decisions:
+        return _actions_required_scoped(
+            base_workspace,
+            pending_delivery_decisions,
+            parallel_group="pack-delivery-conflict",
+        )
+
+    installed_entries: list[dict[str, object]] = []
+    for skill, skill_view, skill_output in compiled_ready:
+        built = build_workspace_skill(
+            skill_view,
+            host=host,
+            output=skill_output,
+            project=bool(configuration["project"]),
+            project_root=Path(str(configuration["project_root"])),
+            skill_root=configured_skill_root,
+            run_official_validation=bool(configuration["run_official_validation"]),
+        )
+        installed_entries.append(
+            {
+                "id": skill.id,
+                "name": built.name,
+                "title": skill.title,
+                "description": skill.description,
+                "build_id": built.build_id,
+                "generated_path": str(built.generated_path),
+                "installed_path": str(built.installed_path),
+                "validation_report_path": str(built.validation_report_path),
+                "semantic_unit_ids": skill.semantic_unit_ids,
+                "prerequisites": skill.prerequisites,
+            }
+        )
+
+    plan, _plan_record = load_canonical_skill_pack_plan(base_workspace)
+    pack_manifest = {
+        "schema_version": 1,
+        "workspace": str(base_workspace.root),
+        "decomposition_mode": plan.decomposition_mode,
+        "rationale": plan.rationale,
+        "host": host.value,
+        "skill_count": len(installed_entries),
+        "skills": installed_entries,
+    }
+    workspace_manifest_path = base_workspace.analysis_dir / "pack-manifest.json"
+    output_manifest_path = pack_output_root / "pack-manifest.json"
+    base_workspace.write_json(workspace_manifest_path, pack_manifest)
+    atomic_write_json(output_manifest_path, pack_manifest)
+
+    return RunEnvelope(
+        status="complete",
+        workspace=base_workspace.root,
+        completion={
+            "mode": "multi",
+            "host": host.value,
+            "skill_count": len(installed_entries),
+            "pack_manifest_path": str(output_manifest_path),
+            "workspace_pack_manifest_path": str(workspace_manifest_path),
+            "skills": installed_entries,
+        },
+    )
 
 
 def _plan_decision_task(
@@ -552,6 +913,24 @@ def submit_decision_result(
         output = workspace.tasks_dir / task.id / "output" / "curriculum.json"
         workspace.write_json(output, legacy_selection)
         canonical_outputs = [("curriculum", "default", output)]
+    elif task.scope.get("kind") == "skill-pack-selection":
+        plan, plan_record = load_canonical_skill_pack_plan(workspace)
+        known_ids = {skill.id for skill in plan.skills}
+        raw_choice = result.selected_option_id.strip()
+        if raw_choice == "all":
+            selected_ids = [skill.id for skill in plan.skills]
+        else:
+            selected_ids = [part.strip() for part in raw_choice.split(",") if part.strip()]
+            if not selected_ids or any(sid not in known_ids for sid in selected_ids):
+                raise ProcessingError(f"User selected unknown skill id(s): {raw_choice}")
+        pack_selection = SkillPackSelection(
+            selected_skill_ids=selected_ids,
+            source="user",
+            plan_digest=plan_record.digest,
+        )
+        output = workspace.tasks_dir / task.id / "output" / "selected-skill-pack.json"
+        workspace.write_json(output, pack_selection)
+        canonical_outputs = [("selected-skill-pack", "default", output)]
     elif task.scope.get("kind") == "delivery-name-selection":
         packet = _verified_task_packet(workspace, task)
         payload = packet.get("payload")
@@ -614,14 +993,17 @@ def submit_workspace_result(
 ) -> SubmissionReceipt:
     scoped_edition = workspace.task_edition_id(task_id)
     if scoped_edition is not None:
-        from video_to_skill.editions import (
-            assert_edition_analysis_lineage,
-            load_edition_state_by_id,
-        )
+        if scoped_edition.startswith("skill-"):
+            workspace = workspace.for_edition(scoped_edition)
+        else:
+            from video_to_skill.editions import (
+                assert_edition_analysis_lineage,
+                load_edition_state_by_id,
+            )
 
-        state = load_edition_state_by_id(workspace, scoped_edition)
-        workspace = workspace.for_edition(state.configuration.edition_id)
-        assert_edition_analysis_lineage(workspace)
+            state = load_edition_state_by_id(workspace, scoped_edition)
+            workspace = workspace.for_edition(state.configuration.edition_id)
+            assert_edition_analysis_lineage(workspace)
     item = workspace.get_work_item(task_id)
     submitted_result = Path(os.path.abspath(result_path))
     task_output = Path(os.path.abspath(workspace.tasks_dir / task_id / "output"))
@@ -635,15 +1017,14 @@ def submit_workspace_result(
     if item.role == WorkRole.ANALYZE:
         accepted = submit_analyze_result(workspace, task_id, submitted_result)
     elif item.role == WorkRole.AUTHOR:
-        if item.scope.get("kind") == "curriculum-planning":
+        if item.scope.get("kind") == "skill-decomposition":
+            accepted = submit_decompose_result(workspace, task_id, submitted_result)
+        elif item.scope.get("kind") == "curriculum-planning":
             accepted = submit_curriculum_plan_result(workspace, task_id, submitted_result)
         else:
             accepted = submit_author_result(workspace, task_id, submitted_result)
     elif item.role == WorkRole.REVIEW:
-        if item.scope.get("kind") == "behavior-trial":
-            accepted = submit_behavior_trial_result(workspace, task_id, submitted_result)
-        else:
-            accepted = submit_review_result(workspace, task_id, submitted_result)
+        accepted = submit_review_result(workspace, task_id, submitted_result)
     else:
         accepted = submit_decision_result(workspace, task_id, submitted_result)
     assert accepted.result_digest is not None
@@ -668,7 +1049,7 @@ def _delivery_targets(
     *,
     name: str,
 ) -> tuple[Path, Path]:
-    if workspace.edition_id is not None:
+    if workspace.is_named_edition:
         immutable = assert_edition_analysis_lineage(workspace).configuration
         authority: dict[str, object] = {
             "host": immutable.host,
@@ -1019,6 +1400,9 @@ def advance_run(
             analyze_task = pinned_analyze_task
 
         all_author_tasks = workspace.list_work_items(run.id, role=WorkRole.AUTHOR)
+        decompose_tasks = [
+            item for item in all_author_tasks if item.scope.get("kind") == "skill-decomposition"
+        ]
         curriculum_tasks = [
             item
             for item in all_author_tasks
@@ -1029,6 +1413,39 @@ def advance_run(
             for item in all_author_tasks
             if item.scope.get("kind") in {"course-authoring", "course-authoring-repair"}
         ]
+        if not workspace.is_named_edition and not curriculum_tasks and not course_author_tasks:
+            if not decompose_tasks:
+                plan_decompose_task(workspace, run, analyze_task=analyze_task)
+                continue
+            decompose_task = decompose_tasks[-1]
+            if decompose_task.state != WorkState.COMPLETE:
+                return _actions_required(workspace, [decompose_task])
+            pack_checkpoint = load_canonical_skill_pack_checkpoint(workspace)
+            if pack_checkpoint.plan.decomposition_mode == "multi":
+                if pack_checkpoint.selection is None:
+                    pack_decisions = [
+                        item
+                        for item in _matching_tasks(
+                            workspace.list_work_items(run.id, role=WorkRole.DECISION),
+                            scope_key="decompose_task_id",
+                            scope_value=decompose_task.id,
+                        )
+                        if item.scope.get("kind") == "skill-pack-selection"
+                    ]
+                    if not pack_decisions:
+                        _plan_skill_pack_decision_task(workspace, run, decompose_task)
+                        continue
+                    if pack_decisions[-1].state != WorkState.COMPLETE:
+                        return _actions_required(workspace, [pack_decisions[-1]])
+                    continue
+                return _advance_multi_skill_pack(
+                    workspace,
+                    run,
+                    analyze_task=analyze_task,
+                    selected_skills=selected_skill_candidates(workspace),
+                    configuration=configuration,
+                    settings=settings,
+                )
         legacy_authoring = bool(course_author_tasks) and not curriculum_tasks
         decision_dependency: list[str] = []
         if legacy_authoring:
@@ -1108,27 +1525,6 @@ def advance_run(
             author_task = course_author_tasks[-1]
 
         repair_cycle = max(0, int(author_task.scope.get("revision", 1)) - 1)
-        behavior_trials = plan_behavior_trial_tasks(
-            workspace,
-            run,
-            author_task=author_task,
-            repair_cycle=repair_cycle,
-        )
-        incomplete_trials = [item for item in behavior_trials if item.state != WorkState.COMPLETE]
-        if incomplete_trials:
-            return _actions_required(workspace, incomplete_trials)
-        trial_contract = behavior_trials[0].scope
-        review_contract_keys = (
-            "contract_version",
-            "renderer_contract_version",
-            "catalog_version",
-            "catalog_digest",
-            "reviewed_snapshot_digest",
-            "target_build_id",
-            "target_content_digest",
-            "artifact_language_contract_digest",
-            "artifact_language_declaration_digest",
-        )
         current_analysis_depth = workspace.analysis_depth_contract()
         if current_analysis_depth is None:
             raise ProcessingError("Review requires a persisted analysis-depth contract")
@@ -1136,13 +1532,11 @@ def advance_run(
             current_analysis_depth.model_dump(mode="json"),
             length=64,
         )
-        expected_review_dependencies = sorted(
-            {
-                author_task.id,
-                *(item.id for item in behavior_trials),
-                *decision_dependency,
-            }
+        current_reviewed_snapshot_digest, _ = reconstruct_review_snapshot(
+            workspace,
+            expected_author_task_id=author_task.id,
         )
+        expected_review_dependencies = sorted({author_task.id, *decision_dependency})
         reviews = [
             item
             for item in _matching_tasks(
@@ -1153,8 +1547,8 @@ def advance_run(
             if item.scope.get("kind") == "independent-review"
             and item.scope.get("author_task_id") == author_task.id
             and item.scope.get("repair_cycle") == repair_cycle
-            and all(item.scope.get(key) == trial_contract.get(key) for key in review_contract_keys)
             and item.scope.get("analysis_depth_contract_digest") == current_analysis_depth_digest
+            and item.scope.get("reviewed_snapshot_digest") == current_reviewed_snapshot_digest
             and item.dependencies == expected_review_dependencies
         ]
         if not reviews:
@@ -1162,7 +1556,6 @@ def advance_run(
                 workspace,
                 run,
                 author_task=author_task,
-                behavior_trial_tasks=behavior_trials,
                 repair_cycle=repair_cycle,
                 additional_dependencies=decision_dependency,
             )

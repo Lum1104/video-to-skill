@@ -52,7 +52,7 @@ You can specify language or goals naturally:
 /video-to-skill https://... Build a Chinese Skill focused on applying this workflow to my repo.
 ```
 
-Each run inventories accessible items, extracts speech and key visual evidence, runs `Analyze → Author → Review`, validates the package, and installs it for your host. Interrupted runs resume cleanly from the saved workspace.
+Each run inventories accessible items, extracts speech and key visual evidence, runs `Analyze → Decompose → Author → Review`, validates each Skill package, and installs it for your host. Long or multi-topic videos automatically decompose into multiple focused Skills built in parallel (with a single confirmation prompt to build all or pick a subset) plus a `pack-manifest.json` summary. Interrupted runs resume cleanly from the saved workspace.
 
 ### 2. Use the generated Skill
 
@@ -71,8 +71,9 @@ No second tutor Skill is needed.
 
 1. **Acquire**: resolves playlists/local files and collects metadata, captions, audio, and capped analysis video (default 720p). Isolated failures are recorded in `sources.md` without discarding working items.
 2. **Analyze**: aligns transcripts, chapters, scene changes, and OCR; inspects contact sheets via native host vision and pulls dense frame windows only when needed.
-3. **Author**: plans a curriculum, writes grounded Markdown artifacts, and selects only essential teaching visuals.
-4. **Review & install**: runs isolated behavior trials and an independent critic, validates structure/safety, and installs without silently overwriting existing different Skills.
+3. **Decompose**: keeps cohesive single-topic videos as one Skill automatically, or splits long/multi-topic videos into focused Skills built in parallel with a shared `pack-manifest.json`.
+4. **Author**: plans a curriculum per Skill, writes grounded Markdown artifacts, and selects only essential teaching visuals.
+5. **Review & install**: runs one independent critic per Skill against the rendered preview (up to 2 repair cycles), validates structure/safety, and installs without silently overwriting existing different Skills.
 
 ## Privacy & access
 

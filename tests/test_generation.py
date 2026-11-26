@@ -34,7 +34,7 @@ def test_generator_skill_owns_the_complete_user_workflow() -> None:
     assert "Process every accessible playlist or course item by default" in generator
     assert "invoke a second tutor Skill" in generator
     assert "not artifact quotas" in generator
-    assert "Analyze → Author → Review" in generator
+    assert "Analyze → Decompose → Author → Review" in generator
     assert "instructional-affordance ledger" in generator
     assert "run SOURCES... --workspace WORKSPACE --host codex" in generator
     assert "run --workspace WORKSPACE" in generator
