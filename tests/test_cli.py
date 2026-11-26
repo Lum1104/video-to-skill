@@ -256,7 +256,7 @@ def test_run_and_extract_explain_distinct_source_and_output_languages(
     for command in ("run", "extract"):
         result = runner.invoke(app, [command, "--help"], color=True)
         assert result.exit_code == 0, result.output
-        visible_output = unstyle(result.output)
+        visible_output = " ".join(unstyle(result.output).replace("│", " ").split())
         assert "--output-language" in visible_output
         assert "caption/ASR" in visible_output
         assert "artifact language" in visible_output

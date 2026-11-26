@@ -31,6 +31,29 @@ class SkillHost(StrEnum):
 
     CLAUDE = "claude"
     CODEX = "codex"
+    COPILOT = "copilot"
+    CURSOR = "cursor"
+
+
+_PROJECT_SKILL_DIRS: Final[dict[SkillHost, str]] = {
+    SkillHost.CLAUDE: ".claude/skills",
+    SkillHost.CODEX: ".agents/skills",
+    SkillHost.COPILOT: ".github/skills",
+    SkillHost.CURSOR: ".cursor/skills",
+}
+
+_USER_SKILL_DIRS: Final[dict[SkillHost, str]] = {
+    SkillHost.CLAUDE: ".claude/skills",
+    SkillHost.CODEX: ".agents/skills",
+    SkillHost.COPILOT: ".copilot/skills",
+    SkillHost.CURSOR: ".cursor/skills",
+}
+
+
+def host_invocation_prefix(host: SkillHost) -> str:
+    """Return the slash/dollar invocation prefix for a supported host."""
+
+    return "$" if host == SkillHost.CODEX else "/"
 
 
 def host_skill_root(
@@ -44,9 +67,9 @@ def host_skill_root(
 
     if project:
         base = (project_root or Path.cwd()).expanduser().resolve()
-        return base / (".claude/skills" if host == SkillHost.CLAUDE else ".agents/skills")
+        return base / _PROJECT_SKILL_DIRS[host]
     base = (user_home or Path.home()).expanduser().resolve()
-    return base / (".claude/skills" if host == SkillHost.CLAUDE else ".agents/skills")
+    return base / _USER_SKILL_DIRS[host]
 
 
 def _skill_name(skill_directory: Path) -> str:
@@ -86,8 +109,10 @@ def _tree_manifest(root: Path) -> dict[str, str]:
 def install_generated_skill(
     skill_directory: Path,
     skill_root: Path,
+    *,
+    overwrite: bool = False,
 ) -> tuple[Path, str]:
-    """Atomically install a validated generated Skill without overwriting conflicts."""
+    """Atomically install (or with overwrite=True, safely update) a generated Skill."""
 
     source = skill_directory.expanduser().resolve()
     if not source.is_dir():
@@ -102,27 +127,39 @@ def install_generated_skill(
     target = root / name
     if target.is_symlink():
         raise ProcessingError(f"Refusing to replace symbolic-link target: {target}")
+    updating = False
     if target.exists():
         if not target.is_dir():
             raise ProcessingError(f"Skill installation target is not a directory: {target}")
         if _tree_manifest(target) == source_manifest:
             return target, "unchanged"
-        raise ProcessingError(
-            f"A different skill named '{name}' already exists at {target}. "
-            "Keep the generated artifact and choose a different name or explicitly update "
-            "the existing skill."
-        )
+        if not overwrite:
+            raise ProcessingError(
+                f"A different skill named '{name}' already exists at {target}. "
+                "Keep the generated artifact and choose a different name or re-run with "
+                "--force to replace the existing skill."
+            )
+        updating = True
 
     staging_root = Path(tempfile.mkdtemp(prefix=f".{name}.", dir=root))
     staged = staging_root / name
+    backup = staging_root / f"{name}.backup"
     try:
         shutil.copytree(source, staged)
-        os.replace(staged, target)
+        if updating:
+            os.replace(target, backup)
+            try:
+                os.replace(staged, target)
+            except OSError:
+                os.replace(backup, target)
+                raise
+        else:
+            os.replace(staged, target)
     except OSError as exc:
         raise ProcessingError(f"Could not install generated skill at {target}: {exc}") from exc
     finally:
         shutil.rmtree(staging_root, ignore_errors=True)
-    return target, "installed"
+    return target, ("updated" if updating else "installed")
 
 
 def bundled_skill_text() -> str:
