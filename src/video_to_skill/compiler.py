@@ -19,12 +19,7 @@ from video_to_skill.artifact_language import (
     canonical_artifact_language_state,
 )
 from video_to_skill.behavior import (
-    BEHAVIOR_CATALOG_VERSION,
-    BEHAVIOR_CONTRACT_VERSION,
     BehaviorTargetSnapshot,
-    behavior_catalog_digest,
-    build_behavior_catalog,
-    check_matches_scenario,
     lexical_path_without_symlinks,
     snapshot_behavior_target,
 )
@@ -63,15 +58,13 @@ from video_to_skill.installation import (
 from video_to_skill.models import AnalysisDepthContract
 from video_to_skill.orchestration import (
     ArtifactDraftSpec,
-    BehaviorReport,
-    BehaviorTrialResult,
     CriticReport,
     DeliverySelection,
     InstructionalAffordance,
     ReviewResult,
 )
 from video_to_skill.review_contract import (
-    reconstruct_review_reports,
+    reconstruct_critic_report,
     reconstruct_review_snapshot,
 )
 from video_to_skill.utils import hash_file, stable_hash
@@ -113,7 +106,6 @@ class WorkspaceBuildReceipt(CompileModel):
     assets_digest: str
     visual_asset_candidates_digest: str | None = None
     critic_report_digest: str
-    behavior_report_digest: str
     delivery_selection_digest: str | None = None
     artifacts: list[CompiledArtifactReference]
     edition_lineage: CourseSkillEditionLineage | None = None
@@ -224,7 +216,7 @@ def _fresh_canonical_target_snapshot(
     workspace: Workspace,
     projection: WorkspaceBlueprintProjection,
 ) -> BehaviorTargetSnapshot:
-    target_root = workspace.analysis_dir / "behavior-targets"
+    target_root = workspace.analysis_dir / "review-targets"
     workspace.ensure_directory(target_root)
     fresh_path = target_root / f".compiler-fresh-{secrets.token_hex(16)}"
     try:
@@ -250,33 +242,22 @@ def _fresh_canonical_target_snapshot(
 def _quality_gate(
     workspace: Workspace,
     projection: WorkspaceBlueprintProjection,
-) -> tuple[str, str]:
+) -> str:
     raw_critic = _canonical_json(workspace, "critic-report")
-    raw_behavior = _canonical_json(workspace, "behavior-report")
-    if not isinstance(raw_behavior, dict) or raw_behavior.get("schema_version") != 2:
-        raise ProcessingError(
-            "Legacy behavior reports cannot satisfy catalog v2; resume for fresh-context "
-            "behavior validation"
-        )
     try:
         critic = CriticReport.model_validate(raw_critic)
-        behavior = BehaviorReport.model_validate(raw_behavior)
     except PydanticValidationError as exc:
-        raise ProcessingError(f"Canonical Review reports are invalid: {exc}") from exc
+        raise ProcessingError(f"Canonical critic report is invalid: {exc}") from exc
     critic_record = workspace.canonical_record("critic-report")
-    behavior_record = workspace.canonical_record("behavior-report")
-    assert critic_record is not None and behavior_record is not None
-    if critic_record.producer_task_id != behavior_record.producer_task_id:
-        raise ProcessingError("Critic and behavior reports must come from the same Review")
-    review_task = workspace.get_work_item(behavior_record.producer_task_id)
+    assert critic_record is not None
+    review_task = workspace.get_work_item(critic_record.producer_task_id)
     if (
         review_task.role != WorkRole.REVIEW
         or review_task.scope.get("kind") != "independent-review"
         or review_task.state != WorkState.COMPLETE
         or critic.review_task_id != review_task.id
-        or behavior.review_task_id != review_task.id
     ):
-        raise ProcessingError("Canonical Review reports are not bound to a completed v2 Review")
+        raise ProcessingError("Canonical critic report is not bound to a completed Review")
     if review_task.result_path is None or review_task.result_digest is None:
         raise ProcessingError("Canonical Review has no accepted raw ReviewResult")
     accepted_result_path = workspace.root / review_task.result_path
@@ -300,20 +281,15 @@ def _quality_gate(
         or accepted_result.execution_context_id != review_task.execution_context_id
     ):
         raise ProcessingError("Accepted ReviewResult has the wrong engine-issued context")
-    expected_critic, expected_behavior = reconstruct_review_reports(
-        review_task,
-        accepted_result,
-    )
-    if raw_critic != expected_critic.model_dump(
-        mode="json"
-    ) or raw_behavior != expected_behavior.model_dump(mode="json"):
-        raise ProcessingError("Canonical Review heads differ from the accepted ReviewResult")
+    expected_critic = reconstruct_critic_report(review_task, accepted_result)
+    if raw_critic != expected_critic.model_dump(mode="json"):
+        raise ProcessingError("Canonical critic report differs from the accepted ReviewResult")
     course_record = workspace.canonical_record("course")
     if (
         course_record is None
         or review_task.scope.get("author_task_id") != course_record.producer_task_id
     ):
-        raise ProcessingError("Canonical behavior Review targets a stale Author revision")
+        raise ProcessingError("Canonical Review targets a stale Author revision")
     current_review_snapshot, _canonical_packet = reconstruct_review_snapshot(
         workspace,
         expected_author_task_id=course_record.producer_task_id,
@@ -364,15 +340,8 @@ def _quality_gate(
         raise ProcessingError("Canonical Review packet failed its digest check")
     payload = packet.get("payload")
     target_packet = payload.get("evaluation_target") if isinstance(payload, dict) else None
-    catalog_packet = payload.get("behavior_catalog") if isinstance(payload, dict) else None
-    trial_entries = payload.get("behavior_trials") if isinstance(payload, dict) else None
-    if (
-        not isinstance(target_packet, dict)
-        or not isinstance(catalog_packet, dict)
-        or not isinstance(trial_entries, list)
-    ):
-        raise ProcessingError("Canonical Review packet has incomplete behavior evidence")
-    assert isinstance(payload, dict)
+    if not isinstance(payload, dict) or not isinstance(target_packet, dict):
+        raise ProcessingError("Canonical Review packet has incomplete evaluation target")
     language_state = canonical_artifact_language_state(
         workspace,
         expected_author_task_id=course_record.producer_task_id,
@@ -396,149 +365,32 @@ def _quality_gate(
     target = snapshot_behavior_target(
         workspace.root / target_relative,
         expected_build_id=expected_build_id,
-        allowed_root=workspace.analysis_dir / "behavior-targets",
+        allowed_root=workspace.analysis_dir / "review-targets",
     )
     fresh_target = _fresh_canonical_target_snapshot(workspace, projection)
     if target.content_digest != fresh_target.content_digest or target.files != fresh_target.files:
         raise ProcessingError(
-            "Evaluated behavior target differs from a fresh canonical engine render"
+            "Evaluated review target differs from a fresh canonical engine render"
         )
     if (
-        behavior.catalog_version != BEHAVIOR_CATALOG_VERSION
-        or behavior.catalog_version != review_task.scope.get("catalog_version")
-        or behavior.target_build_id != expected_build_id
-        or behavior.target_content_digest != target.content_digest
-        or critic.reviewed_snapshot_digest != behavior.reviewed_snapshot_digest
-        or critic.target_build_id != behavior.target_build_id
-        or critic.target_content_digest != behavior.target_content_digest
+        critic.target_build_id != expected_build_id
+        or critic.target_content_digest != target.content_digest
         or review_task.scope.get("target_content_digest") != target.content_digest
         or target_packet.get("build_id") != target.build_id
         or target_packet.get("content_digest") != target.content_digest
         or accepted_result.reviewed_snapshot_digest != current_review_snapshot
         or review_task.scope.get("reviewed_snapshot_digest") != current_review_snapshot
-        or (payload.get("reviewed_snapshot_digest") if isinstance(payload, dict) else None)
-        != current_review_snapshot
-        or (payload.get("canonical") if isinstance(payload, dict) else None) != _canonical_packet
+        or payload.get("reviewed_snapshot_digest") != current_review_snapshot
+        or payload.get("canonical") != _canonical_packet
         or critic.reviewed_snapshot_digest != current_review_snapshot
-        or behavior.reviewed_snapshot_digest != current_review_snapshot
-        or review_task.scope.get("contract_version") != BEHAVIOR_CONTRACT_VERSION
         or review_task.scope.get("renderer_contract_version")
         != COURSE_SKILL_RENDERER_CONTRACT_VERSION
         or target_packet.get("renderer_contract_version") != COURSE_SKILL_RENDERER_CONTRACT_VERSION
     ):
-        raise ProcessingError("Canonical Review reports target a stale catalog or Skill preview")
-
-    affordances = _validated_list(
-        InstructionalAffordance,
-        _canonical_json(workspace, "instructional-affordances"),
-        label="instructional affordance ledger",
-    )
-    scenarios = build_behavior_catalog(
-        projection.blueprint.semantic_units,
-        affordances,
-        artifact_language=projection.blueprint.artifact_language,
-    )
-    expected_catalog_digest = behavior_catalog_digest(scenarios)
-    if (
-        behavior.catalog_digest != expected_catalog_digest
-        or review_task.scope.get("catalog_digest") != expected_catalog_digest
-        or len(behavior.checks) != len(scenarios)
-        or catalog_packet.get("version") != BEHAVIOR_CATALOG_VERSION
-        or catalog_packet.get("digest") != expected_catalog_digest
-        or catalog_packet.get("scenarios")
-        != [scenario.model_dump(mode="json") for scenario in scenarios]
-    ):
-        raise ProcessingError("Canonical behavior report is incomplete for the current catalog")
-    trial_entries_by_scenario = {
-        str(entry.get("scenario_id")): entry
-        for entry in trial_entries
-        if isinstance(entry, dict) and isinstance(entry.get("scenario_id"), str)
-    }
-    applicable_ids = {scenario.id for scenario in scenarios if scenario.applicability == "required"}
-    if set(trial_entries_by_scenario) != applicable_ids or len(trial_entries) != len(
-        applicable_ids
-    ):
-        raise ProcessingError("Canonical Review packet does not contain the exact trial set")
-    dependency_trial_ids = {
-        dependency_id
-        for dependency_id in review_task.dependencies
-        if workspace.get_work_item(dependency_id).scope.get("kind") == "behavior-trial"
-    }
-    packet_trial_ids = {
-        str(entry["task_id"])
-        for entry in trial_entries
-        if isinstance(entry, dict) and isinstance(entry.get("task_id"), str)
-    }
-    if dependency_trial_ids != packet_trial_ids:
-        raise ProcessingError("Canonical Review dependencies differ from its exact trial set")
-    trial_ids: set[str] = set()
-    trial_execution_context_ids: set[str] = set()
-    for check, scenario in zip(behavior.checks, scenarios, strict=True):
-        if not check_matches_scenario(check, scenario):
-            raise ProcessingError(f"Canonical behavior report changed scenario {scenario.id}")
-        if scenario.applicability != "required":
-            continue
-        assert check.trial_task_id is not None
-        assert check.trial_result_digest is not None
-        if check.trial_task_id in trial_ids:
-            raise ProcessingError("Canonical behavior report reuses a fresh-context trial")
-        trial_ids.add(check.trial_task_id)
-        trial_task = workspace.get_work_item(check.trial_task_id)
-        trial_entry = trial_entries_by_scenario[scenario.id]
-        if (
-            trial_task.role != WorkRole.REVIEW
-            or trial_task.scope.get("kind") != "behavior-trial"
-            or trial_task.state != WorkState.COMPLETE
-            or trial_task.result_path is None
-            or trial_task.result_digest != check.trial_result_digest
-            or trial_task.scope.get("scenario_digest") != scenario.scenario_digest
-            or trial_task.scope.get("target_content_digest") != target.content_digest
-            or trial_entry.get("task_id") != trial_task.id
-            or trial_entry.get("result_path") != str(trial_task.result_path)
-            or trial_entry.get("result_digest") != trial_task.result_digest
-            or trial_task.id not in review_task.dependencies
-            or trial_task.execution_context_id is None
-        ):
-            raise ProcessingError(f"Behavior trial binding is invalid for {scenario.id}")
-        trial_path = workspace.root / trial_task.result_path
-        if trial_path.is_symlink() or hash_file(trial_path) != trial_task.result_digest:
-            raise ProcessingError(f"Behavior trial bytes changed for {scenario.id}")
-        try:
-            trial = BehaviorTrialResult.model_validate_json(trial_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, PydanticValidationError) as exc:
-            raise ProcessingError(f"Invalid behavior trial for {scenario.id}: {exc}") from exc
-        if (
-            trial.task_id != trial_task.id
-            or trial.execution_context_id != trial_task.execution_context_id
-            or trial.scenario_id != scenario.id
-            or trial.scenario_digest != scenario.scenario_digest
-            or trial.target_content_digest != target.content_digest
-        ):
-            raise ProcessingError(f"Behavior trial content is stale for {scenario.id}")
-        for access in trial.artifact_accesses:
-            expected_file = target.files.get(access.path)
-            if expected_file is None or access.sha256 != expected_file.get("sha256"):
-                raise ProcessingError(f"Behavior trial file evidence is stale for {scenario.id}")
-        stored_trial_producer = workspace.work_result_producer(trial_task.id)
-        if stored_trial_producer != trial.producer.model_dump(mode="json"):
-            raise ProcessingError("Behavior trial producer differs from stored provenance")
-        if (
-            trial.execution_context_id in trial_execution_context_ids
-            or trial.execution_context_id == review_task.execution_context_id
-        ):
-            raise ProcessingError("Behavior trials do not use distinct engine-issued contexts")
-        trial_execution_context_ids.add(trial.execution_context_id)
-        same_trial_name = stored_reviewer.get("name") == stored_trial_producer.get("name")
-        same_trial_run = stored_reviewer.get("run_id") is not None and stored_reviewer.get(
-            "run_id"
-        ) == stored_trial_producer.get("run_id")
-        if same_trial_name or same_trial_run:
-            raise ProcessingError("Independent Review provenance matches a behavior trial")
+        raise ProcessingError("Canonical Review report targets a stale Skill preview")
     if critic.verdict != "pass":
         raise ProcessingError("Canonical independent Review has not passed")
-    if not behavior.passed or any(check.passed is False for check in behavior.checks):
-        raise ProcessingError("Canonical behavior Review has not passed")
-    return critic_record.digest, behavior_record.digest
+    return critic_record.digest
 
 
 def portable_build_matches(root: Path, expected_build_id: str) -> bool:
@@ -812,7 +664,7 @@ def compile_workspace_blueprint(
                     "Canonical Analyze result is not bound to the persisted analysis-depth contract"
                 )
     projection = assemble_workspace_blueprint(workspace)
-    critic_digest, behavior_digest = _quality_gate(workspace, projection)
+    critic_digest = _quality_gate(workspace, projection)
     blueprint = projection.blueprint
     build_id = course_skill_build_id(blueprint)
     receipt = WorkspaceBuildReceipt(
@@ -834,7 +686,6 @@ def compile_workspace_blueprint(
         assets_digest=projection.assets_digest,
         visual_asset_candidates_digest=projection.visual_asset_candidates_digest,
         critic_report_digest=critic_digest,
-        behavior_report_digest=behavior_digest,
         delivery_selection_digest=projection.delivery_selection_digest,
         artifacts=projection.artifact_references,
         edition_lineage=blueprint.edition_lineage,
@@ -844,10 +695,6 @@ def compile_workspace_blueprint(
     workspace.write_json(
         build_directory / "critic-report.json",
         _canonical_json(workspace, "critic-report"),
-    )
-    workspace.write_json(
-        build_directory / "behavior-report.json",
-        _canonical_json(workspace, "behavior-report"),
     )
     return blueprint, receipt, build_directory
 
@@ -881,14 +728,14 @@ def build_workspace_skill(
             generated,
             workspace_root=workspace.root,
         )
-    behavior_report = BehaviorReport.model_validate(_canonical_json(workspace, "behavior-report"))
+    critic_report = CriticReport.model_validate(_canonical_json(workspace, "critic-report"))
     generated_snapshot = snapshot_behavior_target(
         generated,
         expected_build_id=receipt.build_id,
     )
-    if generated_snapshot.content_digest != behavior_report.target_content_digest:
+    if generated_snapshot.content_digest != critic_report.target_content_digest:
         raise ProcessingError(
-            "Rendered Skill bytes differ from the independently evaluated behavior target"
+            "Rendered Skill bytes differ from the independently reviewed target"
         )
     report = validate_skill(
         generated,

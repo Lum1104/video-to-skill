@@ -16,7 +16,6 @@ from video_to_skill.errors import ProcessingError
 from video_to_skill.generation import CurriculumDesign
 from video_to_skill.orchestration import (
     ArtifactDraftSpec,
-    BehaviorReport,
     CriticReport,
     ReviewResult,
 )
@@ -198,13 +197,13 @@ def reconstruct_review_snapshot(
     }
 
 
-def reconstruct_review_reports(
+def reconstruct_critic_report(
     task: WorkItem,
     result: ReviewResult,
-) -> tuple[CriticReport, BehaviorReport]:
-    """Project the only canonical reports valid for one accepted ReviewResult."""
+) -> CriticReport:
+    """Project the canonical critic report for one accepted ReviewResult."""
 
-    critic = CriticReport(
+    return CriticReport(
         review_task_id=task.id,
         verdict=result.verdict,
         reviewed_snapshot_digest=result.reviewed_snapshot_digest,
@@ -213,14 +212,3 @@ def reconstruct_review_reports(
         repair_cycle=int(task.scope["repair_cycle"]),
         findings=result.findings,
     )
-    behavior = BehaviorReport(
-        review_task_id=task.id,
-        reviewed_snapshot_digest=result.reviewed_snapshot_digest,
-        catalog_version=result.catalog_version,
-        catalog_digest=result.catalog_digest,
-        target_build_id=result.target_build_id,
-        target_content_digest=result.target_content_digest,
-        passed=all(check.passed is not False for check in result.behavior_checks),
-        checks=result.behavior_checks,
-    )
-    return critic, behavior

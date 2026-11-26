@@ -213,50 +213,6 @@ def _reviewed_workspace(
     )
     assert author_receipt.status == "complete"
 
-    trial_envelope = _resume(workspace, settings)
-    assert all(action.role == "review" for action in trial_envelope.actions)
-    for index, trial_action in enumerate(trial_envelope.actions):
-        trial_task = workspace.get_work_item(trial_action.task_id)
-        trial_lease = json.loads(
-            (trial_action.task_path / "lease.json").read_text(encoding="utf-8")
-        )
-        packet = json.loads((workspace.root / trial_task.packet_path).read_text(encoding="utf-8"))[
-            "payload"
-        ]
-        target = snapshot_behavior_target(
-            workspace.root / packet["evaluation_target"]["path"],
-            expected_build_id=packet["evaluation_target"]["build_id"],
-        )
-        trial_result_path = trial_action.task_path / "output" / "result.json"
-        atomic_write_json(
-            trial_result_path,
-            BehaviorTrialResult(
-                task_id=trial_task.id,
-                lease_token=str(trial_lease["lease_token"]),
-                execution_context_id=str(trial_lease["execution_context_id"]),
-                snapshot_digest=trial_task.snapshot_digest,
-                producer=ObservationProducer(
-                    name=f"trial-worker-{index}",
-                    run_id=f"trial-run-{index}",
-                ),
-                scenario_id=str(trial_task.scope["scenario_id"]),
-                scenario_digest=str(trial_task.scope["scenario_digest"]),
-                target_content_digest=target.content_digest,
-                turns=[
-                    BehaviorTurn(role="user", content=packet["scenario"]["prompt"]),
-                    BehaviorTurn(role="assistant", content="A bounded grounded response."),
-                ],
-                artifact_accesses=[
-                    BehaviorArtifactAccess(
-                        path="SKILL.md",
-                        sha256=str(target.files["SKILL.md"]["sha256"]),
-                        reason="The host loaded the resident Skill instructions.",
-                    )
-                ],
-            ),
-        )
-        submit_workspace_result(workspace, trial_task.id, trial_result_path)
-
     review_envelope = _resume(workspace, settings)
     [review_action] = review_envelope.actions
     assert review_action.role == "review"
@@ -533,10 +489,8 @@ def test_run_recovers_from_generated_and_installed_name_conflicts(
     atomic_write_json(result_path, result)
     submit_workspace_result(workspace, task.id, result_path)
 
-    fresh_trials = _resume(workspace, settings)
-    assert fresh_trials.status == "actions-required"
-    _submit_trial_envelope(workspace, fresh_trials, run_prefix="renamed-trial")
     fresh_review = _resume(workspace, settings)
+    assert fresh_review.status == "actions-required"
     _submit_review_envelope(workspace, fresh_review)
     complete = _resume(workspace, settings)
 

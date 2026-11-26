@@ -7,7 +7,6 @@ import os
 import secrets
 import shutil
 from dataclasses import dataclass
-from hashlib import sha256
 from pathlib import Path
 
 from pydantic import ValidationError as PydanticValidationError
@@ -19,12 +18,7 @@ from video_to_skill.artifact_language import (
 )
 from video_to_skill.author import AUTHOR_PERSONA
 from video_to_skill.behavior import (
-    BEHAVIOR_CATALOG_VERSION,
-    BEHAVIOR_CONTRACT_VERSION,
     BehaviorTargetSnapshot,
-    behavior_catalog_digest,
-    build_behavior_catalog,
-    check_matches_scenario,
     snapshot_behavior_target,
 )
 from video_to_skill.compiler import assemble_workspace_blueprint
@@ -41,15 +35,11 @@ from video_to_skill.generation import (
 from video_to_skill.models import EvidenceGapType
 from video_to_skill.orchestration import (
     AuthorResult,
-    BehaviorReport,
-    BehaviorScenario,
-    BehaviorTrialResult,
     CriticReport,
-    InstructionalAffordance,
     ReviewResult,
 )
 from video_to_skill.review_contract import (
-    reconstruct_review_reports,
+    reconstruct_critic_report,
     reconstruct_review_snapshot,
     verified_canonical_review_json,
 )
@@ -59,25 +49,17 @@ from video_to_skill.work import AnalysisRun, WorkItem, WorkRole, WorkState
 from video_to_skill.workspace import Workspace
 
 REVIEW_PERSONA = (
-    "Independent Skill reviewer. Audit the canonical drafts, rendered preview, and "
-    "behavior trials for evidence grounding, coverage, disclosure, safety, and usability."
+    "Independent Skill reviewer. Audit the canonical drafts and rendered Skill preview "
+    "for evidence grounding, coverage, disclosure, safety, and usability."
 )
 
-BEHAVIOR_TRIAL_PERSONA = (
-    "Behavior trial runner. In a fresh context, load only the supplied immutable Skill "
-    "preview, run the single prompt, and record the exact exchange and file accesses "
-    "without grading it."
-)
-
-MAX_REPAIR_CYCLES = 3
+MAX_REPAIR_CYCLES = 2
 
 
 @dataclass(frozen=True)
-class BehaviorEvaluationPlan:
+class ReviewTargetPlan:
     reviewed_snapshot_digest: str
     canonical_packet: dict[str, object]
-    scenarios: list[BehaviorScenario]
-    catalog_digest: str
     target: BehaviorTargetSnapshot
 
 
@@ -106,42 +88,27 @@ def _verified_task_packet(workspace: Workspace, task: WorkItem) -> dict[str, obj
     return packet
 
 
-def _behavior_evaluation_plan(
+def _review_target_plan(
     workspace: Workspace,
     *,
     author_task: WorkItem,
-) -> BehaviorEvaluationPlan:
+) -> ReviewTargetPlan:
     reviewed_snapshot, canonical_packet = _review_snapshot(
         workspace,
         expected_author_task_id=author_task.id,
     )
     projection = assemble_workspace_blueprint(workspace)
-    raw_affordances = _verified_canonical_json(workspace, "instructional-affordances")
-    if not isinstance(raw_affordances, list):
-        raise ProcessingError("Canonical instructional affordances must be a JSON list")
-    try:
-        affordances = [InstructionalAffordance.model_validate(item) for item in raw_affordances]
-    except PydanticValidationError as exc:
-        raise ProcessingError(f"Invalid canonical instructional affordances: {exc}") from exc
-    scenarios = build_behavior_catalog(
-        projection.blueprint.semantic_units,
-        affordances,
-        artifact_language=projection.blueprint.artifact_language,
-    )
-    catalog_digest = behavior_catalog_digest(scenarios)
     build_id = course_skill_build_id(projection.blueprint)
     target_key = stable_hash(
         {
-            "contract": BEHAVIOR_CONTRACT_VERSION,
             "renderer_contract": COURSE_SKILL_RENDERER_CONTRACT_VERSION,
-            "catalog": catalog_digest,
             "reviewed_snapshot": reviewed_snapshot,
             "build_id": build_id,
         },
         length=32,
     )
-    target_path = workspace.analysis_dir / "behavior-targets" / target_key
-    target_root = workspace.analysis_dir / "behavior-targets"
+    target_root = workspace.analysis_dir / "review-targets"
+    target_path = target_root / target_key
     workspace.ensure_directory(target_root)
     fresh_path = target_path.with_name(f".{target_path.name}-fresh-{secrets.token_hex(12)}")
     try:
@@ -157,7 +124,7 @@ def _behavior_evaluation_plan(
             allowed_root=target_root,
         )
         if target_path.is_symlink():
-            raise ProcessingError("Cached behavior target cannot be a symlink")
+            raise ProcessingError("Cached review target cannot be a symlink")
         if target_path.exists():
             existing = snapshot_behavior_target(
                 target_path,
@@ -166,7 +133,7 @@ def _behavior_evaluation_plan(
             )
             if existing.content_digest != fresh.content_digest or existing.files != fresh.files:
                 raise ProcessingError(
-                    "Cached behavior target differs from a fresh canonical engine render"
+                    "Cached review target differs from a fresh canonical engine render"
                 )
         else:
             os.replace(fresh_path, target_path)
@@ -181,203 +148,11 @@ def _behavior_evaluation_plan(
         expected_build_id=build_id,
         allowed_root=target_root,
     )
-    return BehaviorEvaluationPlan(
+    return ReviewTargetPlan(
         reviewed_snapshot_digest=reviewed_snapshot,
         canonical_packet=canonical_packet,
-        scenarios=scenarios,
-        catalog_digest=catalog_digest,
         target=target,
     )
-
-
-def plan_behavior_trial_tasks(
-    workspace: Workspace,
-    run: AnalysisRun,
-    *,
-    author_task: WorkItem,
-    repair_cycle: int = 0,
-) -> list[WorkItem]:
-    """Create one prompt-isolated host dispatch per applicable catalog scenario."""
-
-    if (
-        author_task.role != WorkRole.AUTHOR
-        or author_task.scope.get("kind") not in {"course-authoring", "course-authoring-repair"}
-        or author_task.state != WorkState.COMPLETE
-    ):
-        raise ProcessingError("Behavior trials require a completed Author task")
-    if repair_cycle < 0 or repair_cycle > MAX_REPAIR_CYCLES:
-        raise ProcessingError("Behavior trial repair cycle is outside the supported range")
-    plan = _behavior_evaluation_plan(workspace, author_task=author_task)
-    language_state = canonical_artifact_language_state(
-        workspace,
-        expected_author_task_id=author_task.id,
-    )
-    target_path = plan.target.path.relative_to(workspace.root)
-    tasks: list[WorkItem] = []
-    for scenario in plan.scenarios:
-        if scenario.applicability != "required":
-            continue
-        tasks.append(
-            workspace.ensure_work_item(
-                run_id=run.id,
-                role=WorkRole.REVIEW,
-                scope={
-                    "kind": "behavior-trial",
-                    "contract_version": BEHAVIOR_CONTRACT_VERSION,
-                    "renderer_contract_version": COURSE_SKILL_RENDERER_CONTRACT_VERSION,
-                    "catalog_version": BEHAVIOR_CATALOG_VERSION,
-                    "catalog_digest": plan.catalog_digest,
-                    "scenario_id": scenario.id,
-                    "scenario_digest": scenario.scenario_digest,
-                    "author_task_id": author_task.id,
-                    "reviewed_snapshot_digest": plan.reviewed_snapshot_digest,
-                    "target_build_id": plan.target.build_id,
-                    "target_content_digest": plan.target.content_digest,
-                    "repair_cycle": repair_cycle,
-                    "artifact_language_contract_digest": language_state.contract_digest,
-                    "artifact_language_declaration_digest": language_state.declaration_digest,
-                },
-                persona_hint=BEHAVIOR_TRIAL_PERSONA,
-                packet={
-                    "instructions": (
-                        "Use a new context containing only this packet and the immutable Skill "
-                        "target. Activate the Skill, execute exactly one user turn, and record "
-                        "the assistant turn plus every generated-Skill file access and side "
-                        "effect. Do not grade, repair, or summarize the behavior. Submit directly."
-                    ),
-                    "evaluation_target": {
-                        "path": str(target_path),
-                        "build_id": plan.target.build_id,
-                        "content_digest": plan.target.content_digest,
-                        "renderer_contract_version": COURSE_SKILL_RENDERER_CONTRACT_VERSION,
-                    },
-                    "scenario": {"id": scenario.id, "prompt": scenario.prompt},
-                },
-                result_schema=BehaviorTrialResult.model_json_schema(mode="validation"),
-                dependencies=[author_task.id],
-                snapshot_digest=run.snapshot_digest,
-            )
-        )
-    return tasks
-
-
-def _load_behavior_trial_result(payload: bytes) -> BehaviorTrialResult:
-    try:
-        return BehaviorTrialResult.model_validate_json(payload)
-    except PydanticValidationError as exc:
-        raise ProcessingError(f"Invalid behavior trial result: {exc}") from exc
-    except (UnicodeDecodeError, ValueError) as exc:
-        if isinstance(exc, ProcessingError):
-            raise
-        raise ProcessingError(f"Could not read behavior trial result: {exc}") from exc
-
-
-def _verify_trial_against_task(
-    workspace: Workspace,
-    task: WorkItem,
-    result: BehaviorTrialResult,
-) -> BehaviorTargetSnapshot:
-    packet = _verified_task_packet(workspace, task)
-    payload = packet.get("payload")
-    if not isinstance(payload, dict):
-        raise ProcessingError("Behavior trial packet has no payload")
-    target_packet = payload.get("evaluation_target")
-    scenario_packet = payload.get("scenario")
-    if not isinstance(target_packet, dict) or not isinstance(scenario_packet, dict):
-        raise ProcessingError("Behavior trial packet is incomplete")
-    if (
-        result.task_id != task.id
-        or result.snapshot_digest != task.snapshot_digest
-        or result.execution_context_id != task.execution_context_id
-        or result.scenario_id != task.scope.get("scenario_id")
-        or result.scenario_digest != task.scope.get("scenario_digest")
-        or result.target_content_digest != task.scope.get("target_content_digest")
-        or result.scenario_id != scenario_packet.get("id")
-        or result.turns[0].content != scenario_packet.get("prompt")
-    ):
-        raise ProcessingError("Behavior trial result does not belong to this task contract")
-    target_relative = Path(str(target_packet.get("path", "")))
-    if target_relative.is_absolute() or ".." in target_relative.parts:
-        raise ProcessingError("Behavior trial target path is unsafe")
-    target = snapshot_behavior_target(
-        workspace.root / target_relative,
-        expected_build_id=str(task.scope["target_build_id"]),
-        allowed_root=workspace.analysis_dir / "behavior-targets",
-    )
-    if target.content_digest != result.target_content_digest:
-        raise ProcessingError("Behavior trial target changed after dispatch")
-    for access in result.artifact_accesses:
-        expected = target.files.get(access.path)
-        if expected is None or access.sha256 != expected.get("sha256"):
-            raise ProcessingError(
-                f"Behavior trial references an unknown or changed Skill file: {access.path}"
-            )
-    return target
-
-
-def submit_behavior_trial_result(
-    workspace: Workspace,
-    task_id: str,
-    result_path: Path,
-) -> WorkItem:
-    task = workspace.get_work_item(task_id)
-    if task.role != WorkRole.REVIEW or task.scope.get("kind") != "behavior-trial":
-        raise ProcessingError(f"Task is not a behavior trial: {task_id}")
-    result_snapshot = workspace.task_output_file_snapshot(
-        task_id,
-        result_path,
-        max_bytes=2 * 1024 * 1024,
-    )
-    result = _load_behavior_trial_result(result_snapshot.payload)
-    _verify_trial_against_task(workspace, task, result)
-    accepted, _records = workspace.accept_work_result(
-        task_id=task.id,
-        lease_token=result.lease_token,
-        result_path=result_path,
-        result_snapshot=result_snapshot,
-        producer=result.producer.model_dump(mode="json"),
-    )
-    return accepted
-
-
-def _verified_completed_trials(
-    workspace: Workspace,
-    tasks: list[WorkItem],
-    *,
-    plan: BehaviorEvaluationPlan,
-) -> dict[str, tuple[WorkItem, BehaviorTrialResult]]:
-    expected = {
-        scenario.id: scenario for scenario in plan.scenarios if scenario.applicability == "required"
-    }
-    if len(tasks) != len(expected):
-        raise ProcessingError("Behavior trial set is incomplete")
-    results: dict[str, tuple[WorkItem, BehaviorTrialResult]] = {}
-    execution_context_ids: set[str] = set()
-    for task in tasks:
-        if (
-            task.state != WorkState.COMPLETE
-            or task.result_path is None
-            or task.result_digest is None
-        ):
-            raise ProcessingError("Behavior Review requires completed fresh-context trials")
-        result_path = workspace.root / task.result_path
-        result_payload = workspace.read_file_bytes(result_path, max_bytes=2 * 1024 * 1024)
-        if sha256(result_payload).hexdigest() != task.result_digest:
-            raise ProcessingError("Accepted behavior trial result failed its digest check")
-        result = _load_behavior_trial_result(result_payload)
-        _verify_trial_against_task(workspace, task, result)
-        scenario = expected.get(result.scenario_id)
-        if scenario is None or result.scenario_digest != scenario.scenario_digest:
-            raise ProcessingError("Behavior trial does not match the current catalog")
-        if result.scenario_id in results:
-            raise ProcessingError("Behavior scenario was executed more than once")
-        if result.execution_context_id in execution_context_ids:
-            raise ProcessingError("Behavior trials must use distinct engine-issued contexts")
-        execution_context_ids.add(result.execution_context_id)
-        results[result.scenario_id] = (task, result)
-    if set(results) != set(expected):
-        raise ProcessingError("Behavior trial set does not cover every applicable scenario")
-    return results
 
 
 def plan_review_task(
@@ -385,7 +160,6 @@ def plan_review_task(
     run: AnalysisRun,
     *,
     author_task: WorkItem,
-    behavior_trial_tasks: list[WorkItem],
     repair_cycle: int = 0,
     additional_dependencies: list[str] | None = None,
 ) -> WorkItem:
@@ -397,12 +171,7 @@ def plan_review_task(
         raise ProcessingError("Review requires a completed Author task")
     if repair_cycle < 0 or repair_cycle > MAX_REPAIR_CYCLES:
         raise ProcessingError("Review repair cycle is outside the supported range")
-    plan = _behavior_evaluation_plan(workspace, author_task=author_task)
-    trials = _verified_completed_trials(
-        workspace,
-        behavior_trial_tasks,
-        plan=plan,
-    )
+    plan = _review_target_plan(workspace, author_task=author_task)
     language_state = canonical_artifact_language_state(
         workspace,
         expected_author_task_id=author_task.id,
@@ -417,19 +186,12 @@ def plan_review_task(
     )
     packet = {
         "instructions": (
-            "Independently audit source-meaning retention and instructional-affordance "
-            "coverage, then grounding, disclosure, runtime behavior, safety, and scope. "
-            "Inspect the immutable rendered Skill target and canonical files directly; judge "
-            "every catalog scenario from its separate raw fresh-context trial. Treat missing "
-            "quick reference, operational "
-            "validation or recovery, capstone scoring, progressive hints, retry, and teaching "
-            "scaffolds as product losses when the claimed capability requires them. Inspect "
-            "every selected teaching visual and audit necessity, legibility, surrounding "
-            "context, privacy, evidence grounding, and whether artifacts load it only on demand. "
-            f"The canonical artifact language is {language_state.declaration.artifact_language!r}; "
-            "audit all authored prose, titles, welcome text, and metadata for consistency with "
-            "that declaration. Do not infer consistency merely from the declared field. Runtime "
-            "interaction must still follow the learner's language by default."
+            "Independently audit the rendered Skill preview and canonical records for "
+            "evidence grounding, source-meaning retention, instructional usefulness, "
+            "disclosure boundaries, visual asset quality, safety, and scope. "
+            f"Verify all authored prose matches the canonical artifact language "
+            f"{language_state.declaration.artifact_language!r}. "
+            "Return pass unless there is a concrete blocking defect."
         ),
         "artifact_language_contract": language_state.contract.model_dump(mode="json"),
         "artifact_language_contract_digest": language_state.contract_digest,
@@ -439,26 +201,12 @@ def plan_review_task(
         "analysis_depth_contract_digest": analysis_depth_digest,
         "reviewed_snapshot_digest": plan.reviewed_snapshot_digest,
         "canonical": plan.canonical_packet,
-        "behavior_catalog": {
-            "version": BEHAVIOR_CATALOG_VERSION,
-            "digest": plan.catalog_digest,
-            "scenarios": [scenario.model_dump(mode="json") for scenario in plan.scenarios],
-        },
         "evaluation_target": {
             "path": str(plan.target.path.relative_to(workspace.root)),
             "build_id": plan.target.build_id,
             "content_digest": plan.target.content_digest,
             "renderer_contract_version": COURSE_SKILL_RENDERER_CONTRACT_VERSION,
         },
-        "behavior_trials": [
-            {
-                "scenario_id": scenario_id,
-                "task_id": task.id,
-                "result_path": str(task.result_path),
-                "result_digest": str(task.result_digest),
-            }
-            for scenario_id, (task, _result) in trials.items()
-        ],
         "visual_asset_candidates": visual_asset_candidate_packet(workspace),
         "visual_retention": [
             report.model_dump(mode="json") for report in workspace.visual_retention_reports()
@@ -484,10 +232,7 @@ def plan_review_task(
         role=WorkRole.REVIEW,
         scope={
             "kind": "independent-review",
-            "contract_version": BEHAVIOR_CONTRACT_VERSION,
             "renderer_contract_version": COURSE_SKILL_RENDERER_CONTRACT_VERSION,
-            "catalog_version": BEHAVIOR_CATALOG_VERSION,
-            "catalog_digest": plan.catalog_digest,
             "author_task_id": author_task.id,
             "reviewed_snapshot_digest": plan.reviewed_snapshot_digest,
             "target_build_id": plan.target.build_id,
@@ -502,7 +247,6 @@ def plan_review_task(
         result_schema=ReviewResult.model_json_schema(mode="validation"),
         dependencies=[
             author_task.id,
-            *(task.id for task in behavior_trial_tasks),
             *(additional_dependencies or []),
         ],
         snapshot_digest=run.snapshot_digest,
@@ -511,17 +255,7 @@ def plan_review_task(
 
 def _load_review_result(payload: bytes) -> ReviewResult:
     try:
-        raw = payload.decode("utf-8")
-        try:
-            version = json.loads(raw).get("schema_version")
-        except (json.JSONDecodeError, AttributeError):
-            version = None
-        if version == 1:
-            raise ProcessingError(
-                "Legacy Review schema 1 cannot satisfy behavior catalog v2; dispatch fresh "
-                "behavior trials and an independent Review"
-            )
-        return ReviewResult.model_validate_json(raw)
+        return ReviewResult.model_validate_json(payload.decode("utf-8"))
     except PydanticValidationError as exc:
         raise ProcessingError(f"Invalid Review result: {exc}") from exc
     except (UnicodeDecodeError, ValueError) as exc:
@@ -538,7 +272,7 @@ def submit_review_result(
     task = workspace.get_work_item(task_id)
     if task.role != WorkRole.REVIEW or task.scope.get("kind") != "independent-review":
         raise ProcessingError(f"Task is not a Review task: {task_id}")
-    _verified_task_packet(workspace, task)
+    packet = _verified_task_packet(workspace, task)
     result_snapshot = workspace.task_output_file_snapshot(
         task_id,
         result_path,
@@ -557,10 +291,7 @@ def submit_review_result(
         raise ProcessingError("Independent Review is missing its engine-issued execution context")
     if author_task.execution_context_id == task.execution_context_id:
         raise ProcessingError("Review and Author require distinct engine-issued contexts")
-    plan = _behavior_evaluation_plan(
-        workspace,
-        author_task=author_task,
-    )
+    plan = _review_target_plan(workspace, author_task=author_task)
     language_state = canonical_artifact_language_state(
         workspace,
         expected_author_task_id=author_task.id,
@@ -576,10 +307,6 @@ def submit_review_result(
     if (
         result.reviewed_snapshot_digest != plan.reviewed_snapshot_digest
         or result.reviewed_snapshot_digest != task.scope.get("reviewed_snapshot_digest")
-        or result.catalog_version != BEHAVIOR_CATALOG_VERSION
-        or result.catalog_version != task.scope.get("catalog_version")
-        or result.catalog_digest != plan.catalog_digest
-        or result.catalog_digest != task.scope.get("catalog_digest")
         or result.target_build_id != plan.target.build_id
         or result.target_build_id != task.scope.get("target_build_id")
         or result.target_content_digest != plan.target.content_digest
@@ -589,8 +316,7 @@ def submit_review_result(
         != language_state.declaration_digest
         or task.scope.get("analysis_depth_contract_digest") != analysis_depth_digest
     ):
-        raise ProcessingError("Review result targets a stale behavior catalog or Skill snapshot")
-    packet = _verified_task_packet(workspace, task)
+        raise ProcessingError("Review result targets a stale Skill snapshot")
     payload = packet.get("payload")
     if (
         not isinstance(payload, dict)
@@ -604,36 +330,6 @@ def submit_review_result(
         or payload.get("analysis_depth_contract_digest") != analysis_depth_digest
     ):
         raise ProcessingError("Review packet has stale artifact-language state")
-    trial_entries = payload.get("behavior_trials") if isinstance(payload, dict) else None
-    if not isinstance(trial_entries, list):
-        raise ProcessingError("Review packet has no behavior trial evidence")
-    trial_tasks: list[WorkItem] = []
-    for entry in trial_entries:
-        if not isinstance(entry, dict) or not isinstance(entry.get("task_id"), str):
-            raise ProcessingError("Review packet has an invalid behavior trial reference")
-        trial_tasks.append(workspace.get_work_item(str(entry["task_id"])))
-    trials = _verified_completed_trials(workspace, trial_tasks, plan=plan)
-    if len(result.behavior_checks) != len(plan.scenarios):
-        raise ProcessingError("Review must account for every catalog scenario exactly once")
-    for check, scenario in zip(result.behavior_checks, plan.scenarios, strict=True):
-        if not check_matches_scenario(check, scenario):
-            raise ProcessingError(f"Review changed catalog scenario {scenario.id}")
-        trial_pair = trials.get(scenario.id)
-        if scenario.applicability == "required":
-            if trial_pair is None:
-                raise ProcessingError(f"Review lacks trial evidence for {scenario.id}")
-            trial_task, trial_result = trial_pair
-            if (
-                check.trial_task_id != trial_task.id
-                or check.trial_result_digest != trial_task.result_digest
-                or check.target_content_digest != plan.target.content_digest
-                or any(index >= len(trial_result.turns) for index in check.evidence_turn_indices)
-            ):
-                raise ProcessingError(f"Review cited stale trial evidence for {scenario.id}")
-        elif trial_pair is not None:
-            raise ProcessingError(
-                f"Not-applicable scenario unexpectedly has a trial: {scenario.id}"
-            )
     author_producer = workspace.work_result_producer(author_task_id)
     if author_producer is None:
         raise ProcessingError("Review cannot identify the canonical Author producer")
@@ -662,24 +358,10 @@ def submit_review_result(
             raise ProcessingError(
                 "Review producer must be independent of the curriculum Author producer"
             )
-    for _scenario_id, (trial_task, _trial_result) in trials.items():
-        trial_producer = workspace.work_result_producer(trial_task.id)
-        if trial_producer is None:
-            raise ProcessingError("Review cannot identify a behavior trial producer")
-        if reviewer.get("name") == trial_producer.get("name") or reviewer.get(
-            "run_id"
-        ) == trial_producer.get("run_id"):
-            raise ProcessingError("Review producer must be independent of behavior trial producers")
-        if trial_task.execution_context_id == task.execution_context_id:
-            raise ProcessingError(
-                "Review and behavior trials require distinct engine-issued contexts"
-            )
     output = workspace.tasks_dir / task.id / "output"
     review_path = output / "critic-report.json"
-    behavior_path = output / "behavior-report.json"
-    critic_report, behavior_report = reconstruct_review_reports(task, result)
+    critic_report = reconstruct_critic_report(task, result)
     workspace.write_json(review_path, critic_report)
-    workspace.write_json(behavior_path, behavior_report)
     accepted, _canonical = workspace.accept_work_result(
         task_id=task.id,
         lease_token=result.lease_token,
@@ -692,12 +374,6 @@ def submit_review_result(
                 "critic-report",
                 "default",
                 review_path,
-            ),
-            workspace.canonical_output_file_snapshot(
-                task.id,
-                "behavior-report",
-                "default",
-                behavior_path,
             ),
         ],
     )
@@ -716,21 +392,11 @@ def plan_author_repair_task(
     review_record = workspace.canonical_record("critic-report")
     if review_record is None or review_record.producer_task_id != failed_review_task.id:
         raise ProcessingError("Author repair requires the failed canonical critic report")
-    behavior_record = workspace.canonical_record("behavior-report")
-    if behavior_record is None or behavior_record.producer_task_id != failed_review_task.id:
-        raise ProcessingError("Author repair requires the failed canonical behavior report")
     try:
         critic_path = workspace.root / review_record.path
-        behavior_path = workspace.root / behavior_record.path
-        if (
-            hash_file(critic_path) != review_record.digest
-            or hash_file(behavior_path) != behavior_record.digest
-        ):
-            raise ProcessingError("Author repair Review reports failed their digest checks")
+        if hash_file(critic_path) != review_record.digest:
+            raise ProcessingError("Author repair critic report failed its digest check")
         report = CriticReport.model_validate_json(critic_path.read_text(encoding="utf-8"))
-        behavior_report = BehaviorReport.model_validate_json(
-            behavior_path.read_text(encoding="utf-8")
-        )
     except (OSError, PydanticValidationError) as exc:
         if isinstance(exc, ProcessingError):
             raise
@@ -834,19 +500,6 @@ def plan_author_repair_task(
         ),
         "prior_author_result": str(prior_author_task.result_path),
         "critic_report": {"path": str(review_record.path), "digest": review_record.digest},
-        "behavior_report": {
-            "path": str(behavior_record.path),
-            "digest": behavior_record.digest,
-        },
-        "behavior_trials": [
-            {
-                "scenario_id": check.id,
-                "task_id": check.trial_task_id,
-                "result_digest": check.trial_result_digest,
-            }
-            for check in behavior_report.checks
-            if check.trial_task_id is not None
-        ],
         "repair_cycle": repair_cycle,
         "visual_asset_candidates": visual_asset_candidate_packet(workspace),
         "canonical_curriculum": curriculum_packet,

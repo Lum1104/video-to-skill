@@ -60,6 +60,7 @@ _EXCLUDED_DIRECTORY_NAMES = frozenset(
         "locks",
         "__pycache__",
         "behavior-targets",
+        "review-targets",
         "tasks",
     }
 )

@@ -62,11 +62,10 @@ from video_to_skill.pipeline import extract_sources
 from video_to_skill.review import (
     MAX_REPAIR_CYCLES,
     plan_author_repair_task,
-    plan_behavior_trial_tasks,
     plan_review_task,
-    submit_behavior_trial_result,
     submit_review_result,
 )
+from video_to_skill.review_contract import reconstruct_review_snapshot
 from video_to_skill.utils import stable_hash
 from video_to_skill.work import AnalysisRun, WorkItem, WorkRole, WorkState
 from video_to_skill.workspace import Workspace
@@ -640,10 +639,7 @@ def submit_workspace_result(
         else:
             accepted = submit_author_result(workspace, task_id, submitted_result)
     elif item.role == WorkRole.REVIEW:
-        if item.scope.get("kind") == "behavior-trial":
-            accepted = submit_behavior_trial_result(workspace, task_id, submitted_result)
-        else:
-            accepted = submit_review_result(workspace, task_id, submitted_result)
+        accepted = submit_review_result(workspace, task_id, submitted_result)
     else:
         accepted = submit_decision_result(workspace, task_id, submitted_result)
     assert accepted.result_digest is not None
@@ -1108,27 +1104,6 @@ def advance_run(
             author_task = course_author_tasks[-1]
 
         repair_cycle = max(0, int(author_task.scope.get("revision", 1)) - 1)
-        behavior_trials = plan_behavior_trial_tasks(
-            workspace,
-            run,
-            author_task=author_task,
-            repair_cycle=repair_cycle,
-        )
-        incomplete_trials = [item for item in behavior_trials if item.state != WorkState.COMPLETE]
-        if incomplete_trials:
-            return _actions_required(workspace, incomplete_trials)
-        trial_contract = behavior_trials[0].scope
-        review_contract_keys = (
-            "contract_version",
-            "renderer_contract_version",
-            "catalog_version",
-            "catalog_digest",
-            "reviewed_snapshot_digest",
-            "target_build_id",
-            "target_content_digest",
-            "artifact_language_contract_digest",
-            "artifact_language_declaration_digest",
-        )
         current_analysis_depth = workspace.analysis_depth_contract()
         if current_analysis_depth is None:
             raise ProcessingError("Review requires a persisted analysis-depth contract")
@@ -1136,13 +1111,11 @@ def advance_run(
             current_analysis_depth.model_dump(mode="json"),
             length=64,
         )
-        expected_review_dependencies = sorted(
-            {
-                author_task.id,
-                *(item.id for item in behavior_trials),
-                *decision_dependency,
-            }
+        current_reviewed_snapshot_digest, _ = reconstruct_review_snapshot(
+            workspace,
+            expected_author_task_id=author_task.id,
         )
+        expected_review_dependencies = sorted({author_task.id, *decision_dependency})
         reviews = [
             item
             for item in _matching_tasks(
@@ -1153,8 +1126,8 @@ def advance_run(
             if item.scope.get("kind") == "independent-review"
             and item.scope.get("author_task_id") == author_task.id
             and item.scope.get("repair_cycle") == repair_cycle
-            and all(item.scope.get(key) == trial_contract.get(key) for key in review_contract_keys)
             and item.scope.get("analysis_depth_contract_digest") == current_analysis_depth_digest
+            and item.scope.get("reviewed_snapshot_digest") == current_reviewed_snapshot_digest
             and item.dependencies == expected_review_dependencies
         ]
         if not reviews:
@@ -1162,7 +1135,6 @@ def advance_run(
                 workspace,
                 run,
                 author_task=author_task,
-                behavior_trial_tasks=behavior_trials,
                 repair_cycle=repair_cycle,
                 additional_dependencies=decision_dependency,
             )
