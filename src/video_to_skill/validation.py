@@ -716,23 +716,23 @@ def _validate_course_skill_contract(
         return
     required_headings = {
         "missing-empty-invocation": (
-            r"(?m)^## Empty invocation\s*$",
+            r"(?m)^## (?:Empty invocation|直接调用时|引数なしの呼び出し)\s*$",
             "Course skill is missing the empty-invocation contract.",
         ),
         "missing-initial-context": (
-            r"(?m)^## Initial context\s*$",
+            r"(?m)^## (?:Initial context|开始前了解背景|前提の確認)\s*$",
             "Course skill is missing its bounded initial-context contract.",
         ),
         "missing-interaction-behavior": (
-            r"(?m)^## Interaction behavior\s*$",
+            r"(?m)^## (?:Interaction behavior|互动规则|対話ルール)\s*$",
             "Course skill is missing adaptive interaction behavior.",
         ),
         "missing-capability-profile": (
-            r"(?m)^## Capability profile\s*$",
+            r"(?m)^## (?:Capability profile|能力深度|対応レベル)\s*$",
             "Course skill is missing its evidence-derived capability profile.",
         ),
         "missing-evidence-contract": (
-            r"(?m)^## Evidence and uncertainty\s*$",
+            r"(?m)^## (?:Evidence and uncertainty|证据与边界|根拠と境界)\s*$",
             "Course skill is missing its evidence and uncertainty contract.",
         ),
     }
@@ -742,47 +742,55 @@ def _validate_course_skill_contract(
 
     behavioral_checks = {
         "missing-empty-no-side-effects": (
-            r"(?is)load no supporting file.*inspect no project.*run no command.*create no file",
+            r"(?is)(?:load no supporting file.*inspect no project.*run no command.*create no file"
+            r"|不读取任何附属文件.*不检查项目目录.*不执行命令.*不创建文件"
+            r"|補足ファイルを読まず.*プロジェクトを検査せず.*コマンドを実行せず.*ファイルも作成しません)",
             "Empty invocation must have no supporting-file, project, command, or file side effects.",
         ),
         "missing-start-option": (
-            r"(?ims)^## Empty invocation.*\bstart\b",
+            r"(?ims)^## (?:Empty invocation|直接调用时|引数なしの呼び出し).*\bstart\b",
             "Empty invocation must offer a zero-friction `start` path.",
         ),
         "missing-three-question-bound": (
-            r"(?is)\bat most three\b",
+            r"(?is)(?:\bat most three\b|最多三个|最大3問)",
             "Initial context must ask at most three questions.",
         ),
         "missing-adaptive-teaching": (
-            r"(?is)\bone useful cognitive move\b.*\b(adapt|answer)\b",
-            "Learning behavior must teach one bounded move and adapt to the learner.",
+            r"(?is)(?:\bone (?:useful cognitive move|concept at a time)\b.*\b(?:adapt|answer)\b"
+            r"|一次只讲一个核心点.*(?:调整|回答)"
+            r"|1つずつ要点を説明.*調整)",
+            "Learning behavior must teach one bounded concept and adapt to the learner.",
         ),
         "missing-practice-feedback": (
-            r"(?is)\b(attempt|retry)\b.*\b(rubric|feedback|misconception|hint)",
+            r"(?is)(?:\b(?:attempt|retry)\b.*\b(?:rubric|feedback|misconception|hint)"
+            r"|(?:作答|重试).*(?:点评|提示|评分)"
+            r"|(?:回答|再挑戦).*(?:ヒント|採点))",
             "Practice mode must evaluate an attempt and provide bounded feedback.",
         ),
         "solution-leakage-risk": (
-            r"(?is)\b(without|before|until)\b.{0,120}\b(solution|answer)\b",
+            r"(?is)(?:\b(?:without|before|until)\b.{0,120}\b(?:solution|answer)\b"
+            r"|不要提前加载答案|作答后.*展示解析"
+            r"|解答を読まずに|試行後.*提示)",
             "Practice mode must withhold solutions until an attempt or explicit request.",
         ),
         "missing-application-context": (
-            r"(?is)\buser(?:'s)? actual context\b",
+            r"(?is)(?:\buser(?:'s)? actual context\b|实际项目|実際の文脈)",
             "Apply mode must inspect the user's real context before adapting the course method.",
         ),
         "missing-timestamp-grounding": (
-            r"(?is)\b(timestamp|time-coded|timecode)\w*",
+            r"(?is)(?:\b(?:timestamp|time-coded|timecode)\w*|时间戳|タイムスタンプ)",
             "Consequential answers must be grounded with source timestamps.",
         ),
         "missing-honest-uncertainty": (
-            r"(?is)\b(uncertain|uncertainty|low-confidence|inferred)\b",
+            r"(?is)(?:\b(?:uncertain|uncertainty|low-confidence|inferred)\b|低置信度|推断|推測)",
             "The skill must state how to handle unsupported or uncertain material.",
         ),
         "missing-language-following": (
-            r"(?is)respond in the user's language",
+            r"(?is)(?:respond in the user's language|用户的对话语言回复|ユーザーの言語で回答)",
             "The skill must follow the user's interaction language by default.",
         ),
         "missing-knowledge-boundary": (
-            r"(?is)outside or current knowledge",
+            r"(?is)(?:outside or current knowledge|课外或最新知识|外部・最新知識)",
             "The skill must distinguish source evidence from outside or current knowledge.",
         ),
     }

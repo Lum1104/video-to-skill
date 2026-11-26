@@ -433,7 +433,11 @@ def _quality_gate(
         _canonical_json(workspace, "instructional-affordances"),
         label="instructional affordance ledger",
     )
-    scenarios = build_behavior_catalog(projection.blueprint.semantic_units, affordances)
+    scenarios = build_behavior_catalog(
+        projection.blueprint.semantic_units,
+        affordances,
+        artifact_language=projection.blueprint.artifact_language,
+    )
     expected_catalog_digest = behavior_catalog_digest(scenarios)
     if (
         behavior.catalog_digest != expected_catalog_digest

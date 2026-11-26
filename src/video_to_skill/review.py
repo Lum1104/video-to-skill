@@ -126,7 +126,11 @@ def _behavior_evaluation_plan(
         affordances = [InstructionalAffordance.model_validate(item) for item in raw_affordances]
     except PydanticValidationError as exc:
         raise ProcessingError(f"Invalid canonical instructional affordances: {exc}") from exc
-    scenarios = build_behavior_catalog(projection.blueprint.semantic_units, affordances)
+    scenarios = build_behavior_catalog(
+        projection.blueprint.semantic_units,
+        affordances,
+        artifact_language=projection.blueprint.artifact_language,
+    )
     catalog_digest = behavior_catalog_digest(scenarios)
     build_id = course_skill_build_id(projection.blueprint)
     target_key = stable_hash(

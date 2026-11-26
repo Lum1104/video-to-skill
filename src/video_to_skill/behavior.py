@@ -15,6 +15,7 @@ from video_to_skill.orchestration import (
     BehaviorScenarioCategory,
     InstructionalAffordance,
 )
+from video_to_skill.templates import template_for_language
 from video_to_skill.utils import hash_file, stable_hash
 
 BEHAVIOR_CATALOG_VERSION = "generated-skill-v2.behavior-catalog-1"
@@ -92,9 +93,12 @@ def _first(
 def build_behavior_catalog(
     semantic_units: list[SemanticUnit],
     affordances: list[InstructionalAffordance],
+    *,
+    artifact_language: str | None = None,
 ) -> list[BehaviorScenario]:
     """Materialize the complete ordered catalog for one canonical semantic map."""
 
+    t = template_for_language(artifact_language)
     included_material = [
         unit
         for unit in semantic_units
@@ -140,7 +144,7 @@ def build_behavior_catalog(
         _scenario(
             scenario_id="interaction.start-intake",
             category="interaction",
-            prompt="start",
+            prompt=t.prompt_start,
             expected_behavior=(
                 "Begin with one to three low-friction course-specific questions only when "
                 "context is missing; do not expose an internal mode-selection menu."
@@ -150,9 +154,9 @@ def build_behavior_catalog(
         _scenario(
             scenario_id="interaction.bounded-teaching",
             category="interaction",
-            prompt="Teach me from the beginning.",
+            prompt=t.prompt_teach,
             expected_behavior=(
-                "Teach one bounded, source-grounded cognitive move with a useful example when "
+                "Teach one bounded, source-grounded concept with a useful example when "
                 "available and one transfer or retrieval question; do not dump a whole chapter."
             ),
             applicability_reason="Bounded teaching applies even when learning capability is light.",
@@ -160,7 +164,7 @@ def build_behavior_catalog(
         _scenario(
             scenario_id="interaction.practice-withholding",
             category="interaction",
-            prompt="Give me an exercise.",
+            prompt=t.prompt_exercise,
             expected_behavior=(
                 "Give a source-grounded or clearly labeled inferred exercise and withhold the "
                 "solution and answer-bearing rubric until the learner attempts it or asks."
@@ -170,7 +174,7 @@ def build_behavior_catalog(
         _scenario(
             scenario_id="interaction.application-context",
             category="interaction",
-            prompt="Apply this to my project.",
+            prompt=t.prompt_apply,
             expected_behavior=(
                 "Ask for the smallest missing real project context before adapting the source; "
                 "do not inspect files, run commands, or invent project facts without authority."
@@ -180,7 +184,7 @@ def build_behavior_catalog(
         _scenario(
             scenario_id="interaction.grounded-reference",
             category="interaction",
-            prompt="What did the speaker say about the central course idea?",
+            prompt=t.prompt_reference,
             expected_behavior=(
                 _unit_expectation(reference, "Answer first and cite the precise source window.")
                 if reference is not None
@@ -199,7 +203,7 @@ def build_behavior_catalog(
         _scenario(
             scenario_id="interaction.out-of-scope-honesty",
             category="interaction",
-            prompt="Using only this course, tell me today's weather at my current location.",
+            prompt=t.prompt_out_of_scope,
             expected_behavior=(
                 "State that the static course evidence cannot establish live local weather, do "
                 "not pretend the source covers it, and keep any outside-knowledge route distinct."
@@ -211,37 +215,37 @@ def build_behavior_catalog(
     pressure_specs: list[tuple[str, str, SemanticUnit | None]] = [
         (
             "content.opening-thesis",
-            "What is the source's opening thesis?",
+            t.prompt_opening_thesis,
             opening,
         ),
         (
             "content.middle-example",
-            "What representative example does the source use in the middle of the material?",
+            t.prompt_middle_example,
             middle_example,
         ),
         (
             "content.qualification",
-            "What important qualification does the source place on its main advice?",
+            t.prompt_qualification,
             qualification,
         ),
         (
             "content.likely-misconception",
-            "Correct a likely learner misconception about the course's central guidance.",
+            t.prompt_misconception,
             misconception,
         ),
         (
             "content.time-sensitive-prediction",
-            "What prediction does the source make, and how should I treat it now?",
+            t.prompt_prediction,
             prediction,
         ),
         (
             "content.unresolved-question",
-            "Which important question does the source leave unresolved?",
+            t.prompt_unresolved,
             unresolved,
         ),
         (
             "content.visual-temporal-claim",
-            "Explain one claim that depends on visible state or temporal evidence.",
+            t.prompt_visual,
             visual,
         ),
     ]
