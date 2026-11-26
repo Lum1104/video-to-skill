@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import mimetypes
 from abc import ABC, abstractmethod
@@ -753,6 +754,44 @@ class BilibiliSourceAdapter(YtDlpSourceAdapter):
     hosts = ("bilibili.com", "b23.tv")
 
 
+def _is_safe_public_web_url(locator: str) -> bool:
+    """Return True for public http(s) URLs, rejecting localhost/private/credential URLs."""
+
+    parsed = urlparse(locator)
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    if parsed.username is not None or parsed.password is not None:
+        return False
+    host = (parsed.hostname or "").strip().lower().rstrip(".")
+    if not host:
+        return False
+    if host == "localhost" or host.endswith((".localhost", ".local", ".internal")):
+        return False
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        # Domain name: require at least one dot (no bare intranet hostnames)
+        return "." in host
+    return not (
+        addr.is_private
+        or addr.is_loopback
+        or addr.is_link_local
+        or addr.is_multicast
+        or addr.is_reserved
+        or addr.is_unspecified
+    )
+
+
+class GenericYtDlpSourceAdapter(YtDlpSourceAdapter):
+    """Fallback yt-dlp adapter for public web video URLs (Vimeo, Loom, TED, etc.)."""
+
+    platform = SourcePlatform.WEB
+    hosts: tuple[str, ...] = ()
+
+    def accepts(self, locator: str) -> bool:
+        return _is_safe_public_web_url(locator)
+
+
 class SourceRegistry:
     def __init__(self, adapters: list[SourceAdapter] | None = None):
         if adapters is not None:
@@ -763,7 +802,7 @@ class SourceRegistry:
             YouTubeSourceAdapter(),
             BilibiliSourceAdapter(),
         ]
-        built_in_names = {"local", "youtube", "bilibili"}
+        built_in_names = {"local", "youtube", "bilibili", "web"}
         for entry_point in entry_points(group="video_to_skill.source_adapters"):
             if entry_point.name in built_in_names:
                 continue
@@ -774,6 +813,7 @@ class SourceRegistry:
                     "implement SourceAdapter"
                 )
             self.adapters.append(candidate)
+        self.adapters.append(GenericYtDlpSourceAdapter())
 
     def adapter_for(self, locator: str) -> SourceAdapter:
         matches = [adapter for adapter in self.adapters if adapter.accepts(locator)]
@@ -781,7 +821,8 @@ class SourceRegistry:
             parsed = urlparse(locator)
             if parsed.scheme in {"http", "https"}:
                 raise SourceError(
-                    "Unsupported URL host. Production inputs are limited to YouTube and Bilibili."
+                    "Rejected unsafe or unsupported URL (localhost, private network, "
+                    "intranet, and embedded-credential URLs are not allowed)."
                 )
             raise SourceError(f"Input is not a supported media file or URL: {locator}")
         return matches[0]

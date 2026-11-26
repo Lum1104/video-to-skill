@@ -22,6 +22,7 @@ class SourcePlatform(StrEnum):
     LOCAL = "local"
     YOUTUBE = "youtube"
     BILIBILI = "bilibili"
+    WEB = "web"
 
 
 class SourceKind(StrEnum):

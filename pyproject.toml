@@ -42,6 +42,7 @@ video-to-skill = "video_to_skill.cli:run"
 local = "video_to_skill.sources:LocalSourceAdapter"
 youtube = "video_to_skill.sources:YouTubeSourceAdapter"
 bilibili = "video_to_skill.sources:BilibiliSourceAdapter"
+web = "video_to_skill.sources:GenericYtDlpSourceAdapter"
 
 [project.entry-points."video_to_skill.transcribers"]
 faster-whisper = "video_to_skill.transcript:FasterWhisperTranscriber"
