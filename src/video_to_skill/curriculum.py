@@ -14,6 +14,7 @@ from video_to_skill.artifact_language import (
     ensure_artifact_language_contract,
     load_artifact_language_contract,
 )
+from video_to_skill.decompose import SkillCandidate, scoped_skill_candidate
 from video_to_skill.errors import ProcessingError
 from video_to_skill.generation import CurriculumDesign, SemanticUnit
 from video_to_skill.orchestration import (
@@ -105,6 +106,7 @@ def plan_curriculum_task(
     run: AnalysisRun,
     *,
     analyze_task: WorkItem,
+    skill_candidate: SkillCandidate | None = None,
 ) -> WorkItem:
     if (
         analyze_task.role != WorkRole.ANALYZE
@@ -134,34 +136,47 @@ def plan_curriculum_task(
             )
         )
     )
+    skill_instruction = (
+        f" This task plans one decomposed Skill ({skill_candidate.name!r}: {skill_candidate.title}). "
+        f"Include ONLY semantic units from {skill_candidate.semantic_unit_ids!r} and set "
+        "decision_required to false."
+        if skill_candidate is not None
+        else ""
+    )
+    scope: dict[str, object] = {
+        "kind": "curriculum-planning",
+        "analyze_task_id": analyze_task.id,
+        "canonical_record_digests": record_digests,
+        "artifact_language_contract_digest": language_contract_digest,
+    }
+    if skill_candidate is not None:
+        scope["skill_id"] = skill_candidate.id
+    packet: dict[str, object] = {
+        "instructions": (
+            "Design the curriculum checkpoint only. Recommend a thematic path and propose "
+            "two or three materially different paths when the source justifies them. Order "
+            "each path's semantic unit IDs as its learning sequence. Mark decision_required "
+            "only when choosing among the paths would materially change the user's learning "
+            "experience, and provide a concise user-facing decision summary then. Do not "
+            "design artifact boundaries or IDs, write Markdown drafts, create claims, or "
+            f"select assets. {language_instruction} Write all user-facing curriculum "
+            "metadata in that same language while preserving proper names and technical "
+            f"terms where appropriate.{skill_instruction}"
+        ),
+        "artifact_language_contract": language_contract.model_dump(mode="json"),
+        "artifact_language_contract_digest": language_contract_digest,
+        "canonical_records": {
+            kind: {"path": path, "digest": digest} for kind, (path, digest) in records.items()
+        },
+    }
+    if skill_candidate is not None:
+        packet["skill_candidate"] = skill_candidate.model_dump(mode="json")
     return workspace.ensure_work_item(
         run_id=run.id,
         role=WorkRole.AUTHOR,
-        scope={
-            "kind": "curriculum-planning",
-            "analyze_task_id": analyze_task.id,
-            "canonical_record_digests": record_digests,
-            "artifact_language_contract_digest": language_contract_digest,
-        },
+        scope=scope,
         persona_hint=CURRICULUM_PLANNER_PERSONA,
-        packet={
-            "instructions": (
-                "Design the curriculum checkpoint only. Recommend a thematic path and propose "
-                "two or three materially different paths when the source justifies them. Order "
-                "each path's semantic unit IDs as its learning sequence. Mark decision_required "
-                "only when choosing among the paths would materially change the user's learning "
-                "experience, and provide a concise user-facing decision summary then. Do not "
-                "design artifact boundaries or IDs, write Markdown drafts, create claims, or "
-                f"select assets. {language_instruction} Write all user-facing curriculum "
-                "metadata in that same language while preserving proper names and technical "
-                "terms where appropriate."
-            ),
-            "artifact_language_contract": language_contract.model_dump(mode="json"),
-            "artifact_language_contract_digest": language_contract_digest,
-            "canonical_records": {
-                kind: {"path": path, "digest": digest} for kind, (path, digest) in records.items()
-            },
-        },
+        packet=packet,
         result_schema=CurriculumPlanResult.model_json_schema(mode="validation"),
         dependencies=[analyze_task.id],
         snapshot_digest=run.snapshot_digest,
@@ -416,6 +431,12 @@ def _validate_curriculum_plan(
     except OSError as exc:
         raise ProcessingError(f"Could not verify canonical Analyze state: {exc}") from exc
     units = _load_semantic_units(workspace)
+    skill_id = task.scope.get("skill_id")
+    if isinstance(skill_id, str):
+        candidate = scoped_skill_candidate(workspace, skill_id)
+        if candidate is not None:
+            allowed_ids = set(candidate.semantic_unit_ids)
+            units = [unit for unit in units if unit.id in allowed_ids]
     known_units = {unit.id for unit in units}
     required_units = {
         unit.id
@@ -489,7 +510,7 @@ def submit_curriculum_plan_result(
             language_path,
         ),
     ]
-    if not result.curriculum.decision_required:
+    if not result.curriculum.decision_required or isinstance(task.scope.get("skill_id"), str):
         selection_path = output_directory / "selected-curriculum.json"
         workspace.write_json(
             selection_path,

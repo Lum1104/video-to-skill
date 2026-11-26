@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 from test_author import _analyzed_workspace, _author_result, _curriculum_result
-from test_coordinator import _submit_review_envelope
+from test_coordinator import _submit_review_envelope, _submit_single_skill_decompose
 from test_review import _review_result
 
 from video_to_skill import config as config_module
@@ -37,7 +37,7 @@ def _workspace_with_material_curriculum(
 ) -> tuple[Workspace, Settings, str]:
     workspace, analyze_task = _analyzed_workspace(tmp_path)
     settings = Settings(cache_root=tmp_path)
-    first = advance_run(
+    decompose_env = advance_run(
         sources=[],
         workspace_path=workspace.root,
         settings=settings,
@@ -45,6 +45,13 @@ def _workspace_with_material_curriculum(
         output=tmp_path / "legacy-output",
         skill_root=tmp_path / "skills",
         run_official_validation=False,
+    )
+    _submit_single_skill_decompose(workspace, decompose_env)
+    first = advance_run(
+        sources=[],
+        workspace_path=workspace.root,
+        settings=settings,
+        host=None,
     )
     [action] = first.actions
     task = workspace.get_work_item(action.task_id)

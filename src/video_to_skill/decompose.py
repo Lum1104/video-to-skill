@@ -360,3 +360,15 @@ def selected_skill_candidates(workspace: Workspace) -> list[SkillCandidate]:
         raise ProcessingError("Skill pack selection has not been confirmed yet")
     by_id = {skill.id: skill for skill in checkpoint.plan.skills}
     return [by_id[skill_id] for skill_id in checkpoint.selection.selected_skill_ids]
+
+
+def scoped_skill_candidate(workspace: Workspace, skill_id: str | None) -> SkillCandidate | None:
+    """Resolve one SkillCandidate by id from the canonical skill-pack-plan."""
+
+    if skill_id is None:
+        return None
+    plan, _record = load_canonical_skill_pack_plan(workspace)
+    for skill in plan.skills:
+        if skill.id == skill_id:
+            return skill
+    raise ProcessingError(f"Skill '{skill_id}' was not found in canonical skill-pack-plan")

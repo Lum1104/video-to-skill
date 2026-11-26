@@ -505,17 +505,20 @@ def plan_author_repair_task(
         "canonical_curriculum": curriculum_packet,
         "artifact_language": language_packet,
     }
+    repair_scope: dict[str, object] = {
+        "kind": "course-authoring-repair",
+        "revision": repair_cycle + 1,
+        "repair_of": prior_author_task.id,
+        "review_task_id": failed_review_task.id,
+        **curriculum_scope,
+        **language_scope,
+    }
+    if isinstance(prior_author_task.scope.get("skill_id"), str):
+        repair_scope["skill_id"] = str(prior_author_task.scope["skill_id"])
     return workspace.ensure_work_item(
         run_id=run.id,
         role=WorkRole.AUTHOR,
-        scope={
-            "kind": "course-authoring-repair",
-            "revision": repair_cycle + 1,
-            "repair_of": prior_author_task.id,
-            "review_task_id": failed_review_task.id,
-            **curriculum_scope,
-            **language_scope,
-        },
+        scope=repair_scope,
         persona_hint=AUTHOR_PERSONA,
         packet=packet,
         result_schema=AuthorResult.model_json_schema(mode="validation"),

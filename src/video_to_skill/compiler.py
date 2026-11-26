@@ -28,6 +28,7 @@ from video_to_skill.curriculum import (
     validate_artifact_bound_curriculum,
     validate_curriculum_checkpoint_author_binding,
 )
+from video_to_skill.decompose import scoped_skill_candidate
 from video_to_skill.errors import ProcessingError
 from video_to_skill.generation import (
     COURSE_SKILL_RENDERER_CONTRACT_VERSION,
@@ -457,6 +458,21 @@ def assemble_workspace_blueprint(workspace: Workspace) -> WorkspaceBlueprintProj
         _canonical_json(workspace, "semantic-relations"),
         label="semantic relations",
     )
+    course_record_for_scope = workspace.canonical_record("course")
+    if course_record_for_scope is not None:
+        author_task_for_scope = workspace.get_work_item(course_record_for_scope.producer_task_id)
+        scoped_skill_id = author_task_for_scope.scope.get("skill_id")
+        if isinstance(scoped_skill_id, str):
+            candidate = scoped_skill_candidate(workspace, scoped_skill_id)
+            if candidate is not None:
+                allowed_unit_ids = set(candidate.semantic_unit_ids)
+                semantic_units = [unit for unit in semantic_units if unit.id in allowed_unit_ids]
+                semantic_relations = [
+                    rel
+                    for rel in semantic_relations
+                    if rel.source_unit_id in allowed_unit_ids
+                    and rel.target_unit_id in allowed_unit_ids
+                ]
     artifacts = _validated_list(
         ArtifactDraftSpec,
         _canonical_json(workspace, "artifact-plan"),
@@ -473,7 +489,7 @@ def assemble_workspace_blueprint(workspace: Workspace) -> WorkspaceBlueprintProj
             checkpoint,
             curriculum,
             artifacts,
-            allow_localized_metadata=workspace.edition_id is not None,
+            allow_localized_metadata=workspace.is_named_edition,
         )
     _validated_list(
         InstructionalAffordance,

@@ -110,7 +110,7 @@ def reconstruct_review_snapshot(
             checkpoint,
             curriculum,
             artifact_specs,
-            allow_localized_metadata=workspace.edition_id is not None,
+            allow_localized_metadata=workspace.is_named_edition,
         )
         for kind, record in (
             ("curriculum-options", checkpoint.plan_record),

@@ -23,6 +23,7 @@ from video_to_skill.curriculum import (
     load_canonical_curriculum_plan,
     load_canonical_curriculum_selection,
 )
+from video_to_skill.decompose import SkillCandidate, scoped_skill_candidate
 from video_to_skill.editions import validate_edition_author_identity
 from video_to_skill.errors import ProcessingError
 from video_to_skill.generation import CapabilityLevel, CourseAsset, SemanticUnit, SkillMode
@@ -70,6 +71,7 @@ def plan_author_task(
     analyze_task: WorkItem,
     curriculum_task: WorkItem,
     decision_task: WorkItem | None = None,
+    skill_candidate: SkillCandidate | None = None,
 ) -> WorkItem:
     if analyze_task.role != WorkRole.ANALYZE or analyze_task.state.value != "complete":
         raise ProcessingError("Authoring requires a completed integrated Analyze task")
@@ -136,7 +138,7 @@ def plan_author_task(
     )
     records["selected-curriculum"] = (str(selection_record.path), selection_record.digest)
     edition_instruction = ""
-    if workspace.edition_id is not None:
+    if workspace.is_named_edition:
         from video_to_skill.editions import assert_edition_analysis_lineage
 
         edition_state = assert_edition_analysis_lineage(workspace)
@@ -155,7 +157,13 @@ def plan_author_task(
                 " Establish stable logical artifact and claim IDs for this edition's durable "
                 "identity family; later editions and repairs must preserve them exactly."
             )
-    packet = {
+    if skill_candidate is not None:
+        edition_instruction += (
+            f" This task authors one decomposed Skill ({skill_candidate.name!r}: "
+            f"{skill_candidate.title}). Use exactly {skill_candidate.name!r} as the Skill name "
+            f"and cover ONLY semantic units in {skill_candidate.semantic_unit_ids!r}."
+        )
+    packet: dict[str, Any] = {
         "instructions": (
             "Consume the selected canonical curriculum without redesigning or reopening it. "
             "Bind every planned path to justified artifacts and write every Markdown draft "
@@ -181,19 +189,23 @@ def plan_author_task(
         "affordance_catalog": AFFORDANCE_CATALOG,
         "visual_asset_candidates": visual_asset_candidate_packet(workspace),
     }
+    scope: dict[str, Any] = {
+        "kind": "course-authoring",
+        "revision": 1,
+        "curriculum_task_id": curriculum_task.id,
+        "curriculum_plan_digest": curriculum_plan_record.digest,
+        "curriculum_selection_digest": selection_record.digest,
+        "curriculum_selection_producer_task_id": expected_selection_producer,
+        "artifact_language_contract_digest": language_contract_digest,
+        "artifact_language_declaration_digest": language_declaration_digest,
+    }
+    if skill_candidate is not None:
+        packet["skill_candidate"] = skill_candidate.model_dump(mode="json")
+        scope["skill_id"] = skill_candidate.id
     return workspace.ensure_work_item(
         run_id=run.id,
         role=WorkRole.AUTHOR,
-        scope={
-            "kind": "course-authoring",
-            "revision": 1,
-            "curriculum_task_id": curriculum_task.id,
-            "curriculum_plan_digest": curriculum_plan_record.digest,
-            "curriculum_selection_digest": selection_record.digest,
-            "curriculum_selection_producer_task_id": expected_selection_producer,
-            "artifact_language_contract_digest": language_contract_digest,
-            "artifact_language_declaration_digest": language_declaration_digest,
-        },
+        scope=scope,
         persona_hint=AUTHOR_PERSONA,
         packet=packet,
         result_schema=AuthorResult.model_json_schema(mode="validation"),
@@ -305,7 +317,7 @@ def _validate_selected_curriculum(
         raise ProcessingError("Author curriculum changed the selected canonical path")
     planned_ids = [path.id for path in plan.paths]
     authored_ids = [path.id for path in result.curriculum.paths]
-    localized_edition = workspace.edition_id is not None
+    localized_edition = workspace.is_named_edition
     if authored_ids != planned_ids or (
         not localized_edition and result.curriculum.rationale != plan.rationale
     ):
@@ -394,6 +406,12 @@ def _validate_author_result(
         result.artifact_language,
     )
     units = _load_semantic_units(workspace)
+    skill_id = task.scope.get("skill_id")
+    if isinstance(skill_id, str):
+        scoped_skill = scoped_skill_candidate(workspace, skill_id)
+        if scoped_skill is not None:
+            allowed_ids = set(scoped_skill.semantic_unit_ids)
+            units = [unit for unit in units if unit.id in allowed_ids]
     known_units = {unit.id for unit in units}
     units_by_id = {unit.id: unit for unit in units}
     sources = {source.id: source for source in workspace.list_sources()}

@@ -259,6 +259,18 @@ class Workspace:
         )
         self.tasks_dir = self.analysis_dir / "tasks"
 
+    @property
+    def is_named_edition(self) -> bool:
+        """True when this view targets a named publication edition (edition-*)."""
+
+        return self.edition_id is not None and self.edition_id.startswith("edition-")
+
+    @property
+    def is_skill_scope(self) -> bool:
+        """True when this view targets an isolated decomposed Skill scope (skill-*)."""
+
+        return self.edition_id is not None and self.edition_id.startswith("skill-")
+
     def for_edition(self, edition_id: str) -> Workspace:
         """Return an immutable edition-scoped view; no global active edition exists."""
 
