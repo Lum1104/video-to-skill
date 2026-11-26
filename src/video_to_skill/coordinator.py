@@ -461,9 +461,7 @@ def _advance_multi_skill_pack(
         )
         all_author_tasks = skill_view.list_work_items(skill_run.id, role=WorkRole.AUTHOR)
         curriculum_tasks = [
-            item
-            for item in all_author_tasks
-            if item.scope.get("kind") == "curriculum-planning"
+            item for item in all_author_tasks if item.scope.get("kind") == "curriculum-planning"
         ]
         if not curriculum_tasks:
             curriculum_task = plan_curriculum_task(
@@ -1366,11 +1364,7 @@ def advance_run(
             for item in all_author_tasks
             if item.scope.get("kind") in {"course-authoring", "course-authoring-repair"}
         ]
-        if (
-            not workspace.is_named_edition
-            and not curriculum_tasks
-            and not course_author_tasks
-        ):
+        if not workspace.is_named_edition and not curriculum_tasks and not course_author_tasks:
             if not decompose_tasks:
                 plan_decompose_task(workspace, run, analyze_task=analyze_task)
                 continue

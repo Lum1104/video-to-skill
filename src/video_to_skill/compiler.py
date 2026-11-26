@@ -750,9 +750,7 @@ def build_workspace_skill(
         expected_build_id=receipt.build_id,
     )
     if generated_snapshot.content_digest != critic_report.target_content_digest:
-        raise ProcessingError(
-            "Rendered Skill bytes differ from the independently reviewed target"
-        )
+        raise ProcessingError("Rendered Skill bytes differ from the independently reviewed target")
     report = validate_skill(
         generated,
         run_official=run_official_validation,
