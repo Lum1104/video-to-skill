@@ -1,13 +1,13 @@
 ---
 name: video-to-skill
-description: "Turn a video, tutorial, playlist, or course into an installed, evidence-grounded course Skill that can teach, give practice and feedback, apply demonstrated methods, and answer reference questions. Use when the user provides video sources and wants reusable learning or operational capability."
+description: "Turn a video, tutorial, playlist, or course into one or more installed, evidence-grounded Skills that can teach, give practice and feedback, apply demonstrated methods, and answer reference questions. Automatically decomposes long or multi-topic videos into focused Skills built in parallel. Use when the user provides video sources and wants reusable learning or operational capability."
 ---
 
 <!-- argument-hint: <video-url-or-local-path>... [skill-name] -->
 
 # Video-to-Skill
 
-Own the complete workflow from source discovery through installation of one course-specific Skill. Turn demonstrated capability into a reusable Skill—not a transcript summary.
+Own the complete workflow from source discovery through installation of one or more focused, reusable Skills—not a transcript summary.
 
 ## Core Rules
 
@@ -18,12 +18,12 @@ Normal invocation:
 $video-to-skill <URL>     # Codex
 ```
 
-- **Default scope**: Process every accessible playlist or course item by default, preserve playlist order, resume cached work after interruption, and keep the private evidence workspace separate from the portable Skill. Continue through isolated source failures when useful material remains and report any coverage gaps.
-- **Ask only at real boundaries**: Ask only when credentials are needed, local/private media would leave the machine, a billed dependency is required, scope is unexpectedly large, the user must pick between materially different curricula, or an installation name conflicts with different content. Never ask the user to run internal commands, tune frame settings, copy task payloads, or invoke a second tutor Skill. Never request an account password.
+- **Default scope**: Process every accessible playlist or course item by default, preserve playlist order, resume cached work after interruption, and keep the private evidence workspace separate from the portable Skill(s). Continue through isolated source failures when useful material remains and report any coverage gaps.
+- **Ask only at real boundaries**: Ask only when credentials are needed, local/private media would leave the machine, a billed dependency is required, scope is unexpectedly large, a long/multi-topic video decomposes into multiple Skills for selection (`skill-pack-selection`), the user must pick between materially different curricula, or an installation name conflicts with different content. Never ask the user to run internal commands, tune frame settings, copy task payloads, or invoke a second tutor Skill. Never request an account password.
 - **Output language**: Infer one canonical artifact language from the user's request/conversation language (or honor an explicit language). Keep this separate from source caption/ASR `--language`.
 - **Analysis depth**: Use `--analysis-depth auto` by default (selects `standard` or `deep` from duration, item count, chapters, captions, and visual signals). Use `archival` only when the user explicitly accepts its higher private storage boundary.
 - **No silent overwrites**: Never overwrite an existing different Skill or discard human edits. Update/fold-in into an existing Skill requires explicit `--force` or a new Skill name.
-- **Division of labor**: The engine never calls an LLM—deterministic Python owns acquisition, packets, task state, validation, compilation, rendering, and installation. The host main agent dispatches native workers for `Analyze → Author → Review`.
+- **Division of labor**: The engine never calls an LLM—deterministic Python owns acquisition, packets, task state, validation, compilation, rendering, and installation. The host main agent dispatches native workers for `Analyze → Decompose → Author → Review`.
 
 ## Start the Engine
 
@@ -77,19 +77,20 @@ After dispatched workers finish, run `"$V2S_ENGINE" run --workspace WORKSPACE` a
 ### When status is `complete`
 
 Report:
-- Installed Skill name, path, and invocation (`/<name>` or `$<name>`)
+- Installed Skill name(s), path(s), and invocation (`/<name>` or `$<name>`); for multi-skill packs, also note `pack-manifest.json`
 - Workspace path (retained by default; `clean` is always user-initiated)
 - Processed vs. failed/partial/inaccessible sources, source vs. semantic coverage, and any capability limits
 - Resolved artifact language, requested/effective analysis depth, instructional-affordance coverage, critic repair count, build ID, and validation status
 - One or two concrete next actions using the installed Skill name (e.g. `/<course-skill> start`).
 
-Only the engine's `complete` envelope proves that the Skill compiled, validated, and installed.
+Only the engine's `complete` envelope proves that the Skill(s) compiled, validated, and installed.
 
-## Pipeline Overview (`Analyze → Author → Review`)
+## Pipeline Overview (`Analyze → Decompose → Author → Review`)
 
 - **Analyze**: Extract grounded semantic units, relations, conflicts, visual teaching candidates (≤24), and capability ceilings from workspace evidence.
-- **Author**: First plan a curriculum (and pause for `ask-user` only if alternates materially differ), then author grounded artifacts and complete the instructional-affordance ledger. Treat Learn, Practice, Apply, and Reference as evidence-bounded capability levels, not artifact quotas.
-- **Review**: Run isolated `behavior-trial` tasks against the immutable rendered preview, then dispatch an independent critic (up to 3 repair cycles).
+- **Decompose**: Decide whether the analyzed material belongs in one focused Skill (auto-continues with zero extra prompt) or decomposes into multiple independent Skills (pauses once at `skill-pack-selection` so the user can build all or pick a subset). Selected Skills build in parallel inside isolated `skill-*` scopes and finish with a shared `pack-manifest.json`.
+- **Author**: Plan a curriculum (pausing for `ask-user` only if alternates materially differ in single-skill mode), then author grounded artifacts and complete the instructional-affordance ledger. Treat Learn, Practice, Apply, and Reference as evidence-bounded capability levels, not artifact quotas.
+- **Review**: Dispatch one independent critic per Skill against the immutable rendered preview and canonical evidence (up to 2 repair cycles).
 
 ## Detailed References (Load On Demand)
 
