@@ -29,22 +29,17 @@ from video_to_skill.behavior import (
 )
 from video_to_skill.compiler import assemble_workspace_blueprint
 from video_to_skill.curriculum import (
-    load_canonical_curriculum_checkpoint,
     load_canonical_curriculum_plan,
     load_canonical_curriculum_selection,
-    validate_artifact_bound_curriculum,
-    validate_curriculum_checkpoint_author_binding,
 )
 from video_to_skill.errors import ProcessingError
 from video_to_skill.generation import (
     COURSE_SKILL_RENDERER_CONTRACT_VERSION,
-    CurriculumDesign,
     course_skill_build_id,
     render_course_skill_review_target,
 )
 from video_to_skill.models import EvidenceGapType
 from video_to_skill.orchestration import (
-    ArtifactDraftSpec,
     AuthorResult,
     BehaviorReport,
     BehaviorScenario,
@@ -59,10 +54,7 @@ from video_to_skill.review_contract import (
     verified_canonical_review_json,
 )
 from video_to_skill.utils import hash_file, stable_hash
-from video_to_skill.visual_assets import (
-    canonical_visual_asset_candidates,
-    visual_asset_candidate_packet,
-)
+from video_to_skill.visual_assets import visual_asset_candidate_packet
 from video_to_skill.work import AnalysisRun, WorkItem, WorkRole, WorkState
 from video_to_skill.workspace import Workspace
 
@@ -82,20 +74,6 @@ BEHAVIOR_TRIAL_PERSONA = (
 
 MAX_REPAIR_CYCLES = 3
 
-_REVIEW_RECORD_KINDS = (
-    "semantic-map",
-    "semantic-relations",
-    "semantic-coverage",
-    "course",
-    "curriculum",
-    "interaction",
-    "capability-profile",
-    "artifact-plan",
-    "instructional-affordances",
-    "claims",
-    "assets",
-)
-
 
 @dataclass(frozen=True)
 class BehaviorEvaluationPlan:
@@ -109,20 +87,6 @@ class BehaviorEvaluationPlan:
 def _verified_canonical_json(workspace: Workspace, kind: str) -> object:
     return verified_canonical_review_json(workspace, kind)
 
-    # Kept unreachable for source-compatible tracebacks in legacy workspaces.
-    record = workspace.canonical_record(kind)
-    if record is None:
-        raise ProcessingError(f"Review requires canonical {kind}")
-    path = workspace.root / record.path
-    try:
-        if path.is_symlink() or not path.is_file() or hash_file(path) != record.digest:
-            raise ProcessingError(f"Canonical Review record failed its digest check: {kind}")
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        if isinstance(exc, ProcessingError):
-            raise
-        raise ProcessingError(f"Invalid canonical Review JSON {kind}: {exc}") from exc
-
 
 def _review_snapshot(
     workspace: Workspace,
@@ -133,121 +97,6 @@ def _review_snapshot(
         workspace,
         expected_author_task_id=expected_author_task_id,
     )
-
-    # Kept unreachable for source-compatible tracebacks in legacy workspaces.
-    records: dict[str, dict[str, str]] = {}
-    for kind in _REVIEW_RECORD_KINDS:
-        record = workspace.canonical_record(kind)
-        if record is None:
-            raise ProcessingError(f"Review requires canonical {kind}")
-        _verified_canonical_json(workspace, kind)
-        records[kind] = {
-            "path": str(record.path),
-            "digest": record.digest,
-            "producer_task_id": record.producer_task_id,
-        }
-    checkpoint = load_canonical_curriculum_checkpoint(workspace)
-    if checkpoint is not None:
-        bound_author = validate_curriculum_checkpoint_author_binding(workspace, checkpoint)
-        if expected_author_task_id is not None and bound_author.id != expected_author_task_id:
-            raise ProcessingError("Review target is not the canonical checkpoint-bound Author")
-        try:
-            curriculum = CurriculumDesign.model_validate(
-                _verified_canonical_json(workspace, "curriculum")
-            )
-            artifact_values = _verified_canonical_json(workspace, "artifact-plan")
-            if not isinstance(artifact_values, list):
-                raise ProcessingError("Canonical artifact plan must be a JSON list")
-            artifact_specs = [ArtifactDraftSpec.model_validate(item) for item in artifact_values]
-        except PydanticValidationError as exc:
-            raise ProcessingError(f"Invalid curriculum checkpoint projection: {exc}") from exc
-        validate_artifact_bound_curriculum(
-            checkpoint,
-            curriculum,
-            artifact_specs,
-            allow_localized_metadata=workspace.edition_id is not None,
-        )
-        for kind, record in (
-            ("curriculum-options", checkpoint.plan_record),
-            ("selected-curriculum", checkpoint.selection_record),
-        ):
-            records[kind] = {
-                "path": str(record.path),
-                "digest": record.digest,
-                "producer_task_id": record.producer_task_id,
-            }
-    visual_candidates_record = workspace.canonical_record("visual-asset-candidates")
-    if visual_candidates_record is not None:
-        records["visual-asset-candidates"] = {
-            "path": str(visual_candidates_record.path),
-            "digest": visual_candidates_record.digest,
-            "producer_task_id": visual_candidates_record.producer_task_id,
-        }
-    delivery_record = workspace.canonical_record("delivery-selection")
-    if delivery_record is not None:
-        _verified_canonical_json(workspace, "delivery-selection")
-        records["delivery-selection"] = {
-            "path": str(delivery_record.path),
-            "digest": delivery_record.digest,
-            "producer_task_id": delivery_record.producer_task_id,
-        }
-    artifacts = _verified_canonical_json(workspace, "artifact-plan")
-    if not isinstance(artifacts, list):
-        raise ProcessingError("Canonical artifact plan must be a JSON list")
-    draft_records: dict[str, dict[str, str]] = {}
-    for artifact in artifacts:
-        artifact_id = str(artifact["id"])
-        record = workspace.canonical_record("artifact-draft", artifact_id)
-        if record is None:
-            raise ProcessingError(f"Review requires canonical draft for {artifact_id}")
-        draft_path = workspace.root / record.path
-        try:
-            if (
-                draft_path.is_symlink()
-                or not draft_path.is_file()
-                or draft_path.stat().st_size > 512 * 1024
-                or hash_file(draft_path) != record.digest
-            ):
-                raise ProcessingError(
-                    f"Canonical Review draft failed its digest check: {artifact_id}"
-                )
-        except OSError as exc:
-            raise ProcessingError(f"Could not verify canonical Review draft: {exc}") from exc
-        draft_records[artifact_id] = {
-            "path": str(record.path),
-            "digest": record.digest,
-            "producer_task_id": record.producer_task_id,
-        }
-    records["artifact-drafts"] = {
-        "path": "",
-        "digest": stable_hash(draft_records, length=64),
-        "producer_task_id": "",
-    }
-    visual_image_records = {
-        candidate.candidate_id: {
-            "path": str(image_path.relative_to(workspace.root)),
-            "digest": candidate.sha256,
-        }
-        for candidate, image_path in canonical_visual_asset_candidates(workspace)
-    }
-    records["visual-asset-images"] = {
-        "path": "",
-        "digest": stable_hash(visual_image_records, length=64),
-        "producer_task_id": "",
-    }
-    snapshot = stable_hash(
-        {
-            "records": records,
-            "drafts": draft_records,
-            "visual_asset_images": visual_image_records,
-        },
-        length=64,
-    )
-    return snapshot, {
-        "records": records,
-        "artifact_drafts": draft_records,
-        "visual_asset_images": visual_image_records,
-    }
 
 
 def _verified_task_packet(workspace: Workspace, task: WorkItem) -> dict[str, object]:
