@@ -144,21 +144,30 @@ def install_generated_skill(
     staging_root = Path(tempfile.mkdtemp(prefix=f".{name}.", dir=root))
     staged = staging_root / name
     backup = staging_root / f"{name}.backup"
+    preserve_staging = False
     try:
         shutil.copytree(source, staged)
         if updating:
             os.replace(target, backup)
             try:
                 os.replace(staged, target)
-            except OSError:
-                os.replace(backup, target)
+            except OSError as install_exc:
+                try:
+                    os.replace(backup, target)
+                except OSError as rollback_exc:
+                    preserve_staging = True
+                    raise ProcessingError(
+                        f"Could not install generated skill at {target}: {install_exc}. "
+                        f"Rollback also failed ({rollback_exc}); original skill backup preserved at {backup}."
+                    ) from install_exc
                 raise
         else:
             os.replace(staged, target)
     except OSError as exc:
         raise ProcessingError(f"Could not install generated skill at {target}: {exc}") from exc
     finally:
-        shutil.rmtree(staging_root, ignore_errors=True)
+        if not preserve_staging:
+            shutil.rmtree(staging_root, ignore_errors=True)
     return target, ("updated" if updating else "installed")
 
 

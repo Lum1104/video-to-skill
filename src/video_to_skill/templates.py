@@ -399,7 +399,8 @@ _JA = SkillTemplate(
         "解答や採点基準は試行後または明示的な要求後にのみ提示してください。"
     ),
     apply_rule=(
-        "- **実践**：ユーザーの実際の文脈で不足する情報だけを確認し、推測による適用は明示して検証手順を添えます。"
+        "- **実践**：ユーザーの実際の文脈で不足する情報だけを確認し、外部操作の実行やプライベートデータの参照前に必ず同意を得てください。"
+        "推測による適用は明示し、検証手順を添えます。"
     ),
     reference_rule=(
         "- **リファレンス**：結論を先に述べ、最小の関連ファイルまたは [source-map.md](source-map.md) を参照し、"
@@ -475,14 +476,32 @@ _JA = SkillTemplate(
 )
 
 
+_ZH_LANGUAGE_ALIASES = frozenset(
+    {
+        "zh",
+        "chinese",
+        "simplified chinese",
+        "traditional chinese",
+        "mandarin",
+        "中文",
+        "简体中文",
+        "繁體中文",
+        "繁体中文",
+        "汉语",
+    }
+)
+_JA_LANGUAGE_ALIASES = frozenset({"ja", "jp", "japanese", "日本語", "にほんご"})
+
+
 def template_for_language(language: str | None) -> SkillTemplate:
-    """Select the closest built-in template for an artifact language tag."""
+    """Select the closest built-in template for an artifact language tag or name."""
     if not language:
         return _EN
-    normalized = language.strip().casefold().replace("_", "-")
-    primary = normalized.split("-", 1)[0]
-    if primary == "zh":
+    normalized = " ".join(language.strip().casefold().split())
+    tag = normalized.replace("_", "-")
+    primary = tag.split("-", 1)[0]
+    if primary == "zh" or normalized in _ZH_LANGUAGE_ALIASES:
         return _ZH
-    if primary == "ja":
+    if primary == "ja" or normalized in _JA_LANGUAGE_ALIASES:
         return _JA
     return _EN

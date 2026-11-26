@@ -81,8 +81,26 @@ def _fingerprint_files() -> list[Path]:
     return sorted(set(files), key=lambda path: path.as_posix())
 
 
+def _touch_runtime_used(runtime_root: Path) -> None:
+    with suppress(OSError):
+        (runtime_root / ".last-used").write_text(str(int(time.time())), encoding="utf-8")
+
+
+def _runtime_last_used(runtime_root: Path) -> float:
+    marker = runtime_root / ".last-used"
+    try:
+        if marker.is_file():
+            return marker.stat().st_mtime
+        return runtime_root.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+STALE_RUNTIME_MIN_AGE_SECONDS = 7 * 24 * 60 * 60
+
+
 def _prune_stale_runtimes(runtimes_root: Path, active_name: str) -> None:
-    """Remove old sibling runtime directories beyond MAX_RETAINED_RUNTIMES."""
+    """Remove old sibling runtime directories beyond MAX_RETAINED_RUNTIMES that have been idle."""
     try:
         candidates = [
             entry
@@ -98,17 +116,14 @@ def _prune_stale_runtimes(runtimes_root: Path, active_name: str) -> None:
     if len(candidates) <= keep_extra:
         return
 
-    def _mtime(path: Path) -> float:
-        try:
-            return path.stat().st_mtime
-        except OSError:
-            return 0.0
-
-    candidates.sort(key=_mtime, reverse=True)
+    candidates.sort(key=_runtime_last_used, reverse=True)
+    cutoff = time.time() - STALE_RUNTIME_MIN_AGE_SECONDS
     for stale in candidates[keep_extra:]:
         lock_file = runtimes_root / f".{stale.name}.lock"
         cap_lock = runtimes_root / f".{stale.name}.capabilities.lock"
         if lock_file.exists() or cap_lock.exists():
+            continue
+        if _runtime_last_used(stale) > cutoff:
             continue
         shutil.rmtree(stale, ignore_errors=True)
 
@@ -460,6 +475,7 @@ def _bootstrap_checkout() -> None:
             )
         raise SystemExit(127) from exc
 
+    _touch_runtime_used(runtime_python.parent.parent)
     os.environ[BOOTSTRAP_GUARD] = "1"
     runtime_scripts = str(runtime_python.parent)
     current_path = os.environ.get("PATH", "")
